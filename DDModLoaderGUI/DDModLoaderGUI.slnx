@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="DDModLoaderGUI/DDModLoaderGUI.vcxproj" Id="333d6bfc-7baf-49ca-9041-8d6d68686cc6" />
+</Solution>

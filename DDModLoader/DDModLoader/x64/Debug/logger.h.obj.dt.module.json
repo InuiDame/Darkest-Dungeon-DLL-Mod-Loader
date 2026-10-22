@@ -1,0 +1,15 @@
+{
+    "version": 1,
+    "revision": 0,
+    "rules": [
+        {
+            "primary-output": "x64\\Debug\\logger.obj",
+            "outputs": [
+                "x64\\Debug\\logger.h.obj.dt.module.json",
+                "x64\\Debug\\logger.h.obj.dt.d.json",
+                "x64\\Debug\\DDModLoader.pch"
+            ],
+            "requires": []
+        }
+    ]
+}
