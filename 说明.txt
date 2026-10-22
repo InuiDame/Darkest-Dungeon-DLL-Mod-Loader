@@ -1,0 +1,14 @@
+该加载器用以加载mod文件夹下的dll文件
+
+加载器兼容部分主程序dll修改文件和ReShade
+
+如果需要卸载加载器，请前往游戏根目录的DDModLoader文件夹下卸载
+并删除DarkestDungeon\_windows\win64下的dbghelp.dll
+
+目录下的测试文件可以提供用以查看是否安装成功
+
+C:\Users\用户名\AppData\Local\DDModLoader 下会生成log文件
+
+后续会发布一些简单的示例mod（如果我有时间）
+
+加载器的源码发布在我的github上：https://github.com/InuiDame/Darkest-Dungeon-DLL-Mod-Loader
