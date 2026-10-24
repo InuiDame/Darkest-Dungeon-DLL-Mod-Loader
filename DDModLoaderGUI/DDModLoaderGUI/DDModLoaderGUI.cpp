@@ -15,8 +15,78 @@
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "shlwapi.lib")
-#pragma comment(lib, "shell32.lib")   // ← 新增
+#pragma comment(lib, "shell32.lib")
 #pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
+
+// ---------- 本地化字符串 ----------
+struct LocStrings {
+    const wchar_t* appTitle;
+    const wchar_t* colModName;
+    const wchar_t* colDllName;
+    const wchar_t* colFullPath;
+    const wchar_t* btnRefresh;
+    const wchar_t* btnEnableAll;
+    const wchar_t* btnDisableAll;
+    const wchar_t* btnLaunchSteam;
+    const wchar_t* btnLaunchOffline;
+    const wchar_t* btnSave;
+    const wchar_t* msgSaved;
+    const wchar_t* msgInfoTitle;
+    const wchar_t* msgErrorTitle;
+    const wchar_t* msgSteamFail;
+    const wchar_t* msgOfflineNotFoundFmt;   // %s = 路径
+    const wchar_t* msgOfflineFail;
+    const wchar_t* msgNoGameRoot;
+    const wchar_t* unknownMod;
+};
+
+static const LocStrings kZh = {
+    L"DDModLoader 配置工具",
+    L"MOD 名称",
+    L"DLL 名称",
+    L"完整路径",
+    L"刷新",
+    L"全启用",
+    L"全禁用",
+    L"从 Steam 启动",
+    L"启动离线版",
+    L"保存",
+    L"配置已保存到 DDModLoader.cfg。",
+    L"提示",
+    L"错误",
+    L"无法通过 Steam 启动游戏。\n请确认 Steam 已安装并处于登录状态。",
+    L"未找到离线版可执行文件：\n%s\n\n如果你只安装了 Steam 版，请使用「从 Steam 启动」。",
+    L"启动离线版游戏失败。",
+    L"未能自动找到《暗黑地牢》的游戏根目录。\n\n"
+    L"请将本程序放到游戏根目录（含 mods 文件夹的那个目录），"
+    L"或在命令行中指定路径后重试。",
+    L"(未知)",
+};
+
+static const LocStrings kEn = {
+    L"DDModLoader Config Tool",
+    L"Mod Name",
+    L"DLL Name",
+    L"Full Path",
+    L"Refresh",
+    L"Enable All",
+    L"Disable All",
+    L"Launch via Steam",
+    L"Launch Offline",
+    L"Save",
+    L"Configuration saved to DDModLoader.cfg.",
+    L"Info",
+    L"Error",
+    L"Failed to launch the game via Steam.\nPlease make sure Steam is installed and signed in.",
+    L"Offline executable not found:\n%s\n\nIf you only have the Steam version, please use \"Launch via Steam\".",
+    L"Failed to launch the offline game.",
+    L"Unable to locate the Darkest Dungeon game root folder.\n\n"
+    L"Please place this program in the game root folder (the folder containing the 'mods' directory), "
+    L"or pass the path as a command-line argument and try again.",
+    L"(Unknown)",
+};
+
+static const LocStrings* g_loc = nullptr;
 
 // ---------- 与加载器保持一致的排除名单 ----------
 static const std::vector<std::wstring> kExcludedDlls = {
@@ -91,7 +161,8 @@ static std::wstring FindModName(const std::wstring& dllDir) {
     // 兜底：DLL 所在目录名
     std::wstring fallback = dllDir;
     const wchar_t* name = PathFindFileNameW(fallback.c_str());
-    return name ? name : L"(未知)";
+    if (name && *name) return name;
+    return g_loc ? g_loc->unknownMod : L"(未知)";
 }
 
 static bool DirectoryExists(const std::wstring& path) {
@@ -116,8 +187,6 @@ static std::unordered_map<std::wstring, bool> LoadConfig(const std::wstring& pat
         std::wstring s = line;
         while (!s.empty() && (s.back() == L'\n' || s.back() == L'\r')) s.pop_back();
         if (s.size() < 3 || s[1] != L'|') continue;
-
-        // 规范化 Key
         m[NormalizePath(s.substr(2))] = (s[0] == L'1');
     }
     fclose(f);
@@ -193,7 +262,6 @@ static std::wstring ReadRegString(HKEY root, const wchar_t* sub, const wchar_t* 
 }
 
 static std::wstring AutoDetectGameRoot() {
-    // exe 所在目录，及其上两级（支持放在游戏根目录或 win64 目录下）
     wchar_t exePath[MAX_PATH] = {};
     GetModuleFileNameW(nullptr, exePath, MAX_PATH);
     PathRemoveFileSpecW(exePath);
@@ -204,21 +272,18 @@ static std::wstring AutoDetectGameRoot() {
         dir.resize(wcslen(dir.c_str()));
     }
 
-    // 注册表：Steam 用户路径（HKCU）
     std::wstring steam = ReadRegString(HKEY_CURRENT_USER, L"Software\\Valve\\Steam", L"SteamPath");
     if (!steam.empty()) {
         std::wstring c = steam + L"\\steamapps\\common\\DarkestDungeon";
         if (IsValidGameRoot(c)) return c;
     }
 
-    // 注册表：Steam 安装路径（HKLM，64 位重定向）
     steam = ReadRegString(HKEY_LOCAL_MACHINE, L"SOFTWARE\\WOW6432Node\\Valve\\Steam", L"InstallPath");
     if (!steam.empty()) {
         std::wstring c = steam + L"\\steamapps\\common\\DarkestDungeon";
         if (IsValidGameRoot(c)) return c;
     }
 
-    // 路径兜底,我草,底兜烂了不会还有问题吧.
     const wchar_t* common[] = {
         L"C:\\Program Files (x86)\\Steam\\steamapps\\common\\DarkestDungeon",
         L"D:\\Program Files (x86)\\Steam\\steamapps\\common\\DarkestDungeon",
@@ -260,13 +325,12 @@ static void RefreshList() {
         ListView_SetItemText(g_hList, (int)i, 1, (LPWSTR)e.dllName.c_str());
         ListView_SetItemText(g_hList, (int)i, 2, (LPWSTR)e.fullPath.c_str());
 
-        // 关键修改：查询时也规范化
         auto it = cfg.find(NormalizePath(e.fullPath));
         bool enabled = (it == cfg.end()) ? true : it->second;
         ListView_SetCheckState(g_hList, (int)i, enabled ? TRUE : FALSE);
     }
 
-    SetWindowTextW(g_hWnd, (L"DDModLoader 配置工具 - " + g_gameRoot).c_str());
+    SetWindowTextW(g_hWnd, (std::wstring(g_loc->appTitle) + L" - " + g_gameRoot).c_str());
 }
 
 static void SaveAll() {
@@ -277,16 +341,14 @@ static void SaveAll() {
                           ListView_GetCheckState(g_hList, i) != FALSE });
     }
     SaveConfig(g_configPath, items);
-    MessageBoxW(g_hWnd, L"配置已保存到 DDModLoader.cfg。", L"提示", MB_OK | MB_ICONINFORMATION);
+    MessageBoxW(g_hWnd, g_loc->msgSaved, g_loc->msgInfoTitle, MB_OK | MB_ICONINFORMATION);
 }
 
 static void LaunchViaSteam() {
     HINSTANCE r = ShellExecuteW(nullptr, L"open",
         L"steam://rungameid/262060", nullptr, nullptr, SW_SHOWNORMAL);
     if ((INT_PTR)r <= 32) {
-        MessageBoxW(g_hWnd,
-            L"无法通过 Steam 启动游戏。\n请确认 Steam 已安装并处于登录状态。",
-            L"错误", MB_OK | MB_ICONERROR);
+        MessageBoxW(g_hWnd, g_loc->msgSteamFail, g_loc->msgErrorTitle, MB_OK | MB_ICONERROR);
     }
 }
 
@@ -295,17 +357,16 @@ static void LaunchOffline() {
     std::wstring workDir = g_gameRoot + L"\\_windowsnosteam\\win64";
 
     if (GetFileAttributesW(exe.c_str()) == INVALID_FILE_ATTRIBUTES) {
-        MessageBoxW(g_hWnd,
-            (L"未找到离线版可执行文件：\n" + exe +
-                L"\n\n如果你只安装了 Steam 版，请使用「从 Steam 启动」。").c_str(),
-            L"错误", MB_OK | MB_ICONERROR);
+        wchar_t buf[2048];
+        swprintf_s(buf, g_loc->msgOfflineNotFoundFmt, exe.c_str());
+        MessageBoxW(g_hWnd, buf, g_loc->msgErrorTitle, MB_OK | MB_ICONERROR);
         return;
     }
 
     HINSTANCE r = ShellExecuteW(nullptr, L"open", exe.c_str(), nullptr,
         workDir.c_str(), SW_SHOWNORMAL);
     if ((INT_PTR)r <= 32) {
-        MessageBoxW(g_hWnd, L"启动离线版游戏失败。", L"错误", MB_OK | MB_ICONERROR);
+        MessageBoxW(g_hWnd, g_loc->msgOfflineFail, g_loc->msgErrorTitle, MB_OK | MB_ICONERROR);
     }
 }
 
@@ -325,23 +386,22 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
 
         LVCOLUMNW col = {};
         col.mask = LVCF_TEXT | LVCF_WIDTH;
-        col.pszText = (LPWSTR)L"MOD 名称";
+        col.pszText = (LPWSTR)g_loc->colModName;
         col.cx = 260;
         ListView_InsertColumn(g_hList, 0, &col);
-        col.pszText = (LPWSTR)L"DLL 名称";
+        col.pszText = (LPWSTR)g_loc->colDllName;
         col.cx = 200;
         ListView_InsertColumn(g_hList, 1, &col);
-        col.pszText = (LPWSTR)L"完整路径";
+        col.pszText = (LPWSTR)g_loc->colFullPath;
         col.cx = 480;
         ListView_InsertColumn(g_hList, 2, &col);
 
-        // 按钮的初始坐标全部设为 0, 0, 0, 0，等待 WM_SIZE 来排版
-        CreateWindowW(L"BUTTON", L"刷新", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hWnd, (HMENU)IDC_REFRESH, nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"全启用", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hWnd, (HMENU)IDC_ALL, nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"全禁用", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hWnd, (HMENU)IDC_NONE, nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"从 Steam 启动", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hWnd, (HMENU)IDC_LAUNCH_STEAM, nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"启动离线版", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hWnd, (HMENU)IDC_LAUNCH_OFFLINE, nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"保存", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hWnd, (HMENU)IDC_SAVE, nullptr, nullptr);
+        CreateWindowW(L"BUTTON", g_loc->btnRefresh, WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hWnd, (HMENU)IDC_REFRESH, nullptr, nullptr);
+        CreateWindowW(L"BUTTON", g_loc->btnEnableAll, WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hWnd, (HMENU)IDC_ALL, nullptr, nullptr);
+        CreateWindowW(L"BUTTON", g_loc->btnDisableAll, WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hWnd, (HMENU)IDC_NONE, nullptr, nullptr);
+        CreateWindowW(L"BUTTON", g_loc->btnLaunchSteam, WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hWnd, (HMENU)IDC_LAUNCH_STEAM, nullptr, nullptr);
+        CreateWindowW(L"BUTTON", g_loc->btnLaunchOffline, WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hWnd, (HMENU)IDC_LAUNCH_OFFLINE, nullptr, nullptr);
+        CreateWindowW(L"BUTTON", g_loc->btnSave, WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hWnd, (HMENU)IDC_SAVE, nullptr, nullptr);
 
         RefreshList();
         return 0;
@@ -352,26 +412,21 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         int clientW = rc.right;
         int clientH = rc.bottom;
 
-        // 底部按钮栏高度设定为 50
         int bottomBarH = 50;
         int listH = clientH - bottomBarH - 10;
-        if (listH < 100) listH = 100; // 防止窗口太小时 ListView 消失
+        if (listH < 100) listH = 100;
 
-        // 1. 调整 ListView 大小
         SetWindowPos(g_hList, nullptr, 10, 10, clientW - 20, listH, SWP_NOZORDER);
 
-        // 2. 计算按钮的 Y 坐标
         int btnY = clientH - 40;
 
-        // 3. 排列左侧固定按钮
-        SetWindowPos(GetDlgItem(hWnd, IDC_REFRESH), nullptr, 10, btnY, 90, 30, SWP_NOZORDER);
-        SetWindowPos(GetDlgItem(hWnd, IDC_ALL), nullptr, 110, btnY, 90, 30, SWP_NOZORDER);
-        SetWindowPos(GetDlgItem(hWnd, IDC_NONE), nullptr, 210, btnY, 90, 30, SWP_NOZORDER);
-        SetWindowPos(GetDlgItem(hWnd, IDC_LAUNCH_STEAM), nullptr, 330, btnY, 140, 30, SWP_NOZORDER);
-        SetWindowPos(GetDlgItem(hWnd, IDC_LAUNCH_OFFLINE), nullptr, 480, btnY, 140, 30, SWP_NOZORDER);
-
-        // 4. 排列右侧保存按钮 (靠右对齐)
-        SetWindowPos(GetDlgItem(hWnd, IDC_SAVE), nullptr, clientW - 100, btnY, 90, 30, SWP_NOZORDER);
+        // 宽度调整后同时容纳中英文文案
+        SetWindowPos(GetDlgItem(hWnd, IDC_REFRESH), nullptr, 10, btnY, 100, 30, SWP_NOZORDER);
+        SetWindowPos(GetDlgItem(hWnd, IDC_ALL), nullptr, 120, btnY, 110, 30, SWP_NOZORDER);
+        SetWindowPos(GetDlgItem(hWnd, IDC_NONE), nullptr, 240, btnY, 110, 30, SWP_NOZORDER);
+        SetWindowPos(GetDlgItem(hWnd, IDC_LAUNCH_STEAM), nullptr, 370, btnY, 150, 30, SWP_NOZORDER);
+        SetWindowPos(GetDlgItem(hWnd, IDC_LAUNCH_OFFLINE), nullptr, 530, btnY, 150, 30, SWP_NOZORDER);
+        SetWindowPos(GetDlgItem(hWnd, IDC_SAVE), nullptr, clientW - 110, btnY, 100, 30, SWP_NOZORDER);
 
         return 0;
     }
@@ -393,23 +448,20 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
 }
 
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int nCmdShow) {
-    // 命令行参数优先
+    // 根据系统 UI 语言选择本地化字符串
+    LANGID lang = GetUserDefaultUILanguage();
+    g_loc = (PRIMARYLANGID(lang) == LANG_CHINESE) ? &kZh : &kEn;
+
     if (lpCmdLine && *lpCmdLine) {
         g_gameRoot = lpCmdLine;
         if (g_gameRoot.size() >= 2 && g_gameRoot.front() == L'"' && g_gameRoot.back() == L'"')
             g_gameRoot = g_gameRoot.substr(1, g_gameRoot.size() - 2);
     }
-    // 自动探测
     if (!IsValidGameRoot(g_gameRoot)) {
         g_gameRoot = AutoDetectGameRoot();
     }
-    // 探测失败 → 提示并退出
     if (g_gameRoot.empty()) {
-        MessageBoxW(nullptr,
-            L"未能自动找到《暗黑地牢》的游戏根目录。\n\n"
-            L"请将本程序放到游戏根目录（含 mods 文件夹的那个目录），"
-            L"或在命令行中指定路径后重试。",
-            L"DDModLoader 配置工具", MB_OK | MB_ICONERROR);
+        MessageBoxW(nullptr, g_loc->msgNoGameRoot, g_loc->appTitle, MB_OK | MB_ICONERROR);
         return 1;
     }
     g_configPath = g_gameRoot + L"\\DDModLoader.cfg";
@@ -426,7 +478,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int nCmdShow) 
     wc.lpszClassName = L"DDModLoaderConfig";
     RegisterClassExW(&wc);
 
-    g_hWnd = CreateWindowExW(0, L"DDModLoaderConfig", L"DDModLoader 配置工具",
+    g_hWnd = CreateWindowExW(0, L"DDModLoaderConfig", g_loc->appTitle,
         WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 1200, 540,
         nullptr, nullptr, hInst, nullptr);
 

@@ -1,0 +1,14 @@
+This loader is used to load the dll files located in the mod folder
+
+Loader is compatible with some modified main program dll files and ReShade
+
+If you need to uninstall the loader, please proceed to the DDModLoader folder located in the game's root directory to uninstall it
+And delete dbghelp.dll under DarkestDungeon\_windows\win64
+
+The test files in the directory can be used to check whether the installation is successful
+
+A log file will be generated in C:\Users\username\AppData\Local\DDModLoader
+
+Some simple example mods will be released later (if I have time)
+
+The source code of the loader is published on my GitHub: https://github.com/InuiDame/Darkest-Dungeon-DLL-Mod-Loader

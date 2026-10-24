@@ -1,0 +1,16 @@
+This tutorial may be updated at any time, and currently only provides a general idea
+
+Prepare the tools:
+IDA Pro 9.0 (decompilation)
+x64dbg/cheat engine (to view memory information)
+Visual Studio and its C++ components
+
+First, decompile using IDA to obtain the data you want to modify
+
+Then, create a new Dynamic Link Library (DLL) template solution in Visual Studio
+
+After writing the DLL, place it in the MOD folder, and open the game to observe whether the modification is successful
+
+The simplest modification involves modifying some simple variables to search and view them through a cheat engine
+
+If you succeed, congratulations! You have taken the first step
