@@ -3,5 +3,5 @@
     <Platform Name="x64" />
     <Platform Name="x86" />
   </Configurations>
-  <Project Path="ProtectionCapMod/ProtectionCapMod.vcxproj" />
+  <Project Path="ProtectionCapMod/ProtectionCapMod.vcxproj" Id="c5133cc2-4f06-49a8-b3dc-8fe0b1b35d14" />
 </Solution>

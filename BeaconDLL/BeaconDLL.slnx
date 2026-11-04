@@ -3,5 +3,5 @@
     <Platform Name="x64" />
     <Platform Name="x86" />
   </Configurations>
-  <Project Path="BeaconDLL/BeaconDLL.vcxproj" />
+  <Project Path="BeaconDLL/BeaconDLL.vcxproj" Id="bda86305-f527-4724-ba4f-d98a216c3971" />
 </Solution>

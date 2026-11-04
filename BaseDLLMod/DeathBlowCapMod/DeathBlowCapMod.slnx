@@ -3,5 +3,5 @@
     <Platform Name="x64" />
     <Platform Name="x86" />
   </Configurations>
-  <Project Path="DeathBlowCapMod/DeathBlowCapMod.vcxproj" />
+  <Project Path="DeathBlowCapMod/DeathBlowCapMod.vcxproj" Id="929b8bef-3884-4a1e-bcfa-ae2796cf651d" />
 </Solution>

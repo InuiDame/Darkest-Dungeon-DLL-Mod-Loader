@@ -9,6 +9,7 @@
 #include <string>
 #include <cstdio>
 #include <unordered_map>
+#include <vector>
 #include <algorithm>
 
 #pragma comment(lib, "shlwapi.lib")
@@ -29,12 +30,10 @@ static void LogInit(const std::wstring& fallbackPath) {
     }
 
     if (!g_logFile) {
-        // 回退到游戏根目录
         _wfopen_s(&g_logFile, fallbackPath.c_str(), L"w, ccs=UTF-8");
     }
 
     if (!g_logFile) {
-        // 再回退到临时目录
         wchar_t temp[MAX_PATH] = {};
         GetTempPathW(MAX_PATH, temp);
         std::wstring path = std::wstring(temp) + L"DDModLoader.log";
@@ -103,9 +102,9 @@ static std::wstring GetModuleDirectory(HMODULE hModule) {
 static std::wstring GetGameRootFromWin64(const std::wstring& win64Dir) {
     std::wstring root = win64Dir;
     PathRemoveFileSpecW(root.data());
-    root.resize(wcslen(root.c_str()));   // 同步 size
+    root.resize(wcslen(root.c_str()));
     PathRemoveFileSpecW(root.data());
-    root.resize(wcslen(root.c_str()));   // 同步 size
+    root.resize(wcslen(root.c_str()));
     return root;
 }
 
@@ -118,7 +117,6 @@ static bool DirectoryExists(const std::wstring& path) {
 static int g_loadedCount = 0;
 static int g_failedCount = 0;
 
-// 新增：排除名单与判断函数
 static const std::unordered_set<std::wstring> kExcludedDlls = {
     L"dbghelp.dll",
     L"fmod.dll",
@@ -141,16 +139,13 @@ static bool IsExcludedDll(const std::wstring& fileName) {
 static std::unordered_map<std::wstring, bool> g_dllConfig;
 static std::wstring g_configPath;
 
-// 统一路径格式：转小写，把 / 换成 \ 这段真气笑了,读cfg还能读出问题来.
-
 static std::wstring NormalizePath(const std::wstring& path) {
-std::wstring res = path;
-std::transform(res.begin(), res.end(), res.begin(), ::towlower);
-std::replace(res.begin(), res.end(), L'/', L'\\');
-return res;
+    std::wstring res = path;
+    std::transform(res.begin(), res.end(), res.begin(), ::towlower);
+    std::replace(res.begin(), res.end(), L'/', L'\\');
+    return res;
 }
 
-// 修改 LoadConfig，存储规范化后的 Key
 static void LoadConfig(const std::wstring& path) {
     g_configPath = path;
     g_dllConfig.clear();
@@ -168,7 +163,6 @@ static void LoadConfig(const std::wstring& path) {
         while (!s.empty() && (s.back() == L'\n' || s.back() == L'\r')) s.pop_back();
         if (s.size() < 3 || s[1] != L'|') continue;
 
-        // 路径规范化
         std::wstring rawPath = s.substr(2);
         g_dllConfig[NormalizePath(rawPath)] = (s[0] == L'1');
         count++;
@@ -178,7 +172,6 @@ static void LoadConfig(const std::wstring& path) {
 }
 
 static bool ShouldLoadDll(const std::wstring& fullPath, bool& isNew) {
-    // 查询时把当前扫描到的路径规范化
     auto it = g_dllConfig.find(NormalizePath(fullPath));
     if (it != g_dllConfig.end()) {
         isNew = false;
@@ -212,7 +205,7 @@ static void ScanAndLoadDLLs(const std::wstring& directory) {
         }
         else {
             if (!PathMatchSpecW(fd.cFileName, L"*.dll")) continue;
-            if (IsExcludedDll(fd.cFileName)) continue; 
+            if (IsExcludedDll(fd.cFileName)) continue;
 
             std::wstring oldDir;
             DWORD oldDirLen = GetDllDirectoryW(0, nullptr);
@@ -250,6 +243,33 @@ static void ScanAndLoadDLLs(const std::wstring& directory) {
     FindClose(hFind);
 }
 
+// ===================== 额外 MOD 目录 =====================
+// 与 GUI 共用：%LOCALAPPDATA%\DDModLoader\extra_mods.cfg，每行一个绝对路径。
+static std::vector<std::wstring> LoadExtraDirs() {
+    std::vector<std::wstring> dirs;
+    wchar_t lad[MAX_PATH] = {};
+    if (GetEnvironmentVariableW(L"LOCALAPPDATA", lad, MAX_PATH) == 0) return dirs;
+    std::wstring p = std::wstring(lad) + L"\\DDModLoader\\extra_mods.cfg";
+    FILE* f = nullptr;
+    _wfopen_s(&f, p.c_str(), L"r, ccs=UTF-8");
+    if (!f) return dirs;
+
+    wchar_t line[4096];
+    while (fgetws(line, 4096, f)) {
+        std::wstring s = line;
+        while (!s.empty() && (s.back() == L'\n' || s.back() == L'\r')) s.pop_back();
+
+        size_t b = 0;
+        while (b < s.size() && (s[b] == L' ' || s[b] == L'\t')) ++b;
+        s = s.substr(b);
+        while (!s.empty() && (s.back() == L'\\' || s.back() == L'/')) s.pop_back();
+
+        if (!s.empty()) dirs.push_back(s);
+    }
+    fclose(f);
+    return dirs;
+}
+
 // ===================== MOD 加载线程 =====================
 static DWORD WINAPI ModLoaderThread(LPVOID lpParam) {
     HMODULE hSelf = (HMODULE)lpParam;
@@ -277,6 +297,16 @@ static DWORD WINAPI ModLoaderThread(LPVOID lpParam) {
     }
     else {
         Log(L"创意工坊目录不存在，跳过: " + workshop);
+    }
+
+    // 额外 MOD 目录（MO2 等）
+    auto extraDirs = LoadExtraDirs();
+    if (extraDirs.empty()) {
+        Log(L"未配置额外 MOD 目录。");
+    }
+    for (auto& d : extraDirs) {
+        Log(L"开始扫描额外 MOD 目录: " + d);
+        ScanAndLoadDLLs(d);
     }
 
     Log(L"MOD 扫描完成。成功: " + std::to_wstring(g_loadedCount) +
