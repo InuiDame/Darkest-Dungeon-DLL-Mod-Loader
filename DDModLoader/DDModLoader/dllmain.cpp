@@ -99,8 +99,8 @@ static std::wstring GetModuleDirectory(HMODULE hModule) {
     return path;
 }
 
-static std::wstring GetGameRootFromWin64(const std::wstring& win64Dir) {
-    std::wstring root = win64Dir;
+static std::wstring GetGameRootFromBinDir(const std::wstring& binDir) {
+    std::wstring root = binDir;
     PathRemoveFileSpecW(root.data());
     root.resize(wcslen(root.c_str()));
     PathRemoveFileSpecW(root.data());
@@ -114,16 +114,22 @@ static bool DirectoryExists(const std::wstring& path) {
 }
 
 // ===================== MOD 扫描加载 =====================
+static const std::wstring kForceLoadFolderName = L"DD Mod Lib";
+
 static int g_loadedCount = 0;
 static int g_failedCount = 0;
 
 static const std::unordered_set<std::wstring> kExcludedDlls = {
     L"dbghelp.dll",
     L"fmod.dll",
+    L"fmod64.dll",
     L"fmodstudio.dll",
+    L"fmodstudio64.dll",
     L"sdl2.dll",
     L"glew32.dll",
+    L"glew64.dll",
     L"steam_api.dll",
+    L"steam_api64.dll",
     L"vcruntime140.dll",
     L"vcruntime140_1.dll",
     L"msvcp140.dll"
@@ -181,7 +187,12 @@ static bool ShouldLoadDll(const std::wstring& fullPath, bool& isNew) {
     return true;
 }
 
-static void ScanAndLoadDLLs(const std::wstring& directory) {
+// ===================== 扫描加载（修改）=====================
+// forceLoad=true 时忽略配置文件，强制加载
+// skipDirectSubDir 非空时，跳过当前目录下直接子文件夹（不递归到该子文件夹），用于跳过 mods\DD Mod Lib
+static void ScanAndLoadDLLs(const std::wstring& directory,
+    bool forceLoad = false,
+    const std::wstring& skipDirectSubDir = L"") {
     if (!DirectoryExists(directory)) {
         Log(L"目录不存在，跳过: " + directory);
         return;
@@ -201,11 +212,30 @@ static void ScanAndLoadDLLs(const std::wstring& directory) {
         std::wstring fullPath = directory + L"\\" + fd.cFileName;
 
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            ScanAndLoadDLLs(fullPath);
+            if (!skipDirectSubDir.empty() &&
+                _wcsicmp(fd.cFileName, skipDirectSubDir.c_str()) == 0) {
+                Log(L"跳过前置 MOD 目录（已优先加载）: " + fullPath);
+                continue;
+            }
+            ScanAndLoadDLLs(fullPath, forceLoad, L"");
         }
         else {
             if (!PathMatchSpecW(fd.cFileName, L"*.dll")) continue;
             if (IsExcludedDll(fd.cFileName)) continue;
+
+            if (!forceLoad) {
+                bool isNew = false;
+                if (!ShouldLoadDll(fullPath, isNew)) {
+                    Log(L"跳过（配置已禁用）-> " + fullPath);
+                    continue;
+                }
+                if (isNew) {
+                    Log(L"新 DLL（默认启用，未在 cfg 中）-> " + fullPath);
+                }
+            }
+            else {
+                Log(L"强制加载前置 DLL -> " + fullPath);
+            }
 
             std::wstring oldDir;
             DWORD oldDirLen = GetDllDirectoryW(0, nullptr);
@@ -213,17 +243,8 @@ static void ScanAndLoadDLLs(const std::wstring& directory) {
                 oldDir.resize(oldDirLen);
                 GetDllDirectoryW(oldDirLen, &oldDir[0]);
             }
-            bool isNew = false;
-            if (!ShouldLoadDll(fullPath, isNew)) {
-                Log(L"跳过（配置已禁用）-> " + fullPath);
-                continue;
-            }
-            if (isNew) {
-                Log(L"新 DLL（默认启用，未在 cfg 中）-> " + fullPath);
-            }
 
             SetDllDirectoryW(directory.c_str());
-
             HMODULE hMod = LoadLibraryW(fullPath.c_str());
             DWORD err = GetLastError();
 
@@ -242,6 +263,7 @@ static void ScanAndLoadDLLs(const std::wstring& directory) {
     } while (FindNextFileW(hFind, &fd));
     FindClose(hFind);
 }
+
 
 // ===================== 额外 MOD 目录 =====================
 // 与 GUI 共用：%LOCALAPPDATA%\DDModLoader\extra_mods.cfg，每行一个绝对路径。
@@ -270,20 +292,32 @@ static std::vector<std::wstring> LoadExtraDirs() {
     return dirs;
 }
 
-// ===================== MOD 加载线程 =====================
+// ===================== MOD 加载线程（修改）=====================
 static DWORD WINAPI ModLoaderThread(LPVOID lpParam) {
     HMODULE hSelf = (HMODULE)lpParam;
     Sleep(1500);
 
-    std::wstring win64Dir = GetModuleDirectory(hSelf);
-    std::wstring gameRoot = GetGameRootFromWin64(win64Dir);
+    std::wstring binDir = GetModuleDirectory(hSelf);
+    std::wstring gameRoot = GetGameRootFromBinDir(binDir);
 
-    Log(L"代理 DLL 目录: " + win64Dir);
+    Log(L"代理 DLL 目录: " + binDir);
     Log(L"游戏根目录: " + gameRoot);
 
     std::wstring localMods = gameRoot + L"\\mods";
+    std::wstring forceDir = localMods + L"\\" + kForceLoadFolderName;
+
+    // 1. 优先加载前置 MOD（DD Mod Lib），强制启用
+    if (DirectoryExists(forceDir)) {
+        Log(L"[优先] 加载前置 MOD 目录: " + forceDir);
+        ScanAndLoadDLLs(forceDir, true);
+    }
+    else {
+        Log(L"未找到前置 MOD 目录: " + forceDir);
+    }
+
+    // 2. 再加载本地 mods 下其余 DLL（跳过 DD Mod Lib）
     Log(L"开始扫描本地 MOD: " + localMods);
-    ScanAndLoadDLLs(localMods);
+    ScanAndLoadDLLs(localMods, false, kForceLoadFolderName);
 
     std::wstring steamApps = gameRoot;
     PathRemoveFileSpecW(steamApps.data());
@@ -299,7 +333,6 @@ static DWORD WINAPI ModLoaderThread(LPVOID lpParam) {
         Log(L"创意工坊目录不存在，跳过: " + workshop);
     }
 
-    // 额外 MOD 目录（MO2 等）
     auto extraDirs = LoadExtraDirs();
     if (extraDirs.empty()) {
         Log(L"未配置额外 MOD 目录。");
@@ -314,13 +347,13 @@ static DWORD WINAPI ModLoaderThread(LPVOID lpParam) {
     return 0;
 }
 
-// ===================== DllMain =====================
+// ===================== DllMain（修改改名调用）=====================
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hModule);
 
-        std::wstring win64Dir = GetModuleDirectory(hModule);
-        std::wstring gameRoot = GetGameRootFromWin64(win64Dir);
+        std::wstring binDir = GetModuleDirectory(hModule);
+        std::wstring gameRoot = GetGameRootFromBinDir(binDir);
         std::wstring logPath = gameRoot + L"\\DDModLoader.log";
         LogInit(logPath);
         LoadConfig(gameRoot + L"\\DDModLoader.cfg");

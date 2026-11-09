@@ -38,6 +38,8 @@ struct LocStrings {
     const wchar_t* btnChooseRoot;
     const wchar_t* btnLaunchSteam;
     const wchar_t* btnLaunchOffline;
+    const wchar_t* menuLaunchOffline64;
+    const wchar_t* menuLaunchOffline32;
     const wchar_t* btnSave;
     const wchar_t* msgSaved;
     const wchar_t* msgInfoTitle;
@@ -75,6 +77,8 @@ static const LocStrings kZh = {
     L"选择游戏目录",
     L"从 Steam 启动",
     L"启动离线版",
+    L"启动 64 位版本 (win64)",
+    L"启动 32 位版本 (win32)",
     L"保存",
     L"配置已保存到 DDModLoader.cfg。",
     L"提示",
@@ -115,6 +119,8 @@ static const LocStrings kEn = {
     L"Choose Game Folder",
     L"Launch via Steam",
     L"Launch Offline",
+    L"Launch 64-bit version (win64)",
+    L"Launch 32-bit version (win32)",
     L"Save",
     L"Configuration saved to DDModLoader.cfg.",
     L"Info",
@@ -146,10 +152,13 @@ static const LocStrings kEn = {
 static const LocStrings* g_loc = nullptr;
 
 // ---------- 与加载器保持一致的排除名单 ----------
+static const std::wstring kForceLoadFolderName = L"DD Mod Lib";
+
 static const std::vector<std::wstring> kExcludedDlls = {
-    L"dbghelp.dll", L"fmod.dll", L"fmodstudio.dll", L"sdl2.dll",
-    L"glew32.dll", L"steam_api.dll", L"vcruntime140.dll",
-    L"vcruntime140_1.dll", L"msvcp140.dll"
+    L"dbghelp.dll", L"fmod.dll", L"fmod64.dll",
+    L"fmodstudio.dll", L"fmodstudio64.dll", L"sdl2.dll",
+    L"glew32.dll", L"glew64.dll", L"steam_api.dll", L"steam_api64.dll",
+    L"vcruntime140.dll", L"vcruntime140_1.dll", L"msvcp140.dll"
 };
 
 static bool IsExcluded(const std::wstring& name) {
@@ -334,7 +343,8 @@ static void ScanDllsRec(const std::wstring& dir, const std::wstring& modName,
     FindClose(h);
 }
 
-static void ScanModsFolder(const std::wstring& modsDir, std::vector<DllEntry>& out) {
+static void ScanModsFolder(const std::wstring& modsDir, std::vector<DllEntry>& out,
+    bool skipForceLoad = false) {
     if (!DirectoryExists(modsDir)) return;
 
     std::wstring rootName = PathFindFileNameW(modsDir.c_str());
@@ -347,6 +357,9 @@ static void ScanModsFolder(const std::wstring& modsDir, std::vector<DllEntry>& o
         if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
         std::wstring full = modsDir + L"\\" + fd.cFileName;
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            if (skipForceLoad &&
+                _wcsicmp(fd.cFileName, kForceLoadFolderName.c_str()) == 0)
+                continue;
             ScanDllsRec(full, fd.cFileName, out);
         }
         else if (PathMatchSpecW(fd.cFileName, L"*.dll") && !IsExcluded(fd.cFileName)) {
@@ -407,8 +420,16 @@ static bool g_suppressGroupUpdate = false;
 static bool IsValidGameRoot(const std::wstring& p0) {
     std::wstring p = TrimTrailingSlash(p0);
     if (p.empty() || !DirectoryExists(p)) return false;
-    return FileExists(p + L"\\_windows\\win64\\Darkest.exe") ||
-        FileExists(p + L"\\_windowsnosteam\\win64\\Darkest.exe");
+    static const wchar_t* kExeRels[] = {
+        L"\\_windows\\win64\\Darkest.exe",
+        L"\\_windows\\win32\\Darkest.exe",
+        L"\\_windowsnosteam\\win64\\Darkest.exe",
+        L"\\_windowsnosteam\\win32\\Darkest.exe",
+    };
+    for (auto rel : kExeRels) {
+        if (FileExists(p + rel)) return true;
+    }
+    return false;
 }
 
 static std::wstring DeriveSteamApps(const std::wstring& gameRoot) {
@@ -762,7 +783,7 @@ static void RefreshList() {
     ListView_RemoveAllGroups(g_hList);
     g_entries.clear();
 
-    ScanModsFolder(g_gameRoot + L"\\mods", g_entries);
+    ScanModsFolder(g_gameRoot + L"\\mods", g_entries, true);
     for (auto& extra : g_extraDirs) ScanModsFolder(extra, g_entries);
     std::wstring ws = GetWorkshopDir(g_gameRoot);
     if (!ws.empty()) ScanWorkshopFolder(ws, g_entries);
@@ -863,21 +884,66 @@ static void LaunchViaSteam() {
     }
 }
 
-static void LaunchOffline() {
-    std::wstring exe = g_gameRoot + L"\\_windowsnosteam\\win64\\Darkest.exe";
-    std::wstring workDir = g_gameRoot + L"\\_windowsnosteam\\win64";
+static bool LaunchOneOffline(const std::wstring& exe, const std::wstring& workDir) {
+    HINSTANCE r = ShellExecuteW(nullptr, L"open", exe.c_str(), nullptr,
+        workDir.c_str(), SW_SHOWNORMAL);
+    return (INT_PTR)r > 32;
+}
 
-    if (GetFileAttributesW(exe.c_str()) == INVALID_FILE_ATTRIBUTES) {
+static void LaunchOffline() {
+    const std::wstring exe64 = g_gameRoot + L"\\_windowsnosteam\\win64\\Darkest.exe";
+    const std::wstring dir64 = g_gameRoot + L"\\_windowsnosteam\\win64";
+    const std::wstring exe32 = g_gameRoot + L"\\_windowsnosteam\\win32\\Darkest.exe";
+    const std::wstring dir32 = g_gameRoot + L"\\_windowsnosteam\\win32";
+
+    const bool has64 = FileExists(exe64);
+    const bool has32 = FileExists(exe32);
+
+    if (!has64 && !has32) {
         wchar_t buf[2048];
-        swprintf_s(buf, g_loc->msgOfflineNotFoundFmt, exe.c_str());
+        std::wstring shown = exe64 + L"\n  " + exe32;
+        swprintf_s(buf, g_loc->msgOfflineNotFoundFmt, shown.c_str());
         MessageBoxW(g_hWnd, buf, g_loc->msgErrorTitle, MB_OK | MB_ICONERROR);
         return;
     }
 
-    HINSTANCE r = ShellExecuteW(nullptr, L"open", exe.c_str(), nullptr,
-        workDir.c_str(), SW_SHOWNORMAL);
-    if ((INT_PTR)r <= 32) {
-        MessageBoxW(g_hWnd, g_loc->msgOfflineFail, g_loc->msgErrorTitle, MB_OK | MB_ICONERROR);
+    // 只有 64 位
+    if (has64 && !has32) {
+        if (!LaunchOneOffline(exe64, dir64))
+            MessageBoxW(g_hWnd, g_loc->msgOfflineFail,
+                g_loc->msgErrorTitle, MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    // 只有 32 位
+    if (!has64 && has32) {
+        if (!LaunchOneOffline(exe32, dir32))
+            MessageBoxW(g_hWnd, g_loc->msgOfflineFail,
+                g_loc->msgErrorTitle, MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    // 两个都存在：让玩家选择
+    HMENU menu = CreatePopupMenu();
+    AppendMenuW(menu, MF_STRING, 1, g_loc->menuLaunchOffline64);
+    AppendMenuW(menu, MF_STRING, 2, g_loc->menuLaunchOffline32);
+
+    POINT pt;
+    GetCursorPos(&pt);
+    int cmd = TrackPopupMenu(menu,
+        TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
+        pt.x, pt.y, 0, g_hWnd, nullptr);
+    DestroyMenu(menu);
+
+    if (cmd == 0) return; // 玩家取消
+
+    bool ok;
+    if (cmd == 1) ok = LaunchOneOffline(exe64, dir64);
+    else          ok = LaunchOneOffline(exe32, dir32);
+
+    if (!ok) {
+        MessageBoxW(g_hWnd, g_loc->msgOfflineFail,
+            g_loc->msgErrorTitle, MB_OK | MB_ICONERROR);
     }
 }
 

@@ -1,9 +1,9 @@
 ﻿  DDModLoaderGUI.cpp
-G:\Doc\repo\DDModLoaderGUI\DDModLoaderGUI\DDModLoaderGUI.cpp(628,15): warning C4244: “初始化”: 从“LRESULT”转换到“int”，可能丢失数据
-G:\Doc\repo\DDModLoaderGUI\DDModLoaderGUI\DDModLoaderGUI.cpp(670,15): warning C4244: “初始化”: 从“LRESULT”转换到“int”，可能丢失数据
+G:\Doc\repo\DDModLoaderGUI\DDModLoaderGUI\DDModLoaderGUI.cpp(649,15): warning C4244: “初始化”: 从“LRESULT”转换到“int”，可能丢失数据
+G:\Doc\repo\DDModLoaderGUI\DDModLoaderGUI\DDModLoaderGUI.cpp(691,15): warning C4244: “初始化”: 从“LRESULT”转换到“int”，可能丢失数据
   正在生成代码
-  174 of 873 functions (19.9%) were compiled, the rest were copied from previous compilation.
-    59 functions were new in current compilation
-    168 functions had inline decision re-evaluated but remain unchanged
+  31 of 876 functions ( 3.5%) were compiled, the rest were copied from previous compilation.
+    4 functions were new in current compilation
+    39 functions had inline decision re-evaluated but remain unchanged
   已完成代码的生成
   DDModLoaderGUI.vcxproj -> G:\Doc\repo\DDModLoaderGUI\x64\Release\DDModLoaderGUI.exe
