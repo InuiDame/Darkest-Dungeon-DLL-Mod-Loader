@@ -175,6 +175,8 @@ struct DllEntry {
     std::wstring fullPath;
 };
 
+static std::wstring g_gameRoot;
+
 // ---------- 基础工具 ----------
 static bool DirectoryExists(const std::wstring& path) {
     DWORD a = GetFileAttributesW(path.c_str());
@@ -279,14 +281,19 @@ static void SaveConfig(const std::wstring& path,
     fclose(f);
 }
 
-// ---------- 额外 MOD 目录（与加载器共用） ----------
-// 存放于 %LOCALAPPDATA%\DDModLoader\extra_mods.cfg，每行一个绝对路径。
-static std::wstring GetExtraModsCfgPath() {
-    wchar_t lad[MAX_PATH] = {};
-    if (GetEnvironmentVariableW(L"LOCALAPPDATA", lad, MAX_PATH) == 0) return L"";
-    std::wstring d = std::wstring(lad) + L"\\DDModLoader";
+// 配置统一放在 <游戏根目录>\DDModLoader\cfg，与加载器保持一致
+static std::wstring GetCfgFilePath(const wchar_t* fileName) {
+    std::wstring d = g_gameRoot + L"\\DDModLoader";
     CreateDirectoryW(d.c_str(), nullptr);
-    return d + L"\\extra_mods.cfg";
+    d += L"\\cfg";
+    CreateDirectoryW(d.c_str(), nullptr);
+    return d + L"\\" + fileName;
+}
+
+// ---------- 额外 MOD 目录（与加载器共用） ----------
+// 存放于 <游戏根目录>\DDModLoader\cfg\extra_mods.cfg，每行一个绝对路径。
+static std::wstring GetExtraModsCfgPath() {
+    return GetCfgFilePath(L"extra_mods.cfg");
 }
 
 static std::vector<std::wstring> LoadExtraDirs() {
@@ -407,7 +414,6 @@ static void ScanWorkshopFolder(const std::wstring& wsDir, std::vector<DllEntry>&
 #define IDM_ENABLE_MOD      2003
 #define IDM_DISABLE_MOD     2004
 
-static std::wstring g_gameRoot;
 static std::wstring g_configPath;
 static std::vector<DllEntry> g_entries;
 static std::vector<std::wstring> g_extraDirs;   // 额外 MOD 目录
@@ -580,10 +586,13 @@ static std::wstring AutoDetectGameRoot() {
 }
 
 // ---------- GUI 配置持久化 ----------
+// 放在程序目录的 ini 子目录，默认安装时即 <游戏根目录>\DDModLoader\ini。
+// 这个文件保存着游戏目录，所以不能靠游戏目录来定位
 static std::wstring GetGuiIniPath() {
-    wchar_t lad[MAX_PATH] = {};
-    if (GetEnvironmentVariableW(L"LOCALAPPDATA", lad, MAX_PATH) == 0) return L"";
-    std::wstring d = std::wstring(lad) + L"\\DDModLoader";
+    wchar_t exeDir[MAX_PATH] = {};
+    if (!GetModuleFileNameW(nullptr, exeDir, MAX_PATH)) return L"";
+    PathRemoveFileSpecW(exeDir);
+    std::wstring d = std::wstring(exeDir) + L"\\ini";
     CreateDirectoryW(d.c_str(), nullptr);
     return d + L"\\gui.ini";
 }
@@ -802,6 +811,17 @@ static void RefreshList() {
         g_entries.swap(uniq);
     }
 
+    // 前置目录已有同名 DLL 时，加载器不会加载其他目录的副本，这里也不列出
+    {
+        std::vector<DllEntry> forceLoaded;
+        ScanDllsRec(g_gameRoot + L"\\mods\\" + kForceLoadFolderName, L"", forceLoaded);
+        std::unordered_map<std::wstring, bool> names;
+        for (auto& e : forceLoaded) names[NormalizePath(e.dllName)] = true;
+        g_entries.erase(std::remove_if(g_entries.begin(), g_entries.end(),
+            [&](const DllEntry& e) { return names.count(NormalizePath(e.dllName)) > 0; }),
+            g_entries.end());
+    }
+
     std::stable_sort(g_entries.begin(), g_entries.end(),
         [](const DllEntry& a, const DllEntry& b) {
             int c = _wcsicmp(a.modName.c_str(), b.modName.c_str());
@@ -957,7 +977,8 @@ static void SetAll(BOOL state) {
 
 static void ApplyNewGameRoot(const std::wstring& root) {
     g_gameRoot = TrimTrailingSlash(root);
-    g_configPath = g_gameRoot + L"\\DDModLoader.cfg";
+    g_configPath = GetCfgFilePath(L"DDModLoader.cfg");
+    g_extraDirs = LoadExtraDirs();
     SaveGameRoot(g_gameRoot);
     RefreshList();
 }
@@ -1174,8 +1195,6 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int nCmdShow) 
 
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
-    g_extraDirs = LoadExtraDirs();
-
     if (lpCmdLine && *lpCmdLine) {
         std::wstring arg = lpCmdLine;
         if (arg.size() >= 2 && arg.front() == L'"' && arg.back() == L'"')
@@ -1206,7 +1225,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int nCmdShow) 
     }
 
     g_gameRoot = TrimTrailingSlash(g_gameRoot);
-    g_configPath = g_gameRoot + L"\\DDModLoader.cfg";
+    g_configPath = GetCfgFilePath(L"DDModLoader.cfg");
+    g_extraDirs = LoadExtraDirs();
     SaveGameRoot(g_gameRoot);
     g_groupView = LoadSavedGroupView();
 

@@ -18,19 +18,20 @@
 static FILE* g_logFile = nullptr;
 static CRITICAL_SECTION g_logCs;
 
-static void LogInit(const std::wstring& fallbackPath) {
+// 优先写到 <游戏根目录>\DDModLoader\log，游戏目录不可写时退回用户目录和系统临时目录
+static void LogInit(const std::wstring& logPath) {
     InitializeCriticalSection(&g_logCs);
 
-    wchar_t localAppData[MAX_PATH] = {};
-    if (GetEnvironmentVariableW(L"LOCALAPPDATA", localAppData, MAX_PATH) > 0) {
-        std::wstring dir = std::wstring(localAppData) + L"\\DDModLoader";
-        CreateDirectoryW(dir.c_str(), nullptr);
-        std::wstring path = dir + L"\\DDModLoader.log";
-        _wfopen_s(&g_logFile, path.c_str(), L"w, ccs=UTF-8");
-    }
+    _wfopen_s(&g_logFile, logPath.c_str(), L"w, ccs=UTF-8");
 
     if (!g_logFile) {
-        _wfopen_s(&g_logFile, fallbackPath.c_str(), L"w, ccs=UTF-8");
+        wchar_t localAppData[MAX_PATH] = {};
+        if (GetEnvironmentVariableW(L"LOCALAPPDATA", localAppData, MAX_PATH) > 0) {
+            std::wstring dir = std::wstring(localAppData) + L"\\DDModLoader";
+            CreateDirectoryW(dir.c_str(), nullptr);
+            std::wstring path = dir + L"\\DDModLoader.log";
+            _wfopen_s(&g_logFile, path.c_str(), L"w, ccs=UTF-8");
+        }
     }
 
     if (!g_logFile) {
@@ -108,6 +109,16 @@ static std::wstring GetGameRootFromBinDir(const std::wstring& binDir) {
     return root;
 }
 
+// 配置和日志统一放在 <游戏根目录>\DDModLoader 的 cfg、log 子目录，与 GUI 保持一致
+static std::wstring GetDataDir(const std::wstring& gameRoot, const wchar_t* subDir) {
+    std::wstring dir = gameRoot + L"\\DDModLoader";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    dir += L"\\";
+    dir += subDir;
+    CreateDirectoryW(dir.c_str(), nullptr);
+    return dir;
+}
+
 static bool DirectoryExists(const std::wstring& path) {
     DWORD attr = GetFileAttributesW(path.c_str());
     return attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY);
@@ -118,6 +129,15 @@ static const std::wstring kForceLoadFolderName = L"DD Mod Lib";
 
 static int g_loadedCount = 0;
 static int g_failedCount = 0;
+
+// 前置目录中已成功加载的 DLL 文件名（小写）。其他目录的同名 DLL 不再加载，
+// 兼容仍在使用独立版的创意工坊玩家，避免同一个插件被按不同路径加载两次
+static std::unordered_set<std::wstring> g_forceLoadedNames;
+
+static std::wstring ToLowerName(std::wstring name) {
+    std::transform(name.begin(), name.end(), name.begin(), ::towlower);
+    return name;
+}
 
 static const std::unordered_set<std::wstring> kExcludedDlls = {
     L"dbghelp.dll",
@@ -224,6 +244,11 @@ static void ScanAndLoadDLLs(const std::wstring& directory,
             if (IsExcludedDll(fd.cFileName)) continue;
 
             if (!forceLoad) {
+                if (g_forceLoadedNames.count(ToLowerName(fd.cFileName))) {
+                    Log(L"跳过（前置目录已加载同名 DLL）-> " + fullPath);
+                    continue;
+                }
+
                 bool isNew = false;
                 if (!ShouldLoadDll(fullPath, isNew)) {
                     Log(L"跳过（配置已禁用）-> " + fullPath);
@@ -253,6 +278,7 @@ static void ScanAndLoadDLLs(const std::wstring& directory,
 
             if (hMod) {
                 g_loadedCount++;
+                if (forceLoad) g_forceLoadedNames.insert(ToLowerName(fd.cFileName));
                 Log(L"加载成功 -> " + fullPath);
             }
             else {
@@ -266,12 +292,10 @@ static void ScanAndLoadDLLs(const std::wstring& directory,
 
 
 // ===================== 额外 MOD 目录 =====================
-// 与 GUI 共用：%LOCALAPPDATA%\DDModLoader\extra_mods.cfg，每行一个绝对路径。
-static std::vector<std::wstring> LoadExtraDirs() {
+// 与 GUI 共用：<游戏根目录>\DDModLoader\cfg\extra_mods.cfg，每行一个绝对路径。
+static std::vector<std::wstring> LoadExtraDirs(const std::wstring& gameRoot) {
     std::vector<std::wstring> dirs;
-    wchar_t lad[MAX_PATH] = {};
-    if (GetEnvironmentVariableW(L"LOCALAPPDATA", lad, MAX_PATH) == 0) return dirs;
-    std::wstring p = std::wstring(lad) + L"\\DDModLoader\\extra_mods.cfg";
+    std::wstring p = GetDataDir(gameRoot, L"cfg") + L"\\extra_mods.cfg";
     FILE* f = nullptr;
     _wfopen_s(&f, p.c_str(), L"r, ccs=UTF-8");
     if (!f) return dirs;
@@ -333,7 +357,7 @@ static DWORD WINAPI ModLoaderThread(LPVOID lpParam) {
         Log(L"创意工坊目录不存在，跳过: " + workshop);
     }
 
-    auto extraDirs = LoadExtraDirs();
+    auto extraDirs = LoadExtraDirs(gameRoot);
     if (extraDirs.empty()) {
         Log(L"未配置额外 MOD 目录。");
     }
@@ -354,9 +378,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
 
         std::wstring binDir = GetModuleDirectory(hModule);
         std::wstring gameRoot = GetGameRootFromBinDir(binDir);
-        std::wstring logPath = gameRoot + L"\\DDModLoader.log";
-        LogInit(logPath);
-        LoadConfig(gameRoot + L"\\DDModLoader.cfg");
+        LogInit(GetDataDir(gameRoot, L"log") + L"\\DDModLoader.log");
+        LoadConfig(GetDataDir(gameRoot, L"cfg") + L"\\DDModLoader.cfg");
         Log(L"========== DDModLoader 启动 ==========");
 
         if (!InitMiniDumpForwarder()) {
