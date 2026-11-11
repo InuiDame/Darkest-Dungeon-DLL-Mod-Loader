@@ -1,0 +1,3199 @@
+---@meta dd_topics
+-- 本文件由 tools/gen_lua_types.py 从 sdk/lua/topics.json 生成，不要手改。
+-- 主题表：DDCore 1.0.0，Darkest.exe SHA1 9db2d73b89aa034e2055df65a139403e18df641f（Steam 版），主题 146 个。
+-- 离线版缺特征码时部分主题不可用，dd.on 返回 nil 和原因；运行时以 dd.on 的返回值为准。
+
+---主题名。native 插件自定义的主题也可以订阅，所以参数类型是 dd.Topic|string。
+---@alias dd.Topic
+---| "damage.pre" # 伤害结算前（Hero/Monster 受到伤害）。可写 damage，可取消：取消后伤害按 0 结算，不扣血、不进死门
+---| "damage.post" # 伤害结算后。damage 是实际传给游戏的伤害（被取消时为 0），hp_after 是结算后的生命
+---| "effect.pre" # Effect 应用到一个目标之前。可取消：跳过这一个目标。performer、target 是实际生效的双方
+---| "effect.post" # Effect 应用到一个目标之后
+---| "skill.pre" # 技能执行前。skill、target 可写但都是指针，Lua 不能写；Lua 只能读
+---| "skill.post" # 技能执行后
+---| "hit.pre" # 命中结算前。可写 hit（false 走未命中路径）、crit、damage
+---| "hit.post" # 命中结算后，hit、crit、damage 是最终值
+---| "battle.round.start" # 回合开始（含第一回合）
+---| "battle.round.end" # 回合结束前；战斗最后一回合没有，用 battle.end
+---| "battle.turn.start" # 英雄回合开始前（只有英雄回合）
+---| "battle.turn.end" # 英雄回合的 Combat_StartTurn 返回后（不是行动结束）
+---| "stress.pre" # 压力变化前（正数加压力，负数减压力）。可写 amount
+---| "stress.post" # 压力变化后。amount 是传给游戏的值，applied 是游戏返回的实际变化
+---| "heal.pre" # 治疗前。可写 amount
+---| "heal.post" # 治疗后。amount 是传给游戏的值，applied 是实际治疗量
+---| "app.tick" # 每帧一次（帧边界）
+---| "app.state" # 游戏状态机切换（from/to 是状态号，*_name 是状态名）
+---| "campaign.load" # 进入存档后。Lua Mod 在 main.lua 里订阅能收到这一次
+---| "campaign.unload" # 退出存档。按存档加载的 Lua Mod 收不到：DDLua 在这之前已经拆除了它们
+---| "battle.start" # 战斗创建（BattleCreatedEvent）。从存档恢复的战斗（撤退后重进同一格等）游戏不派发它 [静态]，见 03 的「战斗序号和 battle.start」
+---| "battle.end" # 战斗销毁（BattleDestroyedEvent）。这时怪物已移出战斗，怪物句柄已失效
+---| "actor.deathsdoor" # 英雄进入死门
+---| "actor.heartattack" # 心脏病发作
+---| "actor.death" # 英雄或怪物死亡（is_monster 区分；英雄看 hero_id，怪物看 monster_guid）
+---| "actor.affliction" # 英雄崩溃或美德
+---| "raid.start" # 开始探索。在加载线程上发生，一般是延迟事件（deferred 为 true，raid 为 nil）
+---| "raid.finish" # 探索结算
+---| "raid.step" # 队伍在地牢里走一步
+---| "raid.torch" # 火把亮度变化
+---| "town.enter" # 开始一次城镇访问（从地牢回城等；读城镇存档不经过这里）
+---| "town.event" # 城镇事件
+---| "town.building" # 建筑状态变化
+---| "town.activity" # 打开城镇活动
+---| "town.activity.finish" # 城镇活动结束
+---| "hero.recruit" # 招募英雄
+---| "hero.dismiss" # 解雇英雄
+---| "hero.quirk" # 英雄获得怪癖
+---| "hero.skill" # 英雄技能升级
+---| "inventory.add" # 物品加入库存。读档时有一部分在加载线程上派发，是延迟事件（07 覆盖表 172 次里 10 次），其余在主线程上
+---| "inventory.modified" # 库存变化（静态上没找到派发点，可能从不派发）
+---| "inventory.premerge" # 库存合并前
+---| "inventory.postmerge" # 库存合并后
+---| "estate.currency" # 庄园货币变化
+---| "native.EvaluateAchievementsEvent" # 游戏事件 EvaluateAchievementsEvent（只读）
+---| "native.InitedAchievementsEvent" # 游戏事件 InitedAchievementsEvent（只读）
+---| "native.SaveAchievementStateEvent" # 游戏事件 SaveAchievementStateEvent（只读）
+---| "native.AwardAchievementEvent" # 游戏事件 AwardAchievementEvent（只读）（不可用：没有 Listener<T const> 虚表：游戏没有对应的 Listener 类型描述符（类型没有派发点，无法用 __RTDynamicCast 伪造））
+---| "native.MailingListSignUpEvent" # 游戏事件 MailingListSignUpEvent（只读）
+---| "native.MailingListReminderEvent" # 游戏事件 MailingListReminderEvent（只读）
+---| "native.MailingListReminderSeenEvent" # 游戏事件 MailingListReminderSeenEvent（只读）
+---| "native.LocalizationAvailableEvent" # 游戏事件 LocalizationAvailableEvent（只读）
+---| "native.AreaTileContentsChangedEvent" # 游戏事件 AreaTileContentsChangedEvent（只读）
+---| "native.AreaTileKnowledgeEvent" # 游戏事件 AreaTileKnowledgeEvent（只读）
+---| "native.AreaKnowledgeEvent" # 游戏事件 AreaKnowledgeEvent（只读）
+---| "native.ScoutingEvent" # 游戏事件 ScoutingEvent（只读）
+---| "native.ScoutingCurioEvent" # 游戏事件 ScoutingCurioEvent（只读）
+---| "native.BattleAttackEvent" # 游戏事件 BattleAttackEvent（只读）
+---| "native.TrinketTriggeredEvent" # 游戏事件 TrinketTriggeredEvent（只读）
+---| "native.CaptorBurnRedirectEvent" # 游戏事件 CaptorBurnRedirectEvent（只读）
+---| "native.BattleCreatedEvent" # 游戏事件 BattleCreatedEvent（只读）
+---| "native.BattleDestroyedEvent" # 游戏事件 BattleDestroyedEvent（只读）
+---| "native.MonsterDeathEvent" # 游戏事件 MonsterDeathEvent（只读）
+---| "native.CaptureEvent" # 游戏事件 CaptureEvent（只读）
+---| "native.ReleaseStartEvent" # 游戏事件 ReleaseStartEvent（只读）
+---| "native.ReleaseFinishEvent" # 游戏事件 ReleaseFinishEvent（只读）
+---| "native.TeleportEvent" # 游戏事件 TeleportEvent（只读）
+---| "native.MonsterBattleStageEvent" # 游戏事件 MonsterBattleStageEvent（只读）
+---| "native.DeathDamageEvent" # 游戏事件 DeathDamageEvent（只读）
+---| "native.HeartAttackEvent" # 游戏事件 HeartAttackEvent（只读）
+---| "native.ActorDazedEvent" # 游戏事件 ActorDazedEvent（只读）
+---| "native.HeroDeathEvent" # 游戏事件 HeroDeathEvent（只读）
+---| "native.HeroSurvivedDeathsDoorAttackEvent" # 游戏事件 HeroSurvivedDeathsDoorAttackEvent（只读）
+---| "native.HeroSkillUpgradedEvent" # 游戏事件 HeroSkillUpgradedEvent（只读）
+---| "native.HeroWeaponAndArmourUpgradedEvent" # 游戏事件 HeroWeaponAndArmourUpgradedEvent（只读）
+---| "native.QuirkAppliedEvent" # 游戏事件 QuirkAppliedEvent（只读）
+---| "native.HeroActOutStartEvent" # 游戏事件 HeroActOutStartEvent（只读）
+---| "native.HeroActOutFinishEvent" # 游戏事件 HeroActOutFinishEvent（只读）
+---| "native.HeroAfflictionVirtueEvent" # 游戏事件 HeroAfflictionVirtueEvent（只读）
+---| "native.HeroUsedItemEvent" # 游戏事件 HeroUsedItemEvent（只读）
+---| "native.HeroReachedDeathsDoorEvent" # 游戏事件 HeroReachedDeathsDoorEvent（只读）
+---| "native.InventoryAddItemEvent" # 游戏事件 InventoryAddItemEvent（只读）
+---| "native.InventoryPreMergeEvent" # 游戏事件 InventoryPreMergeEvent（只读）
+---| "native.InventoryPostMergeEvent" # 游戏事件 InventoryPostMergeEvent（只读）
+---| "native.InventoryModifiedEvent" # 游戏事件 InventoryModifiedEvent（只读）
+---| "native.LaunchCreditsEvent" # 游戏事件 LaunchCreditsEvent（只读）
+---| "native.OptionsSavedEvent" # 游戏事件 OptionsSavedEvent（只读）
+---| "native.PlayFabConnectionInitializedEvent" # 游戏事件 PlayFabConnectionInitializedEvent（只读）
+---| "native.PlayFabReconnectedEvent" # 游戏事件 PlayFabReconnectedEvent（只读）
+---| "native.PlayFabConnectionLostEvent" # 游戏事件 PlayFabConnectionLostEvent（只读）
+---| "native.PlayFabLocalizedDataAvailableEvent" # 游戏事件 PlayFabLocalizedDataAvailableEvent（只读）
+---| "native.PlayFabFinishPostMatchDataUpdatesEvent" # 游戏事件 PlayFabFinishPostMatchDataUpdatesEvent（只读）
+---| "native.ReceivedExternalTurnMetaDataInSimpleMPEvent" # 游戏事件 ReceivedExternalTurnMetaDataInSimpleMPEvent（只读）
+---| "native.ExternalSubsystemMultiplayerMessageReceivedEvent" # 游戏事件 ExternalSubsystemMultiplayerMessageReceivedEvent（只读）
+---| "native.RaidStartEvent" # 游戏事件 RaidStartEvent（只读）
+---| "native.PartyStepEvent" # 游戏事件 PartyStepEvent（只读）
+---| "native.RaidFinishResultsEvent" # 游戏事件 RaidFinishResultsEvent（只读）
+---| "native.RaidGoalsCompleteEvent" # 游戏事件 RaidGoalsCompleteEvent（只读）
+---| "native.RaidMapGenerated" # 游戏事件 RaidMapGenerated（只读）
+---| "native.PreRaidFinishResultsEvent" # 游戏事件 PreRaidFinishResultsEvent（只读）
+---| "native.TorchModifiedEvent" # 游戏事件 TorchModifiedEvent（只读）
+---| "native.PrisonerRescuedEvent" # 游戏事件 PrisonerRescuedEvent（只读）
+---| "native.QueueWaveLogicBarkEvent" # 游戏事件 QueueWaveLogicBarkEvent（只读）
+---| "native.MaxPrestigeEvent" # 游戏事件 MaxPrestigeEvent（只读）
+---| "native.RosterListHeroDDEffectEvent" # 游戏事件 RosterListHeroDDEffectEvent（只读）
+---| "native.RosterListHeroDDEffectClearedEvent" # 游戏事件 RosterListHeroDDEffectClearedEvent（只读）
+---| "native.JournalPopupStartEvent" # 游戏事件 JournalPopupStartEvent（只读）
+---| "native.HeroStartBarkEvent" # 游戏事件 HeroStartBarkEvent（只读）
+---| "native.ActivityOpenedEvent" # 游戏事件 ActivityOpenedEvent（只读）
+---| "native.ActivityFinishedEvent" # 游戏事件 ActivityFinishedEvent（只读）
+---| "native.QuirkLockedEvent" # 游戏事件 QuirkLockedEvent（只读）
+---| "native.PositiveQuirkTreatedEvent" # 游戏事件 PositiveQuirkTreatedEvent（只读）
+---| "native.NegativeQuirkTreatedEvent" # 游戏事件 NegativeQuirkTreatedEvent（只读）
+---| "native.BuildingStateChangedEvent" # 游戏事件 BuildingStateChangedEvent（只读）
+---| "native.EstateCurrencyChangeEvent" # 游戏事件 EstateCurrencyChangeEvent（只读）
+---| "native.HeroDismissedEvent" # 游戏事件 HeroDismissedEvent（只读）
+---| "native.BuildingUpgradedEvent" # 游戏事件 BuildingUpgradedEvent（只读）
+---| "native.RealmInventoryChangedEvent" # 游戏事件 RealmInventoryChangedEvent（只读）
+---| "native.HeroRecruitedEvent" # 游戏事件 HeroRecruitedEvent（只读）
+---| "native.TownEventOnStartTownVisitEvent" # 游戏事件 TownEventOnStartTownVisitEvent（只读）
+---| "native.PreOnStartTownVisitEvent" # 游戏事件 PreOnStartTownVisitEvent（只读）
+---| "native.PostOnStartTownVisitEvent" # 游戏事件 PostOnStartTownVisitEvent（只读）
+---| "native.DistrictBuildingBuiltEvent" # 游戏事件 DistrictBuildingBuiltEvent（只读）
+---| "native.PrestigeUpdatedEvent" # 游戏事件 PrestigeUpdatedEvent（只读）
+---| "native.PlayFabAchievementsUpdatedEvent" # 游戏事件 PlayFabAchievementsUpdatedEvent（只读）
+---| "native.PrestigeAndPlayFabAchievementsUpdatedEvent" # 游戏事件 PrestigeAndPlayFabAchievementsUpdatedEvent（只读）
+---| "native.ArenaUnlocksUpdatedEvent" # 游戏事件 ArenaUnlocksUpdatedEvent（只读）
+---| "native.TutorialPopupStartEvent" # 游戏事件 TutorialPopupStartEvent（只读）
+---| "native.TutorialPopupFinishEvent" # 游戏事件 TutorialPopupFinishEvent（只读）
+---| "native.ResidentOccupiesActivityEvent" # 游戏事件 ResidentOccupiesActivityEvent（只读）
+---| "native.ActivitySlotTakenEvent" # 游戏事件 ActivitySlotTakenEvent（只读）
+---| "native.ActivityUnconfirmedSlotCountEvent" # 游戏事件 ActivityUnconfirmedSlotCountEvent（只读）
+---| "native.UpdateHeroStressEvent" # 游戏事件 UpdateHeroStressEvent（只读）
+---| "native.RosterListRandomBarkEvent" # 游戏事件 RosterListRandomBarkEvent（只读）
+---| "native.StageCoachBarkEvent" # 游戏事件 StageCoachBarkEvent（只读）
+---| "query.CampingPointBuffQuery" # 游戏询问 CampingPointBuffQuery：可写结果字段，不能取消
+---| "query.CurioInteractionBuffQuery" # 游戏询问 CurioInteractionBuffQuery：可写结果字段，不能取消
+---| "query.IsDisabledQuery" # 游戏询问 IsDisabledQuery：可写结果字段，不能取消
+---| "query.InventoryExtraStackingLimitQuery" # 游戏询问 InventoryExtraStackingLimitQuery：可写结果字段，不能取消
+---| "query.InventoryReplacementEffectIdQuery" # 游戏询问 InventoryReplacementEffectIdQuery：可写结果字段，不能取消
+---| "query.LootDarknessBuffQuery" # 游戏询问 LootDarknessBuffQuery：可写结果字段，不能取消
+---| "query.TownGoldInterestBuffQuery" # 游戏询问 TownGoldInterestBuffQuery：可写结果字段，不能取消（不可用：没有 Listener<T> 虚表：游戏没有对应的 Listener 类型描述符（类型没有派发点，无法用 __RTDynamicCast 伪造））
+---| "query.TownVisitIdleStressBuffQuery" # 游戏询问 TownVisitIdleStressBuffQuery：可写结果字段，不能取消
+---| "query.ProvisionSupplyBuffQuery" # 游戏询问 ProvisionSupplyBuffQuery：可写结果字段，不能取消
+---| "query.ProvisionIsItemTooltipsEnabledQuery" # 游戏询问 ProvisionIsItemTooltipsEnabledQuery：可写结果字段，不能取消
+---| "query.FindNonRosterHeroesQuery" # 游戏询问 FindNonRosterHeroesQuery：可写结果字段，不能取消
+
+-- ---- damage.pre
+---伤害结算前（Hero/Monster 受到伤害）。可写 damage，可取消：取消后伤害按 0 结算，不扣血、不进死门
+---@class dd.fields.damage.pre
+---@field target dd.Actor? Hero/Monster 转成 actor 句柄，其他指针和延迟事件为 nil
+---@field attacker dd.Actor? Hero/Monster 转成 actor 句柄，其他指针和延迟事件为 nil
+---@field damage number 可写
+---@field damage_type integer
+---@field source_id integer
+---@field source_type integer
+---@field crit boolean
+---@field hp_before number
+---@field is_hero boolean
+---damage.pre 的事件负载，只在回调执行期间有效
+---@class dd.ev.damage.pre : dd.Event, dd.fields.damage.pre
+---damage.pre 的 dd.wait_event 快照
+---@class dd.snap.damage.pre : dd.Snapshot, dd.fields.damage.pre
+---damage.pre 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.damage.pre
+---@field target? dd.Actor
+---@field attacker? dd.Actor
+---@field damage? number
+---@field damage_type? integer
+---@field source_id? integer
+---@field source_type? integer
+---@field crit? boolean
+---@field hp_before? number
+---@field is_hero? boolean
+---@class dd.opts.damage.pre : dd.OnOptions
+---@field filter? dd.filter.damage.pre
+
+-- ---- damage.post
+---伤害结算后。damage 是实际传给游戏的伤害（被取消时为 0），hp_after 是结算后的生命
+---@class dd.fields.damage.post
+---@field target dd.Actor? Hero/Monster 转成 actor 句柄，其他指针和延迟事件为 nil
+---@field attacker dd.Actor? Hero/Monster 转成 actor 句柄，其他指针和延迟事件为 nil
+---@field damage number
+---@field damage_type integer
+---@field source_id integer
+---@field source_type integer
+---@field crit boolean
+---@field hp_before number
+---@field is_hero boolean
+---@field hp_after number
+---@field timeline nil 游戏指针，Lua 里恒为 nil
+---@field cancelled boolean
+---damage.post 的事件负载，只在回调执行期间有效
+---@class dd.ev.damage.post : dd.Event, dd.fields.damage.post
+---damage.post 的 dd.wait_event 快照
+---@class dd.snap.damage.post : dd.Snapshot, dd.fields.damage.post
+---damage.post 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.damage.post
+---@field target? dd.Actor
+---@field attacker? dd.Actor
+---@field damage? number
+---@field damage_type? integer
+---@field source_id? integer
+---@field source_type? integer
+---@field crit? boolean
+---@field hp_before? number
+---@field is_hero? boolean
+---@field hp_after? number
+---@field timeline? dd.Actor
+---@field cancelled? boolean
+---@class dd.opts.damage.post : dd.OnOptions
+---@field filter? dd.filter.damage.post
+
+-- ---- effect.pre
+---Effect 应用到一个目标之前。可取消：跳过这一个目标。performer、target 是实际生效的双方
+---@class dd.fields.effect.pre
+---@field performer dd.Actor? Hero/Monster 转成 actor 句柄，其他指针和延迟事件为 nil
+---@field target dd.Actor? Hero/Monster 转成 actor 句柄，其他指针和延迟事件为 nil
+---@field effect nil 游戏指针，Lua 里恒为 nil
+---@field item nil 游戏指针，Lua 里恒为 nil
+---@field source integer
+---@field stress_amount number
+---@field heal_amount number
+---@field target_stress number
+---@field target_hp number
+---effect.pre 的事件负载，只在回调执行期间有效
+---@class dd.ev.effect.pre : dd.Event, dd.fields.effect.pre
+---effect.pre 的 dd.wait_event 快照
+---@class dd.snap.effect.pre : dd.Snapshot, dd.fields.effect.pre
+---effect.pre 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.effect.pre
+---@field performer? dd.Actor
+---@field target? dd.Actor
+---@field effect? dd.Actor
+---@field item? dd.Actor
+---@field source? integer
+---@field stress_amount? number
+---@field heal_amount? number
+---@field target_stress? number
+---@field target_hp? number
+---@class dd.opts.effect.pre : dd.OnOptions
+---@field filter? dd.filter.effect.pre
+
+-- ---- effect.post
+---Effect 应用到一个目标之后
+---@class dd.fields.effect.post
+---@field performer dd.Actor? Hero/Monster 转成 actor 句柄，其他指针和延迟事件为 nil
+---@field target dd.Actor? Hero/Monster 转成 actor 句柄，其他指针和延迟事件为 nil
+---@field effect nil 游戏指针，Lua 里恒为 nil
+---@field item nil 游戏指针，Lua 里恒为 nil
+---@field source integer
+---@field stress_amount number
+---@field heal_amount number
+---@field target_stress number
+---@field target_hp number
+---@field target_stress_after number
+---@field target_hp_after number
+---@field cancelled boolean
+---effect.post 的事件负载，只在回调执行期间有效
+---@class dd.ev.effect.post : dd.Event, dd.fields.effect.post
+---effect.post 的 dd.wait_event 快照
+---@class dd.snap.effect.post : dd.Snapshot, dd.fields.effect.post
+---effect.post 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.effect.post
+---@field performer? dd.Actor
+---@field target? dd.Actor
+---@field effect? dd.Actor
+---@field item? dd.Actor
+---@field source? integer
+---@field stress_amount? number
+---@field heal_amount? number
+---@field target_stress? number
+---@field target_hp? number
+---@field target_stress_after? number
+---@field target_hp_after? number
+---@field cancelled? boolean
+---@class dd.opts.effect.post : dd.OnOptions
+---@field filter? dd.filter.effect.post
+
+-- ---- skill.pre
+---技能执行前。skill、target 可写但都是指针，Lua 不能写；Lua 只能读
+---@class dd.fields.skill.pre
+---@field performer dd.Actor? Hero/Monster 转成 actor 句柄，其他指针和延迟事件为 nil
+---@field skill nil 游戏指针，Lua 里恒为 nil，SDK 可写，Lua 不能写
+---@field target dd.Actor? Hero/Monster 转成 actor 句柄，其他指针和延迟事件为 nil，SDK 可写，Lua 不能写
+---@field target_count integer
+---@field friendly boolean
+---skill.pre 的事件负载，只在回调执行期间有效
+---@class dd.ev.skill.pre : dd.Event, dd.fields.skill.pre
+---skill.pre 的 dd.wait_event 快照
+---@class dd.snap.skill.pre : dd.Snapshot, dd.fields.skill.pre
+---skill.pre 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.skill.pre
+---@field performer? dd.Actor
+---@field skill? dd.Actor
+---@field target? dd.Actor
+---@field target_count? integer
+---@field friendly? boolean
+---@class dd.opts.skill.pre : dd.OnOptions
+---@field filter? dd.filter.skill.pre
+
+-- ---- skill.post
+---技能执行后
+---@class dd.fields.skill.post
+---@field performer dd.Actor? Hero/Monster 转成 actor 句柄，其他指针和延迟事件为 nil
+---@field skill nil 游戏指针，Lua 里恒为 nil
+---@field target dd.Actor? Hero/Monster 转成 actor 句柄，其他指针和延迟事件为 nil
+---@field target_count integer
+---@field friendly boolean
+---skill.post 的事件负载，只在回调执行期间有效
+---@class dd.ev.skill.post : dd.Event, dd.fields.skill.post
+---skill.post 的 dd.wait_event 快照
+---@class dd.snap.skill.post : dd.Snapshot, dd.fields.skill.post
+---skill.post 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.skill.post
+---@field performer? dd.Actor
+---@field skill? dd.Actor
+---@field target? dd.Actor
+---@field target_count? integer
+---@field friendly? boolean
+---@class dd.opts.skill.post : dd.OnOptions
+---@field filter? dd.filter.skill.post
+
+-- ---- hit.pre
+---命中结算前。可写 hit（false 走未命中路径）、crit、damage
+---@class dd.fields.hit.pre
+---@field attacker dd.Actor? Hero/Monster 转成 actor 句柄，其他指针和延迟事件为 nil
+---@field target dd.Actor? Hero/Monster 转成 actor 句柄，其他指针和延迟事件为 nil
+---@field skill nil 游戏指针，Lua 里恒为 nil
+---@field hit boolean 可写
+---@field crit boolean 可写
+---@field damage number 可写
+---hit.pre 的事件负载，只在回调执行期间有效
+---@class dd.ev.hit.pre : dd.Event, dd.fields.hit.pre
+---hit.pre 的 dd.wait_event 快照
+---@class dd.snap.hit.pre : dd.Snapshot, dd.fields.hit.pre
+---hit.pre 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.hit.pre
+---@field attacker? dd.Actor
+---@field target? dd.Actor
+---@field skill? dd.Actor
+---@field hit? boolean
+---@field crit? boolean
+---@field damage? number
+---@class dd.opts.hit.pre : dd.OnOptions
+---@field filter? dd.filter.hit.pre
+
+-- ---- hit.post
+---命中结算后，hit、crit、damage 是最终值
+---@class dd.fields.hit.post
+---@field attacker dd.Actor? Hero/Monster 转成 actor 句柄，其他指针和延迟事件为 nil
+---@field target dd.Actor? Hero/Monster 转成 actor 句柄，其他指针和延迟事件为 nil
+---@field skill nil 游戏指针，Lua 里恒为 nil
+---@field hit boolean
+---@field crit boolean
+---@field damage number
+---hit.post 的事件负载，只在回调执行期间有效
+---@class dd.ev.hit.post : dd.Event, dd.fields.hit.post
+---hit.post 的 dd.wait_event 快照
+---@class dd.snap.hit.post : dd.Snapshot, dd.fields.hit.post
+---hit.post 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.hit.post
+---@field attacker? dd.Actor
+---@field target? dd.Actor
+---@field skill? dd.Actor
+---@field hit? boolean
+---@field crit? boolean
+---@field damage? number
+---@class dd.opts.hit.post : dd.OnOptions
+---@field filter? dd.filter.hit.post
+
+-- ---- battle.round.start
+---回合开始（含第一回合）
+---@class dd.fields.battle.round.start
+---@field battle nil 游戏指针，Lua 里恒为 nil
+---@field round integer
+---battle.round.start 的事件负载，只在回调执行期间有效
+---@class dd.ev.battle.round.start : dd.Event, dd.fields.battle.round.start
+---battle.round.start 的 dd.wait_event 快照
+---@class dd.snap.battle.round.start : dd.Snapshot, dd.fields.battle.round.start
+---battle.round.start 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.battle.round.start
+---@field battle? dd.Actor
+---@field round? integer
+---@class dd.opts.battle.round.start : dd.OnOptions
+---@field filter? dd.filter.battle.round.start
+
+-- ---- battle.round.end
+---回合结束前；战斗最后一回合没有，用 battle.end
+---@class dd.fields.battle.round.end
+---@field battle nil 游戏指针，Lua 里恒为 nil
+---@field round integer
+---battle.round.end 的事件负载，只在回调执行期间有效
+---@class dd.ev.battle.round.end : dd.Event, dd.fields.battle.round.end
+---battle.round.end 的 dd.wait_event 快照
+---@class dd.snap.battle.round.end : dd.Snapshot, dd.fields.battle.round.end
+---battle.round.end 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.battle.round.end
+---@field battle? dd.Actor
+---@field round? integer
+---@class dd.opts.battle.round.end : dd.OnOptions
+---@field filter? dd.filter.battle.round.end
+
+-- ---- battle.turn.start
+---英雄回合开始前（只有英雄回合）
+---@class dd.fields.battle.turn.start
+---@field actor dd.Actor? Hero/Monster 转成 actor 句柄，其他指针和延迟事件为 nil
+---battle.turn.start 的事件负载，只在回调执行期间有效
+---@class dd.ev.battle.turn.start : dd.Event, dd.fields.battle.turn.start
+---battle.turn.start 的 dd.wait_event 快照
+---@class dd.snap.battle.turn.start : dd.Snapshot, dd.fields.battle.turn.start
+---battle.turn.start 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.battle.turn.start
+---@field actor? dd.Actor
+---@class dd.opts.battle.turn.start : dd.OnOptions
+---@field filter? dd.filter.battle.turn.start
+
+-- ---- battle.turn.end
+---英雄回合的 Combat_StartTurn 返回后（不是行动结束）
+---@class dd.fields.battle.turn.end
+---@field actor dd.Actor? Hero/Monster 转成 actor 句柄，其他指针和延迟事件为 nil
+---@field result integer
+---battle.turn.end 的事件负载，只在回调执行期间有效
+---@class dd.ev.battle.turn.end : dd.Event, dd.fields.battle.turn.end
+---battle.turn.end 的 dd.wait_event 快照
+---@class dd.snap.battle.turn.end : dd.Snapshot, dd.fields.battle.turn.end
+---battle.turn.end 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.battle.turn.end
+---@field actor? dd.Actor
+---@field result? integer
+---@class dd.opts.battle.turn.end : dd.OnOptions
+---@field filter? dd.filter.battle.turn.end
+
+-- ---- stress.pre
+---压力变化前（正数加压力，负数减压力）。可写 amount
+---@class dd.fields.stress.pre
+---@field target dd.Actor? Hero/Monster 转成 actor 句柄，其他指针和延迟事件为 nil
+---@field source dd.Actor? Hero/Monster 转成 actor 句柄，其他指针和延迟事件为 nil
+---@field amount number 可写
+---@field type integer
+---@field stress_before number
+---stress.pre 的事件负载，只在回调执行期间有效
+---@class dd.ev.stress.pre : dd.Event, dd.fields.stress.pre
+---stress.pre 的 dd.wait_event 快照
+---@class dd.snap.stress.pre : dd.Snapshot, dd.fields.stress.pre
+---stress.pre 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.stress.pre
+---@field target? dd.Actor
+---@field source? dd.Actor
+---@field amount? number
+---@field type? integer
+---@field stress_before? number
+---@class dd.opts.stress.pre : dd.OnOptions
+---@field filter? dd.filter.stress.pre
+
+-- ---- stress.post
+---压力变化后。amount 是传给游戏的值，applied 是游戏返回的实际变化
+---@class dd.fields.stress.post
+---@field target dd.Actor? Hero/Monster 转成 actor 句柄，其他指针和延迟事件为 nil
+---@field source dd.Actor? Hero/Monster 转成 actor 句柄，其他指针和延迟事件为 nil
+---@field amount number
+---@field type integer
+---@field stress_before number
+---@field applied number
+---@field stress_after number
+---stress.post 的事件负载，只在回调执行期间有效
+---@class dd.ev.stress.post : dd.Event, dd.fields.stress.post
+---stress.post 的 dd.wait_event 快照
+---@class dd.snap.stress.post : dd.Snapshot, dd.fields.stress.post
+---stress.post 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.stress.post
+---@field target? dd.Actor
+---@field source? dd.Actor
+---@field amount? number
+---@field type? integer
+---@field stress_before? number
+---@field applied? number
+---@field stress_after? number
+---@class dd.opts.stress.post : dd.OnOptions
+---@field filter? dd.filter.stress.post
+
+-- ---- heal.pre
+---治疗前。可写 amount
+---@class dd.fields.heal.pre
+---@field target dd.Actor? Hero/Monster 转成 actor 句柄，其他指针和延迟事件为 nil
+---@field healer dd.Actor? Hero/Monster 转成 actor 句柄，其他指针和延迟事件为 nil
+---@field amount number 可写
+---@field type integer
+---@field crit boolean
+---@field hp_before number
+---heal.pre 的事件负载，只在回调执行期间有效
+---@class dd.ev.heal.pre : dd.Event, dd.fields.heal.pre
+---heal.pre 的 dd.wait_event 快照
+---@class dd.snap.heal.pre : dd.Snapshot, dd.fields.heal.pre
+---heal.pre 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.heal.pre
+---@field target? dd.Actor
+---@field healer? dd.Actor
+---@field amount? number
+---@field type? integer
+---@field crit? boolean
+---@field hp_before? number
+---@class dd.opts.heal.pre : dd.OnOptions
+---@field filter? dd.filter.heal.pre
+
+-- ---- heal.post
+---治疗后。amount 是传给游戏的值，applied 是实际治疗量
+---@class dd.fields.heal.post
+---@field target dd.Actor? Hero/Monster 转成 actor 句柄，其他指针和延迟事件为 nil
+---@field healer dd.Actor? Hero/Monster 转成 actor 句柄，其他指针和延迟事件为 nil
+---@field amount number
+---@field type integer
+---@field crit boolean
+---@field hp_before number
+---@field applied number
+---@field hp_after number
+---heal.post 的事件负载，只在回调执行期间有效
+---@class dd.ev.heal.post : dd.Event, dd.fields.heal.post
+---heal.post 的 dd.wait_event 快照
+---@class dd.snap.heal.post : dd.Snapshot, dd.fields.heal.post
+---heal.post 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.heal.post
+---@field target? dd.Actor
+---@field healer? dd.Actor
+---@field amount? number
+---@field type? integer
+---@field crit? boolean
+---@field hp_before? number
+---@field applied? number
+---@field hp_after? number
+---@class dd.opts.heal.post : dd.OnOptions
+---@field filter? dd.filter.heal.post
+
+-- ---- app.tick
+---每帧一次（帧边界）
+---@class dd.fields.app.tick
+---@field frame integer
+---app.tick 的事件负载，只在回调执行期间有效
+---@class dd.ev.app.tick : dd.Event, dd.fields.app.tick
+---app.tick 的 dd.wait_event 快照
+---@class dd.snap.app.tick : dd.Snapshot, dd.fields.app.tick
+---app.tick 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.app.tick
+---@field frame? integer
+---@class dd.opts.app.tick : dd.OnOptions
+---@field filter? dd.filter.app.tick
+
+-- ---- app.state
+---游戏状态机切换（from/to 是状态号，*_name 是状态名）
+---@class dd.fields.app.state
+---@field from integer
+---@field to integer
+---@field from_name string
+---@field to_name string
+---app.state 的事件负载，只在回调执行期间有效
+---@class dd.ev.app.state : dd.Event, dd.fields.app.state
+---app.state 的 dd.wait_event 快照
+---@class dd.snap.app.state : dd.Snapshot, dd.fields.app.state
+---app.state 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.app.state
+---@field from? integer
+---@field to? integer
+---@field from_name? string
+---@field to_name? string
+---@class dd.opts.app.state : dd.OnOptions
+---@field filter? dd.filter.app.state
+
+-- ---- campaign.load
+---进入存档后。Lua Mod 在 main.lua 里订阅能收到这一次
+---@class dd.fields.campaign.load
+---@field serial integer
+---@field campaign nil 游戏指针，Lua 里恒为 nil
+---campaign.load 的事件负载，只在回调执行期间有效
+---@class dd.ev.campaign.load : dd.Event, dd.fields.campaign.load
+---campaign.load 的 dd.wait_event 快照
+---@class dd.snap.campaign.load : dd.Snapshot, dd.fields.campaign.load
+---campaign.load 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.campaign.load
+---@field serial? integer
+---@field campaign? dd.Actor
+---@class dd.opts.campaign.load : dd.OnOptions
+---@field filter? dd.filter.campaign.load
+
+-- ---- campaign.unload
+---退出存档。按存档加载的 Lua Mod 收不到：DDLua 在这之前已经拆除了它们
+---@class dd.fields.campaign.unload
+---@field serial integer
+---campaign.unload 的事件负载，只在回调执行期间有效
+---@class dd.ev.campaign.unload : dd.Event, dd.fields.campaign.unload
+---campaign.unload 的 dd.wait_event 快照
+---@class dd.snap.campaign.unload : dd.Snapshot, dd.fields.campaign.unload
+---campaign.unload 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.campaign.unload
+---@field serial? integer
+---@class dd.opts.campaign.unload : dd.OnOptions
+---@field filter? dd.filter.campaign.unload
+
+-- ---- battle.start
+---战斗创建（BattleCreatedEvent）。从存档恢复的战斗（撤退后重进同一格等）游戏不派发它 [静态]，见 03 的「战斗序号和 battle.start」
+---@class dd.fields.battle.start
+---battle.start 的事件负载，只在回调执行期间有效
+---@class dd.ev.battle.start : dd.Event, dd.fields.battle.start
+---battle.start 的 dd.wait_event 快照
+---@class dd.snap.battle.start : dd.Snapshot, dd.fields.battle.start
+---battle.start 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.battle.start
+---@class dd.opts.battle.start : dd.OnOptions
+---@field filter? dd.filter.battle.start
+
+-- ---- battle.end
+---战斗销毁（BattleDestroyedEvent）。这时怪物已移出战斗，怪物句柄已失效
+---@class dd.fields.battle.end
+---battle.end 的事件负载，只在回调执行期间有效
+---@class dd.ev.battle.end : dd.Event, dd.fields.battle.end
+---battle.end 的 dd.wait_event 快照
+---@class dd.snap.battle.end : dd.Snapshot, dd.fields.battle.end
+---battle.end 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.battle.end
+---@class dd.opts.battle.end : dd.OnOptions
+---@field filter? dd.filter.battle.end
+
+-- ---- actor.deathsdoor
+---英雄进入死门
+---@class dd.fields.actor.deathsdoor
+---@field hero dd.Actor? Hero/Monster 转成 actor 句柄，其他指针和延迟事件为 nil
+---@field damage_type integer
+---@field source_id integer
+---@field source_type integer
+---actor.deathsdoor 的事件负载，只在回调执行期间有效
+---@class dd.ev.actor.deathsdoor : dd.Event, dd.fields.actor.deathsdoor
+---actor.deathsdoor 的 dd.wait_event 快照
+---@class dd.snap.actor.deathsdoor : dd.Snapshot, dd.fields.actor.deathsdoor
+---actor.deathsdoor 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.actor.deathsdoor
+---@field hero? dd.Actor
+---@field damage_type? integer
+---@field source_id? integer
+---@field source_type? integer
+---@class dd.opts.actor.deathsdoor : dd.OnOptions
+---@field filter? dd.filter.actor.deathsdoor
+
+-- ---- actor.heartattack
+---心脏病发作
+---@class dd.fields.actor.heartattack
+---@field heart_attacks integer
+---@field flag0 boolean
+---@field flag1 boolean
+---@field flag2 boolean
+---actor.heartattack 的事件负载，只在回调执行期间有效
+---@class dd.ev.actor.heartattack : dd.Event, dd.fields.actor.heartattack
+---actor.heartattack 的 dd.wait_event 快照
+---@class dd.snap.actor.heartattack : dd.Snapshot, dd.fields.actor.heartattack
+---actor.heartattack 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.actor.heartattack
+---@field heart_attacks? integer
+---@field flag0? boolean
+---@field flag1? boolean
+---@field flag2? boolean
+---@class dd.opts.actor.heartattack : dd.OnOptions
+---@field filter? dd.filter.actor.heartattack
+
+-- ---- actor.death
+---英雄或怪物死亡（is_monster 区分；英雄看 hero_id，怪物看 monster_guid）
+---@class dd.fields.actor.death
+---@field hero_id integer
+---@field is_monster boolean
+---@field monster_guid integer
+---@field attacker_id integer
+---@field damage_type integer
+---@field class_field_d0 integer
+---@field class_field_cc integer
+---@field flag boolean
+---actor.death 的事件负载，只在回调执行期间有效
+---@class dd.ev.actor.death : dd.Event, dd.fields.actor.death
+---actor.death 的 dd.wait_event 快照
+---@class dd.snap.actor.death : dd.Snapshot, dd.fields.actor.death
+---actor.death 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.actor.death
+---@field hero_id? integer
+---@field is_monster? boolean
+---@field monster_guid? integer
+---@field attacker_id? integer
+---@field damage_type? integer
+---@field class_field_d0? integer
+---@field class_field_cc? integer
+---@field flag? boolean
+---@class dd.opts.actor.death : dd.OnOptions
+---@field filter? dd.filter.actor.death
+
+-- ---- actor.affliction
+---英雄崩溃或美德
+---@class dd.fields.actor.affliction
+---@field hero dd.Actor? Hero/Monster 转成 actor 句柄，其他指针和延迟事件为 nil
+---actor.affliction 的事件负载，只在回调执行期间有效
+---@class dd.ev.actor.affliction : dd.Event, dd.fields.actor.affliction
+---actor.affliction 的 dd.wait_event 快照
+---@class dd.snap.actor.affliction : dd.Snapshot, dd.fields.actor.affliction
+---actor.affliction 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.actor.affliction
+---@field hero? dd.Actor
+---@class dd.opts.actor.affliction : dd.OnOptions
+---@field filter? dd.filter.actor.affliction
+
+-- ---- raid.start
+---开始探索。在加载线程上发生，一般是延迟事件（deferred 为 true，raid 为 nil）
+---@class dd.fields.raid.start
+---@field raid nil 游戏指针，Lua 里恒为 nil
+---raid.start 的事件负载，只在回调执行期间有效
+---@class dd.ev.raid.start : dd.Event, dd.fields.raid.start
+---raid.start 的 dd.wait_event 快照
+---@class dd.snap.raid.start : dd.Snapshot, dd.fields.raid.start
+---raid.start 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.raid.start
+---@field raid? dd.Actor
+---@class dd.opts.raid.start : dd.OnOptions
+---@field filter? dd.filter.raid.start
+
+-- ---- raid.finish
+---探索结算
+---@class dd.fields.raid.finish
+---@field results nil 游戏指针，Lua 里恒为 nil
+---raid.finish 的事件负载，只在回调执行期间有效
+---@class dd.ev.raid.finish : dd.Event, dd.fields.raid.finish
+---raid.finish 的 dd.wait_event 快照
+---@class dd.snap.raid.finish : dd.Snapshot, dd.fields.raid.finish
+---raid.finish 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.raid.finish
+---@field results? dd.Actor
+---@class dd.opts.raid.finish : dd.OnOptions
+---@field filter? dd.filter.raid.finish
+
+-- ---- raid.step
+---队伍在地牢里走一步
+---@class dd.fields.raid.step
+---raid.step 的事件负载，只在回调执行期间有效
+---@class dd.ev.raid.step : dd.Event, dd.fields.raid.step
+---raid.step 的 dd.wait_event 快照
+---@class dd.snap.raid.step : dd.Snapshot, dd.fields.raid.step
+---raid.step 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.raid.step
+---@class dd.opts.raid.step : dd.OnOptions
+---@field filter? dd.filter.raid.step
+
+-- ---- raid.torch
+---火把亮度变化
+---@class dd.fields.raid.torch
+---@field torch_before number
+---@field torch_after number
+---@field delta number
+---@field flag boolean
+---raid.torch 的事件负载，只在回调执行期间有效
+---@class dd.ev.raid.torch : dd.Event, dd.fields.raid.torch
+---raid.torch 的 dd.wait_event 快照
+---@class dd.snap.raid.torch : dd.Snapshot, dd.fields.raid.torch
+---raid.torch 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.raid.torch
+---@field torch_before? number
+---@field torch_after? number
+---@field delta? number
+---@field flag? boolean
+---@class dd.opts.raid.torch : dd.OnOptions
+---@field filter? dd.filter.raid.torch
+
+-- ---- town.enter
+---开始一次城镇访问（从地牢回城等；读城镇存档不经过这里）
+---@class dd.fields.town.enter
+---@field flag boolean
+---town.enter 的事件负载，只在回调执行期间有效
+---@class dd.ev.town.enter : dd.Event, dd.fields.town.enter
+---town.enter 的 dd.wait_event 快照
+---@class dd.snap.town.enter : dd.Snapshot, dd.fields.town.enter
+---town.enter 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.town.enter
+---@field flag? boolean
+---@class dd.opts.town.enter : dd.OnOptions
+---@field filter? dd.filter.town.enter
+
+-- ---- town.event
+---城镇事件
+---@class dd.fields.town.event
+---@field event nil 游戏指针，Lua 里恒为 nil
+---town.event 的事件负载，只在回调执行期间有效
+---@class dd.ev.town.event : dd.Event, dd.fields.town.event
+---town.event 的 dd.wait_event 快照
+---@class dd.snap.town.event : dd.Snapshot, dd.fields.town.event
+---town.event 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.town.event
+---@field event? dd.Actor
+---@class dd.opts.town.event : dd.OnOptions
+---@field filter? dd.filter.town.event
+
+-- ---- town.building
+---建筑状态变化
+---@class dd.fields.town.building
+---@field name string
+---@field value integer
+---@field flag boolean
+---town.building 的事件负载，只在回调执行期间有效
+---@class dd.ev.town.building : dd.Event, dd.fields.town.building
+---town.building 的 dd.wait_event 快照
+---@class dd.snap.town.building : dd.Snapshot, dd.fields.town.building
+---town.building 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.town.building
+---@field name? string
+---@field value? integer
+---@field flag? boolean
+---@class dd.opts.town.building : dd.OnOptions
+---@field filter? dd.filter.town.building
+
+-- ---- town.activity
+---打开城镇活动
+---@class dd.fields.town.activity
+---@field activity nil 游戏指针，Lua 里恒为 nil
+---@field flag boolean
+---town.activity 的事件负载，只在回调执行期间有效
+---@class dd.ev.town.activity : dd.Event, dd.fields.town.activity
+---town.activity 的 dd.wait_event 快照
+---@class dd.snap.town.activity : dd.Snapshot, dd.fields.town.activity
+---town.activity 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.town.activity
+---@field activity? dd.Actor
+---@field flag? boolean
+---@class dd.opts.town.activity : dd.OnOptions
+---@field filter? dd.filter.town.activity
+
+-- ---- town.activity.finish
+---城镇活动结束
+---@class dd.fields.town.activity.finish
+---@field activity_id integer
+---town.activity.finish 的事件负载，只在回调执行期间有效
+---@class dd.ev.town.activity.finish : dd.Event, dd.fields.town.activity.finish
+---town.activity.finish 的 dd.wait_event 快照
+---@class dd.snap.town.activity.finish : dd.Snapshot, dd.fields.town.activity.finish
+---town.activity.finish 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.town.activity.finish
+---@field activity_id? integer
+---@class dd.opts.town.activity.finish : dd.OnOptions
+---@field filter? dd.filter.town.activity.finish
+
+-- ---- hero.recruit
+---招募英雄
+---@class dd.fields.hero.recruit
+---@field hero_id integer
+---hero.recruit 的事件负载，只在回调执行期间有效
+---@class dd.ev.hero.recruit : dd.Event, dd.fields.hero.recruit
+---hero.recruit 的 dd.wait_event 快照
+---@class dd.snap.hero.recruit : dd.Snapshot, dd.fields.hero.recruit
+---hero.recruit 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.hero.recruit
+---@field hero_id? integer
+---@class dd.opts.hero.recruit : dd.OnOptions
+---@field filter? dd.filter.hero.recruit
+
+-- ---- hero.dismiss
+---解雇英雄
+---@class dd.fields.hero.dismiss
+---@field hero_id integer
+---hero.dismiss 的事件负载，只在回调执行期间有效
+---@class dd.ev.hero.dismiss : dd.Event, dd.fields.hero.dismiss
+---hero.dismiss 的 dd.wait_event 快照
+---@class dd.snap.hero.dismiss : dd.Snapshot, dd.fields.hero.dismiss
+---hero.dismiss 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.hero.dismiss
+---@field hero_id? integer
+---@class dd.opts.hero.dismiss : dd.OnOptions
+---@field filter? dd.filter.hero.dismiss
+
+-- ---- hero.quirk
+---英雄获得怪癖
+---@class dd.fields.hero.quirk
+---@field hero_id integer
+---@field kind integer
+---@field quirk string
+---hero.quirk 的事件负载，只在回调执行期间有效
+---@class dd.ev.hero.quirk : dd.Event, dd.fields.hero.quirk
+---hero.quirk 的 dd.wait_event 快照
+---@class dd.snap.hero.quirk : dd.Snapshot, dd.fields.hero.quirk
+---hero.quirk 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.hero.quirk
+---@field hero_id? integer
+---@field kind? integer
+---@field quirk? string
+---@class dd.opts.hero.quirk : dd.OnOptions
+---@field filter? dd.filter.hero.quirk
+
+-- ---- hero.skill
+---英雄技能升级
+---@class dd.fields.hero.skill
+---@field hero_id integer
+---@field skill_index integer
+---hero.skill 的事件负载，只在回调执行期间有效
+---@class dd.ev.hero.skill : dd.Event, dd.fields.hero.skill
+---hero.skill 的 dd.wait_event 快照
+---@class dd.snap.hero.skill : dd.Snapshot, dd.fields.hero.skill
+---hero.skill 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.hero.skill
+---@field hero_id? integer
+---@field skill_index? integer
+---@class dd.opts.hero.skill : dd.OnOptions
+---@field filter? dd.filter.hero.skill
+
+-- ---- inventory.add
+---物品加入库存。读档时有一部分在加载线程上派发，是延迟事件（07 覆盖表 172 次里 10 次），其余在主线程上
+---@class dd.fields.inventory.add
+---@field inventory nil 游戏指针，Lua 里恒为 nil
+---@field item nil 游戏指针，Lua 里恒为 nil
+---@field value integer
+---inventory.add 的事件负载，只在回调执行期间有效
+---@class dd.ev.inventory.add : dd.Event, dd.fields.inventory.add
+---inventory.add 的 dd.wait_event 快照
+---@class dd.snap.inventory.add : dd.Snapshot, dd.fields.inventory.add
+---inventory.add 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.inventory.add
+---@field inventory? dd.Actor
+---@field item? dd.Actor
+---@field value? integer
+---@class dd.opts.inventory.add : dd.OnOptions
+---@field filter? dd.filter.inventory.add
+
+-- ---- inventory.modified
+---库存变化（静态上没找到派发点，可能从不派发）
+---@class dd.fields.inventory.modified
+---inventory.modified 的事件负载，只在回调执行期间有效
+---@class dd.ev.inventory.modified : dd.Event, dd.fields.inventory.modified
+---inventory.modified 的 dd.wait_event 快照
+---@class dd.snap.inventory.modified : dd.Snapshot, dd.fields.inventory.modified
+---inventory.modified 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.inventory.modified
+---@class dd.opts.inventory.modified : dd.OnOptions
+---@field filter? dd.filter.inventory.modified
+
+-- ---- inventory.premerge
+---库存合并前
+---@class dd.fields.inventory.premerge
+---@field inventory nil 游戏指针，Lua 里恒为 nil
+---@field other nil 游戏指针，Lua 里恒为 nil
+---inventory.premerge 的事件负载，只在回调执行期间有效
+---@class dd.ev.inventory.premerge : dd.Event, dd.fields.inventory.premerge
+---inventory.premerge 的 dd.wait_event 快照
+---@class dd.snap.inventory.premerge : dd.Snapshot, dd.fields.inventory.premerge
+---inventory.premerge 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.inventory.premerge
+---@field inventory? dd.Actor
+---@field other? dd.Actor
+---@class dd.opts.inventory.premerge : dd.OnOptions
+---@field filter? dd.filter.inventory.premerge
+
+-- ---- inventory.postmerge
+---库存合并后
+---@class dd.fields.inventory.postmerge
+---@field inventory nil 游戏指针，Lua 里恒为 nil
+---@field other nil 游戏指针，Lua 里恒为 nil
+---inventory.postmerge 的事件负载，只在回调执行期间有效
+---@class dd.ev.inventory.postmerge : dd.Event, dd.fields.inventory.postmerge
+---inventory.postmerge 的 dd.wait_event 快照
+---@class dd.snap.inventory.postmerge : dd.Snapshot, dd.fields.inventory.postmerge
+---inventory.postmerge 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.inventory.postmerge
+---@field inventory? dd.Actor
+---@field other? dd.Actor
+---@class dd.opts.inventory.postmerge : dd.OnOptions
+---@field filter? dd.filter.inventory.postmerge
+
+-- ---- estate.currency
+---庄园货币变化
+---@class dd.fields.estate.currency
+---@field currency integer
+---@field delta integer
+---estate.currency 的事件负载，只在回调执行期间有效
+---@class dd.ev.estate.currency : dd.Event, dd.fields.estate.currency
+---estate.currency 的 dd.wait_event 快照
+---@class dd.snap.estate.currency : dd.Snapshot, dd.fields.estate.currency
+---estate.currency 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.estate.currency
+---@field currency? integer
+---@field delta? integer
+---@class dd.opts.estate.currency : dd.OnOptions
+---@field filter? dd.filter.estate.currency
+
+-- ---- native.EvaluateAchievementsEvent
+---游戏事件 EvaluateAchievementsEvent（只读）
+---@class dd.fields.native.EvaluateAchievementsEvent
+---@field name string
+---@field time integer
+---native.EvaluateAchievementsEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.EvaluateAchievementsEvent : dd.Event, dd.fields.native.EvaluateAchievementsEvent
+---native.EvaluateAchievementsEvent 的 dd.wait_event 快照
+---@class dd.snap.native.EvaluateAchievementsEvent : dd.Snapshot, dd.fields.native.EvaluateAchievementsEvent
+---native.EvaluateAchievementsEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.EvaluateAchievementsEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.EvaluateAchievementsEvent : dd.OnOptions
+---@field filter? dd.filter.native.EvaluateAchievementsEvent
+
+-- ---- native.InitedAchievementsEvent
+---游戏事件 InitedAchievementsEvent（只读）
+---@class dd.fields.native.InitedAchievementsEvent
+---@field name string
+---@field time integer
+---native.InitedAchievementsEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.InitedAchievementsEvent : dd.Event, dd.fields.native.InitedAchievementsEvent
+---native.InitedAchievementsEvent 的 dd.wait_event 快照
+---@class dd.snap.native.InitedAchievementsEvent : dd.Snapshot, dd.fields.native.InitedAchievementsEvent
+---native.InitedAchievementsEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.InitedAchievementsEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.InitedAchievementsEvent : dd.OnOptions
+---@field filter? dd.filter.native.InitedAchievementsEvent
+
+-- ---- native.SaveAchievementStateEvent
+---游戏事件 SaveAchievementStateEvent（只读）
+---@class dd.fields.native.SaveAchievementStateEvent
+---@field name string
+---@field time integer
+---native.SaveAchievementStateEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.SaveAchievementStateEvent : dd.Event, dd.fields.native.SaveAchievementStateEvent
+---native.SaveAchievementStateEvent 的 dd.wait_event 快照
+---@class dd.snap.native.SaveAchievementStateEvent : dd.Snapshot, dd.fields.native.SaveAchievementStateEvent
+---native.SaveAchievementStateEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.SaveAchievementStateEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.SaveAchievementStateEvent : dd.OnOptions
+---@field filter? dd.filter.native.SaveAchievementStateEvent
+
+-- ---- native.AwardAchievementEvent
+---游戏事件 AwardAchievementEvent（只读）（不可用：没有 Listener<T const> 虚表：游戏没有对应的 Listener 类型描述符（类型没有派发点，无法用 __RTDynamicCast 伪造））
+---@class dd.fields.native.AwardAchievementEvent
+---@field name string
+---@field time integer
+---native.AwardAchievementEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.AwardAchievementEvent : dd.Event, dd.fields.native.AwardAchievementEvent
+---native.AwardAchievementEvent 的 dd.wait_event 快照
+---@class dd.snap.native.AwardAchievementEvent : dd.Snapshot, dd.fields.native.AwardAchievementEvent
+---native.AwardAchievementEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.AwardAchievementEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.AwardAchievementEvent : dd.OnOptions
+---@field filter? dd.filter.native.AwardAchievementEvent
+
+-- ---- native.MailingListSignUpEvent
+---游戏事件 MailingListSignUpEvent（只读）
+---@class dd.fields.native.MailingListSignUpEvent
+---@field name string
+---@field time integer
+---native.MailingListSignUpEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.MailingListSignUpEvent : dd.Event, dd.fields.native.MailingListSignUpEvent
+---native.MailingListSignUpEvent 的 dd.wait_event 快照
+---@class dd.snap.native.MailingListSignUpEvent : dd.Snapshot, dd.fields.native.MailingListSignUpEvent
+---native.MailingListSignUpEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.MailingListSignUpEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.MailingListSignUpEvent : dd.OnOptions
+---@field filter? dd.filter.native.MailingListSignUpEvent
+
+-- ---- native.MailingListReminderEvent
+---游戏事件 MailingListReminderEvent（只读）
+---@class dd.fields.native.MailingListReminderEvent
+---@field name string
+---@field time integer
+---native.MailingListReminderEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.MailingListReminderEvent : dd.Event, dd.fields.native.MailingListReminderEvent
+---native.MailingListReminderEvent 的 dd.wait_event 快照
+---@class dd.snap.native.MailingListReminderEvent : dd.Snapshot, dd.fields.native.MailingListReminderEvent
+---native.MailingListReminderEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.MailingListReminderEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.MailingListReminderEvent : dd.OnOptions
+---@field filter? dd.filter.native.MailingListReminderEvent
+
+-- ---- native.MailingListReminderSeenEvent
+---游戏事件 MailingListReminderSeenEvent（只读）
+---@class dd.fields.native.MailingListReminderSeenEvent
+---@field name string
+---@field time integer
+---native.MailingListReminderSeenEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.MailingListReminderSeenEvent : dd.Event, dd.fields.native.MailingListReminderSeenEvent
+---native.MailingListReminderSeenEvent 的 dd.wait_event 快照
+---@class dd.snap.native.MailingListReminderSeenEvent : dd.Snapshot, dd.fields.native.MailingListReminderSeenEvent
+---native.MailingListReminderSeenEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.MailingListReminderSeenEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.MailingListReminderSeenEvent : dd.OnOptions
+---@field filter? dd.filter.native.MailingListReminderSeenEvent
+
+-- ---- native.LocalizationAvailableEvent
+---游戏事件 LocalizationAvailableEvent（只读）
+---@class dd.fields.native.LocalizationAvailableEvent
+---@field name string
+---@field time integer
+---native.LocalizationAvailableEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.LocalizationAvailableEvent : dd.Event, dd.fields.native.LocalizationAvailableEvent
+---native.LocalizationAvailableEvent 的 dd.wait_event 快照
+---@class dd.snap.native.LocalizationAvailableEvent : dd.Snapshot, dd.fields.native.LocalizationAvailableEvent
+---native.LocalizationAvailableEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.LocalizationAvailableEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.LocalizationAvailableEvent : dd.OnOptions
+---@field filter? dd.filter.native.LocalizationAvailableEvent
+
+-- ---- native.AreaTileContentsChangedEvent
+---游戏事件 AreaTileContentsChangedEvent（只读）
+---@class dd.fields.native.AreaTileContentsChangedEvent
+---@field name string
+---@field time integer
+---native.AreaTileContentsChangedEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.AreaTileContentsChangedEvent : dd.Event, dd.fields.native.AreaTileContentsChangedEvent
+---native.AreaTileContentsChangedEvent 的 dd.wait_event 快照
+---@class dd.snap.native.AreaTileContentsChangedEvent : dd.Snapshot, dd.fields.native.AreaTileContentsChangedEvent
+---native.AreaTileContentsChangedEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.AreaTileContentsChangedEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.AreaTileContentsChangedEvent : dd.OnOptions
+---@field filter? dd.filter.native.AreaTileContentsChangedEvent
+
+-- ---- native.AreaTileKnowledgeEvent
+---游戏事件 AreaTileKnowledgeEvent（只读）
+---@class dd.fields.native.AreaTileKnowledgeEvent
+---@field name string
+---@field time integer
+---native.AreaTileKnowledgeEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.AreaTileKnowledgeEvent : dd.Event, dd.fields.native.AreaTileKnowledgeEvent
+---native.AreaTileKnowledgeEvent 的 dd.wait_event 快照
+---@class dd.snap.native.AreaTileKnowledgeEvent : dd.Snapshot, dd.fields.native.AreaTileKnowledgeEvent
+---native.AreaTileKnowledgeEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.AreaTileKnowledgeEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.AreaTileKnowledgeEvent : dd.OnOptions
+---@field filter? dd.filter.native.AreaTileKnowledgeEvent
+
+-- ---- native.AreaKnowledgeEvent
+---游戏事件 AreaKnowledgeEvent（只读）
+---@class dd.fields.native.AreaKnowledgeEvent
+---@field name string
+---@field time integer
+---native.AreaKnowledgeEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.AreaKnowledgeEvent : dd.Event, dd.fields.native.AreaKnowledgeEvent
+---native.AreaKnowledgeEvent 的 dd.wait_event 快照
+---@class dd.snap.native.AreaKnowledgeEvent : dd.Snapshot, dd.fields.native.AreaKnowledgeEvent
+---native.AreaKnowledgeEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.AreaKnowledgeEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.AreaKnowledgeEvent : dd.OnOptions
+---@field filter? dd.filter.native.AreaKnowledgeEvent
+
+-- ---- native.ScoutingEvent
+---游戏事件 ScoutingEvent（只读）
+---@class dd.fields.native.ScoutingEvent
+---@field name string
+---@field time integer
+---native.ScoutingEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.ScoutingEvent : dd.Event, dd.fields.native.ScoutingEvent
+---native.ScoutingEvent 的 dd.wait_event 快照
+---@class dd.snap.native.ScoutingEvent : dd.Snapshot, dd.fields.native.ScoutingEvent
+---native.ScoutingEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.ScoutingEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.ScoutingEvent : dd.OnOptions
+---@field filter? dd.filter.native.ScoutingEvent
+
+-- ---- native.ScoutingCurioEvent
+---游戏事件 ScoutingCurioEvent（只读）
+---@class dd.fields.native.ScoutingCurioEvent
+---@field name string
+---@field time integer
+---native.ScoutingCurioEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.ScoutingCurioEvent : dd.Event, dd.fields.native.ScoutingCurioEvent
+---native.ScoutingCurioEvent 的 dd.wait_event 快照
+---@class dd.snap.native.ScoutingCurioEvent : dd.Snapshot, dd.fields.native.ScoutingCurioEvent
+---native.ScoutingCurioEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.ScoutingCurioEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.ScoutingCurioEvent : dd.OnOptions
+---@field filter? dd.filter.native.ScoutingCurioEvent
+
+-- ---- native.BattleAttackEvent
+---游戏事件 BattleAttackEvent（只读）
+---@class dd.fields.native.BattleAttackEvent
+---@field name string
+---@field time integer
+---native.BattleAttackEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.BattleAttackEvent : dd.Event, dd.fields.native.BattleAttackEvent
+---native.BattleAttackEvent 的 dd.wait_event 快照
+---@class dd.snap.native.BattleAttackEvent : dd.Snapshot, dd.fields.native.BattleAttackEvent
+---native.BattleAttackEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.BattleAttackEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.BattleAttackEvent : dd.OnOptions
+---@field filter? dd.filter.native.BattleAttackEvent
+
+-- ---- native.TrinketTriggeredEvent
+---游戏事件 TrinketTriggeredEvent（只读）
+---@class dd.fields.native.TrinketTriggeredEvent
+---@field name string
+---@field time integer
+---native.TrinketTriggeredEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.TrinketTriggeredEvent : dd.Event, dd.fields.native.TrinketTriggeredEvent
+---native.TrinketTriggeredEvent 的 dd.wait_event 快照
+---@class dd.snap.native.TrinketTriggeredEvent : dd.Snapshot, dd.fields.native.TrinketTriggeredEvent
+---native.TrinketTriggeredEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.TrinketTriggeredEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.TrinketTriggeredEvent : dd.OnOptions
+---@field filter? dd.filter.native.TrinketTriggeredEvent
+
+-- ---- native.CaptorBurnRedirectEvent
+---游戏事件 CaptorBurnRedirectEvent（只读）
+---@class dd.fields.native.CaptorBurnRedirectEvent
+---@field name string
+---@field time integer
+---native.CaptorBurnRedirectEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.CaptorBurnRedirectEvent : dd.Event, dd.fields.native.CaptorBurnRedirectEvent
+---native.CaptorBurnRedirectEvent 的 dd.wait_event 快照
+---@class dd.snap.native.CaptorBurnRedirectEvent : dd.Snapshot, dd.fields.native.CaptorBurnRedirectEvent
+---native.CaptorBurnRedirectEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.CaptorBurnRedirectEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.CaptorBurnRedirectEvent : dd.OnOptions
+---@field filter? dd.filter.native.CaptorBurnRedirectEvent
+
+-- ---- native.BattleCreatedEvent
+---游戏事件 BattleCreatedEvent（只读）
+---@class dd.fields.native.BattleCreatedEvent
+---@field name string
+---@field time integer
+---native.BattleCreatedEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.BattleCreatedEvent : dd.Event, dd.fields.native.BattleCreatedEvent
+---native.BattleCreatedEvent 的 dd.wait_event 快照
+---@class dd.snap.native.BattleCreatedEvent : dd.Snapshot, dd.fields.native.BattleCreatedEvent
+---native.BattleCreatedEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.BattleCreatedEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.BattleCreatedEvent : dd.OnOptions
+---@field filter? dd.filter.native.BattleCreatedEvent
+
+-- ---- native.BattleDestroyedEvent
+---游戏事件 BattleDestroyedEvent（只读）
+---@class dd.fields.native.BattleDestroyedEvent
+---@field name string
+---@field time integer
+---native.BattleDestroyedEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.BattleDestroyedEvent : dd.Event, dd.fields.native.BattleDestroyedEvent
+---native.BattleDestroyedEvent 的 dd.wait_event 快照
+---@class dd.snap.native.BattleDestroyedEvent : dd.Snapshot, dd.fields.native.BattleDestroyedEvent
+---native.BattleDestroyedEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.BattleDestroyedEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.BattleDestroyedEvent : dd.OnOptions
+---@field filter? dd.filter.native.BattleDestroyedEvent
+
+-- ---- native.MonsterDeathEvent
+---游戏事件 MonsterDeathEvent（只读）
+---@class dd.fields.native.MonsterDeathEvent
+---@field name string
+---@field time integer
+---@field monster_guid integer
+---@field attacker_id integer
+---@field damage_type integer
+---@field class_field_d0 integer
+---@field class_field_cc integer
+---@field flag boolean
+---@field is_monster boolean
+---native.MonsterDeathEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.MonsterDeathEvent : dd.Event, dd.fields.native.MonsterDeathEvent
+---native.MonsterDeathEvent 的 dd.wait_event 快照
+---@class dd.snap.native.MonsterDeathEvent : dd.Snapshot, dd.fields.native.MonsterDeathEvent
+---native.MonsterDeathEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.MonsterDeathEvent
+---@field name? string
+---@field time? integer
+---@field monster_guid? integer
+---@field attacker_id? integer
+---@field damage_type? integer
+---@field class_field_d0? integer
+---@field class_field_cc? integer
+---@field flag? boolean
+---@field is_monster? boolean
+---@class dd.opts.native.MonsterDeathEvent : dd.OnOptions
+---@field filter? dd.filter.native.MonsterDeathEvent
+
+-- ---- native.CaptureEvent
+---游戏事件 CaptureEvent（只读）
+---@class dd.fields.native.CaptureEvent
+---@field name string
+---@field time integer
+---native.CaptureEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.CaptureEvent : dd.Event, dd.fields.native.CaptureEvent
+---native.CaptureEvent 的 dd.wait_event 快照
+---@class dd.snap.native.CaptureEvent : dd.Snapshot, dd.fields.native.CaptureEvent
+---native.CaptureEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.CaptureEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.CaptureEvent : dd.OnOptions
+---@field filter? dd.filter.native.CaptureEvent
+
+-- ---- native.ReleaseStartEvent
+---游戏事件 ReleaseStartEvent（只读）
+---@class dd.fields.native.ReleaseStartEvent
+---@field name string
+---@field time integer
+---native.ReleaseStartEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.ReleaseStartEvent : dd.Event, dd.fields.native.ReleaseStartEvent
+---native.ReleaseStartEvent 的 dd.wait_event 快照
+---@class dd.snap.native.ReleaseStartEvent : dd.Snapshot, dd.fields.native.ReleaseStartEvent
+---native.ReleaseStartEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.ReleaseStartEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.ReleaseStartEvent : dd.OnOptions
+---@field filter? dd.filter.native.ReleaseStartEvent
+
+-- ---- native.ReleaseFinishEvent
+---游戏事件 ReleaseFinishEvent（只读）
+---@class dd.fields.native.ReleaseFinishEvent
+---@field name string
+---@field time integer
+---native.ReleaseFinishEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.ReleaseFinishEvent : dd.Event, dd.fields.native.ReleaseFinishEvent
+---native.ReleaseFinishEvent 的 dd.wait_event 快照
+---@class dd.snap.native.ReleaseFinishEvent : dd.Snapshot, dd.fields.native.ReleaseFinishEvent
+---native.ReleaseFinishEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.ReleaseFinishEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.ReleaseFinishEvent : dd.OnOptions
+---@field filter? dd.filter.native.ReleaseFinishEvent
+
+-- ---- native.TeleportEvent
+---游戏事件 TeleportEvent（只读）
+---@class dd.fields.native.TeleportEvent
+---@field name string
+---@field time integer
+---native.TeleportEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.TeleportEvent : dd.Event, dd.fields.native.TeleportEvent
+---native.TeleportEvent 的 dd.wait_event 快照
+---@class dd.snap.native.TeleportEvent : dd.Snapshot, dd.fields.native.TeleportEvent
+---native.TeleportEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.TeleportEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.TeleportEvent : dd.OnOptions
+---@field filter? dd.filter.native.TeleportEvent
+
+-- ---- native.MonsterBattleStageEvent
+---游戏事件 MonsterBattleStageEvent（只读）
+---@class dd.fields.native.MonsterBattleStageEvent
+---@field name string
+---@field time integer
+---native.MonsterBattleStageEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.MonsterBattleStageEvent : dd.Event, dd.fields.native.MonsterBattleStageEvent
+---native.MonsterBattleStageEvent 的 dd.wait_event 快照
+---@class dd.snap.native.MonsterBattleStageEvent : dd.Snapshot, dd.fields.native.MonsterBattleStageEvent
+---native.MonsterBattleStageEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.MonsterBattleStageEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.MonsterBattleStageEvent : dd.OnOptions
+---@field filter? dd.filter.native.MonsterBattleStageEvent
+
+-- ---- native.DeathDamageEvent
+---游戏事件 DeathDamageEvent（只读）
+---@class dd.fields.native.DeathDamageEvent
+---@field name string
+---@field time integer
+---native.DeathDamageEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.DeathDamageEvent : dd.Event, dd.fields.native.DeathDamageEvent
+---native.DeathDamageEvent 的 dd.wait_event 快照
+---@class dd.snap.native.DeathDamageEvent : dd.Snapshot, dd.fields.native.DeathDamageEvent
+---native.DeathDamageEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.DeathDamageEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.DeathDamageEvent : dd.OnOptions
+---@field filter? dd.filter.native.DeathDamageEvent
+
+-- ---- native.HeartAttackEvent
+---游戏事件 HeartAttackEvent（只读）
+---@class dd.fields.native.HeartAttackEvent
+---@field name string
+---@field time integer
+---@field heart_attacks integer
+---@field flag0 boolean
+---@field flag1 boolean
+---@field flag2 boolean
+---native.HeartAttackEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.HeartAttackEvent : dd.Event, dd.fields.native.HeartAttackEvent
+---native.HeartAttackEvent 的 dd.wait_event 快照
+---@class dd.snap.native.HeartAttackEvent : dd.Snapshot, dd.fields.native.HeartAttackEvent
+---native.HeartAttackEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.HeartAttackEvent
+---@field name? string
+---@field time? integer
+---@field heart_attacks? integer
+---@field flag0? boolean
+---@field flag1? boolean
+---@field flag2? boolean
+---@class dd.opts.native.HeartAttackEvent : dd.OnOptions
+---@field filter? dd.filter.native.HeartAttackEvent
+
+-- ---- native.ActorDazedEvent
+---游戏事件 ActorDazedEvent（只读）
+---@class dd.fields.native.ActorDazedEvent
+---@field name string
+---@field time integer
+---native.ActorDazedEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.ActorDazedEvent : dd.Event, dd.fields.native.ActorDazedEvent
+---native.ActorDazedEvent 的 dd.wait_event 快照
+---@class dd.snap.native.ActorDazedEvent : dd.Snapshot, dd.fields.native.ActorDazedEvent
+---native.ActorDazedEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.ActorDazedEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.ActorDazedEvent : dd.OnOptions
+---@field filter? dd.filter.native.ActorDazedEvent
+
+-- ---- native.HeroDeathEvent
+---游戏事件 HeroDeathEvent（只读）
+---@class dd.fields.native.HeroDeathEvent
+---@field name string
+---@field time integer
+---@field hero_id integer
+---@field is_monster boolean
+---native.HeroDeathEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.HeroDeathEvent : dd.Event, dd.fields.native.HeroDeathEvent
+---native.HeroDeathEvent 的 dd.wait_event 快照
+---@class dd.snap.native.HeroDeathEvent : dd.Snapshot, dd.fields.native.HeroDeathEvent
+---native.HeroDeathEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.HeroDeathEvent
+---@field name? string
+---@field time? integer
+---@field hero_id? integer
+---@field is_monster? boolean
+---@class dd.opts.native.HeroDeathEvent : dd.OnOptions
+---@field filter? dd.filter.native.HeroDeathEvent
+
+-- ---- native.HeroSurvivedDeathsDoorAttackEvent
+---游戏事件 HeroSurvivedDeathsDoorAttackEvent（只读）
+---@class dd.fields.native.HeroSurvivedDeathsDoorAttackEvent
+---@field name string
+---@field time integer
+---native.HeroSurvivedDeathsDoorAttackEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.HeroSurvivedDeathsDoorAttackEvent : dd.Event, dd.fields.native.HeroSurvivedDeathsDoorAttackEvent
+---native.HeroSurvivedDeathsDoorAttackEvent 的 dd.wait_event 快照
+---@class dd.snap.native.HeroSurvivedDeathsDoorAttackEvent : dd.Snapshot, dd.fields.native.HeroSurvivedDeathsDoorAttackEvent
+---native.HeroSurvivedDeathsDoorAttackEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.HeroSurvivedDeathsDoorAttackEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.HeroSurvivedDeathsDoorAttackEvent : dd.OnOptions
+---@field filter? dd.filter.native.HeroSurvivedDeathsDoorAttackEvent
+
+-- ---- native.HeroSkillUpgradedEvent
+---游戏事件 HeroSkillUpgradedEvent（只读）
+---@class dd.fields.native.HeroSkillUpgradedEvent
+---@field name string
+---@field time integer
+---@field hero_id integer
+---@field skill_index integer
+---native.HeroSkillUpgradedEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.HeroSkillUpgradedEvent : dd.Event, dd.fields.native.HeroSkillUpgradedEvent
+---native.HeroSkillUpgradedEvent 的 dd.wait_event 快照
+---@class dd.snap.native.HeroSkillUpgradedEvent : dd.Snapshot, dd.fields.native.HeroSkillUpgradedEvent
+---native.HeroSkillUpgradedEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.HeroSkillUpgradedEvent
+---@field name? string
+---@field time? integer
+---@field hero_id? integer
+---@field skill_index? integer
+---@class dd.opts.native.HeroSkillUpgradedEvent : dd.OnOptions
+---@field filter? dd.filter.native.HeroSkillUpgradedEvent
+
+-- ---- native.HeroWeaponAndArmourUpgradedEvent
+---游戏事件 HeroWeaponAndArmourUpgradedEvent（只读）
+---@class dd.fields.native.HeroWeaponAndArmourUpgradedEvent
+---@field name string
+---@field time integer
+---native.HeroWeaponAndArmourUpgradedEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.HeroWeaponAndArmourUpgradedEvent : dd.Event, dd.fields.native.HeroWeaponAndArmourUpgradedEvent
+---native.HeroWeaponAndArmourUpgradedEvent 的 dd.wait_event 快照
+---@class dd.snap.native.HeroWeaponAndArmourUpgradedEvent : dd.Snapshot, dd.fields.native.HeroWeaponAndArmourUpgradedEvent
+---native.HeroWeaponAndArmourUpgradedEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.HeroWeaponAndArmourUpgradedEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.HeroWeaponAndArmourUpgradedEvent : dd.OnOptions
+---@field filter? dd.filter.native.HeroWeaponAndArmourUpgradedEvent
+
+-- ---- native.QuirkAppliedEvent
+---游戏事件 QuirkAppliedEvent（只读）
+---@class dd.fields.native.QuirkAppliedEvent
+---@field name string
+---@field time integer
+---@field hero_id integer
+---@field kind integer
+---@field quirk string
+---native.QuirkAppliedEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.QuirkAppliedEvent : dd.Event, dd.fields.native.QuirkAppliedEvent
+---native.QuirkAppliedEvent 的 dd.wait_event 快照
+---@class dd.snap.native.QuirkAppliedEvent : dd.Snapshot, dd.fields.native.QuirkAppliedEvent
+---native.QuirkAppliedEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.QuirkAppliedEvent
+---@field name? string
+---@field time? integer
+---@field hero_id? integer
+---@field kind? integer
+---@field quirk? string
+---@class dd.opts.native.QuirkAppliedEvent : dd.OnOptions
+---@field filter? dd.filter.native.QuirkAppliedEvent
+
+-- ---- native.HeroActOutStartEvent
+---游戏事件 HeroActOutStartEvent（只读）
+---@class dd.fields.native.HeroActOutStartEvent
+---@field name string
+---@field time integer
+---native.HeroActOutStartEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.HeroActOutStartEvent : dd.Event, dd.fields.native.HeroActOutStartEvent
+---native.HeroActOutStartEvent 的 dd.wait_event 快照
+---@class dd.snap.native.HeroActOutStartEvent : dd.Snapshot, dd.fields.native.HeroActOutStartEvent
+---native.HeroActOutStartEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.HeroActOutStartEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.HeroActOutStartEvent : dd.OnOptions
+---@field filter? dd.filter.native.HeroActOutStartEvent
+
+-- ---- native.HeroActOutFinishEvent
+---游戏事件 HeroActOutFinishEvent（只读）
+---@class dd.fields.native.HeroActOutFinishEvent
+---@field name string
+---@field time integer
+---native.HeroActOutFinishEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.HeroActOutFinishEvent : dd.Event, dd.fields.native.HeroActOutFinishEvent
+---native.HeroActOutFinishEvent 的 dd.wait_event 快照
+---@class dd.snap.native.HeroActOutFinishEvent : dd.Snapshot, dd.fields.native.HeroActOutFinishEvent
+---native.HeroActOutFinishEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.HeroActOutFinishEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.HeroActOutFinishEvent : dd.OnOptions
+---@field filter? dd.filter.native.HeroActOutFinishEvent
+
+-- ---- native.HeroAfflictionVirtueEvent
+---游戏事件 HeroAfflictionVirtueEvent（只读）
+---@class dd.fields.native.HeroAfflictionVirtueEvent
+---@field name string
+---@field time integer
+---@field hero dd.Actor? Hero/Monster 转成 actor 句柄，其他指针和延迟事件为 nil
+---native.HeroAfflictionVirtueEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.HeroAfflictionVirtueEvent : dd.Event, dd.fields.native.HeroAfflictionVirtueEvent
+---native.HeroAfflictionVirtueEvent 的 dd.wait_event 快照
+---@class dd.snap.native.HeroAfflictionVirtueEvent : dd.Snapshot, dd.fields.native.HeroAfflictionVirtueEvent
+---native.HeroAfflictionVirtueEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.HeroAfflictionVirtueEvent
+---@field name? string
+---@field time? integer
+---@field hero? dd.Actor
+---@class dd.opts.native.HeroAfflictionVirtueEvent : dd.OnOptions
+---@field filter? dd.filter.native.HeroAfflictionVirtueEvent
+
+-- ---- native.HeroUsedItemEvent
+---游戏事件 HeroUsedItemEvent（只读）
+---@class dd.fields.native.HeroUsedItemEvent
+---@field name string
+---@field time integer
+---native.HeroUsedItemEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.HeroUsedItemEvent : dd.Event, dd.fields.native.HeroUsedItemEvent
+---native.HeroUsedItemEvent 的 dd.wait_event 快照
+---@class dd.snap.native.HeroUsedItemEvent : dd.Snapshot, dd.fields.native.HeroUsedItemEvent
+---native.HeroUsedItemEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.HeroUsedItemEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.HeroUsedItemEvent : dd.OnOptions
+---@field filter? dd.filter.native.HeroUsedItemEvent
+
+-- ---- native.HeroReachedDeathsDoorEvent
+---游戏事件 HeroReachedDeathsDoorEvent（只读）
+---@class dd.fields.native.HeroReachedDeathsDoorEvent
+---@field name string
+---@field time integer
+---@field hero dd.Actor? Hero/Monster 转成 actor 句柄，其他指针和延迟事件为 nil
+---@field damage_type integer
+---@field source_id integer
+---@field source_type integer
+---native.HeroReachedDeathsDoorEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.HeroReachedDeathsDoorEvent : dd.Event, dd.fields.native.HeroReachedDeathsDoorEvent
+---native.HeroReachedDeathsDoorEvent 的 dd.wait_event 快照
+---@class dd.snap.native.HeroReachedDeathsDoorEvent : dd.Snapshot, dd.fields.native.HeroReachedDeathsDoorEvent
+---native.HeroReachedDeathsDoorEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.HeroReachedDeathsDoorEvent
+---@field name? string
+---@field time? integer
+---@field hero? dd.Actor
+---@field damage_type? integer
+---@field source_id? integer
+---@field source_type? integer
+---@class dd.opts.native.HeroReachedDeathsDoorEvent : dd.OnOptions
+---@field filter? dd.filter.native.HeroReachedDeathsDoorEvent
+
+-- ---- native.InventoryAddItemEvent
+---游戏事件 InventoryAddItemEvent（只读）
+---@class dd.fields.native.InventoryAddItemEvent
+---@field name string
+---@field time integer
+---@field inventory nil 游戏指针，Lua 里恒为 nil
+---@field item nil 游戏指针，Lua 里恒为 nil
+---@field value integer
+---native.InventoryAddItemEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.InventoryAddItemEvent : dd.Event, dd.fields.native.InventoryAddItemEvent
+---native.InventoryAddItemEvent 的 dd.wait_event 快照
+---@class dd.snap.native.InventoryAddItemEvent : dd.Snapshot, dd.fields.native.InventoryAddItemEvent
+---native.InventoryAddItemEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.InventoryAddItemEvent
+---@field name? string
+---@field time? integer
+---@field inventory? dd.Actor
+---@field item? dd.Actor
+---@field value? integer
+---@class dd.opts.native.InventoryAddItemEvent : dd.OnOptions
+---@field filter? dd.filter.native.InventoryAddItemEvent
+
+-- ---- native.InventoryPreMergeEvent
+---游戏事件 InventoryPreMergeEvent（只读）
+---@class dd.fields.native.InventoryPreMergeEvent
+---@field name string
+---@field time integer
+---@field inventory nil 游戏指针，Lua 里恒为 nil
+---@field other nil 游戏指针，Lua 里恒为 nil
+---native.InventoryPreMergeEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.InventoryPreMergeEvent : dd.Event, dd.fields.native.InventoryPreMergeEvent
+---native.InventoryPreMergeEvent 的 dd.wait_event 快照
+---@class dd.snap.native.InventoryPreMergeEvent : dd.Snapshot, dd.fields.native.InventoryPreMergeEvent
+---native.InventoryPreMergeEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.InventoryPreMergeEvent
+---@field name? string
+---@field time? integer
+---@field inventory? dd.Actor
+---@field other? dd.Actor
+---@class dd.opts.native.InventoryPreMergeEvent : dd.OnOptions
+---@field filter? dd.filter.native.InventoryPreMergeEvent
+
+-- ---- native.InventoryPostMergeEvent
+---游戏事件 InventoryPostMergeEvent（只读）
+---@class dd.fields.native.InventoryPostMergeEvent
+---@field name string
+---@field time integer
+---@field inventory nil 游戏指针，Lua 里恒为 nil
+---@field other nil 游戏指针，Lua 里恒为 nil
+---native.InventoryPostMergeEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.InventoryPostMergeEvent : dd.Event, dd.fields.native.InventoryPostMergeEvent
+---native.InventoryPostMergeEvent 的 dd.wait_event 快照
+---@class dd.snap.native.InventoryPostMergeEvent : dd.Snapshot, dd.fields.native.InventoryPostMergeEvent
+---native.InventoryPostMergeEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.InventoryPostMergeEvent
+---@field name? string
+---@field time? integer
+---@field inventory? dd.Actor
+---@field other? dd.Actor
+---@class dd.opts.native.InventoryPostMergeEvent : dd.OnOptions
+---@field filter? dd.filter.native.InventoryPostMergeEvent
+
+-- ---- native.InventoryModifiedEvent
+---游戏事件 InventoryModifiedEvent（只读）
+---@class dd.fields.native.InventoryModifiedEvent
+---@field name string
+---@field time integer
+---native.InventoryModifiedEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.InventoryModifiedEvent : dd.Event, dd.fields.native.InventoryModifiedEvent
+---native.InventoryModifiedEvent 的 dd.wait_event 快照
+---@class dd.snap.native.InventoryModifiedEvent : dd.Snapshot, dd.fields.native.InventoryModifiedEvent
+---native.InventoryModifiedEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.InventoryModifiedEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.InventoryModifiedEvent : dd.OnOptions
+---@field filter? dd.filter.native.InventoryModifiedEvent
+
+-- ---- native.LaunchCreditsEvent
+---游戏事件 LaunchCreditsEvent（只读）
+---@class dd.fields.native.LaunchCreditsEvent
+---@field name string
+---@field time integer
+---native.LaunchCreditsEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.LaunchCreditsEvent : dd.Event, dd.fields.native.LaunchCreditsEvent
+---native.LaunchCreditsEvent 的 dd.wait_event 快照
+---@class dd.snap.native.LaunchCreditsEvent : dd.Snapshot, dd.fields.native.LaunchCreditsEvent
+---native.LaunchCreditsEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.LaunchCreditsEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.LaunchCreditsEvent : dd.OnOptions
+---@field filter? dd.filter.native.LaunchCreditsEvent
+
+-- ---- native.OptionsSavedEvent
+---游戏事件 OptionsSavedEvent（只读）
+---@class dd.fields.native.OptionsSavedEvent
+---@field name string
+---@field time integer
+---native.OptionsSavedEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.OptionsSavedEvent : dd.Event, dd.fields.native.OptionsSavedEvent
+---native.OptionsSavedEvent 的 dd.wait_event 快照
+---@class dd.snap.native.OptionsSavedEvent : dd.Snapshot, dd.fields.native.OptionsSavedEvent
+---native.OptionsSavedEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.OptionsSavedEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.OptionsSavedEvent : dd.OnOptions
+---@field filter? dd.filter.native.OptionsSavedEvent
+
+-- ---- native.PlayFabConnectionInitializedEvent
+---游戏事件 PlayFabConnectionInitializedEvent（只读）
+---@class dd.fields.native.PlayFabConnectionInitializedEvent
+---@field name string
+---@field time integer
+---native.PlayFabConnectionInitializedEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.PlayFabConnectionInitializedEvent : dd.Event, dd.fields.native.PlayFabConnectionInitializedEvent
+---native.PlayFabConnectionInitializedEvent 的 dd.wait_event 快照
+---@class dd.snap.native.PlayFabConnectionInitializedEvent : dd.Snapshot, dd.fields.native.PlayFabConnectionInitializedEvent
+---native.PlayFabConnectionInitializedEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.PlayFabConnectionInitializedEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.PlayFabConnectionInitializedEvent : dd.OnOptions
+---@field filter? dd.filter.native.PlayFabConnectionInitializedEvent
+
+-- ---- native.PlayFabReconnectedEvent
+---游戏事件 PlayFabReconnectedEvent（只读）
+---@class dd.fields.native.PlayFabReconnectedEvent
+---@field name string
+---@field time integer
+---native.PlayFabReconnectedEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.PlayFabReconnectedEvent : dd.Event, dd.fields.native.PlayFabReconnectedEvent
+---native.PlayFabReconnectedEvent 的 dd.wait_event 快照
+---@class dd.snap.native.PlayFabReconnectedEvent : dd.Snapshot, dd.fields.native.PlayFabReconnectedEvent
+---native.PlayFabReconnectedEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.PlayFabReconnectedEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.PlayFabReconnectedEvent : dd.OnOptions
+---@field filter? dd.filter.native.PlayFabReconnectedEvent
+
+-- ---- native.PlayFabConnectionLostEvent
+---游戏事件 PlayFabConnectionLostEvent（只读）
+---@class dd.fields.native.PlayFabConnectionLostEvent
+---@field name string
+---@field time integer
+---native.PlayFabConnectionLostEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.PlayFabConnectionLostEvent : dd.Event, dd.fields.native.PlayFabConnectionLostEvent
+---native.PlayFabConnectionLostEvent 的 dd.wait_event 快照
+---@class dd.snap.native.PlayFabConnectionLostEvent : dd.Snapshot, dd.fields.native.PlayFabConnectionLostEvent
+---native.PlayFabConnectionLostEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.PlayFabConnectionLostEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.PlayFabConnectionLostEvent : dd.OnOptions
+---@field filter? dd.filter.native.PlayFabConnectionLostEvent
+
+-- ---- native.PlayFabLocalizedDataAvailableEvent
+---游戏事件 PlayFabLocalizedDataAvailableEvent（只读）
+---@class dd.fields.native.PlayFabLocalizedDataAvailableEvent
+---@field name string
+---@field time integer
+---native.PlayFabLocalizedDataAvailableEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.PlayFabLocalizedDataAvailableEvent : dd.Event, dd.fields.native.PlayFabLocalizedDataAvailableEvent
+---native.PlayFabLocalizedDataAvailableEvent 的 dd.wait_event 快照
+---@class dd.snap.native.PlayFabLocalizedDataAvailableEvent : dd.Snapshot, dd.fields.native.PlayFabLocalizedDataAvailableEvent
+---native.PlayFabLocalizedDataAvailableEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.PlayFabLocalizedDataAvailableEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.PlayFabLocalizedDataAvailableEvent : dd.OnOptions
+---@field filter? dd.filter.native.PlayFabLocalizedDataAvailableEvent
+
+-- ---- native.PlayFabFinishPostMatchDataUpdatesEvent
+---游戏事件 PlayFabFinishPostMatchDataUpdatesEvent（只读）
+---@class dd.fields.native.PlayFabFinishPostMatchDataUpdatesEvent
+---@field name string
+---@field time integer
+---native.PlayFabFinishPostMatchDataUpdatesEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.PlayFabFinishPostMatchDataUpdatesEvent : dd.Event, dd.fields.native.PlayFabFinishPostMatchDataUpdatesEvent
+---native.PlayFabFinishPostMatchDataUpdatesEvent 的 dd.wait_event 快照
+---@class dd.snap.native.PlayFabFinishPostMatchDataUpdatesEvent : dd.Snapshot, dd.fields.native.PlayFabFinishPostMatchDataUpdatesEvent
+---native.PlayFabFinishPostMatchDataUpdatesEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.PlayFabFinishPostMatchDataUpdatesEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.PlayFabFinishPostMatchDataUpdatesEvent : dd.OnOptions
+---@field filter? dd.filter.native.PlayFabFinishPostMatchDataUpdatesEvent
+
+-- ---- native.ReceivedExternalTurnMetaDataInSimpleMPEvent
+---游戏事件 ReceivedExternalTurnMetaDataInSimpleMPEvent（只读）
+---@class dd.fields.native.ReceivedExternalTurnMetaDataInSimpleMPEvent
+---@field name string
+---@field time integer
+---native.ReceivedExternalTurnMetaDataInSimpleMPEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.ReceivedExternalTurnMetaDataInSimpleMPEvent : dd.Event, dd.fields.native.ReceivedExternalTurnMetaDataInSimpleMPEvent
+---native.ReceivedExternalTurnMetaDataInSimpleMPEvent 的 dd.wait_event 快照
+---@class dd.snap.native.ReceivedExternalTurnMetaDataInSimpleMPEvent : dd.Snapshot, dd.fields.native.ReceivedExternalTurnMetaDataInSimpleMPEvent
+---native.ReceivedExternalTurnMetaDataInSimpleMPEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.ReceivedExternalTurnMetaDataInSimpleMPEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.ReceivedExternalTurnMetaDataInSimpleMPEvent : dd.OnOptions
+---@field filter? dd.filter.native.ReceivedExternalTurnMetaDataInSimpleMPEvent
+
+-- ---- native.ExternalSubsystemMultiplayerMessageReceivedEvent
+---游戏事件 ExternalSubsystemMultiplayerMessageReceivedEvent（只读）
+---@class dd.fields.native.ExternalSubsystemMultiplayerMessageReceivedEvent
+---@field name string
+---@field time integer
+---native.ExternalSubsystemMultiplayerMessageReceivedEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.ExternalSubsystemMultiplayerMessageReceivedEvent : dd.Event, dd.fields.native.ExternalSubsystemMultiplayerMessageReceivedEvent
+---native.ExternalSubsystemMultiplayerMessageReceivedEvent 的 dd.wait_event 快照
+---@class dd.snap.native.ExternalSubsystemMultiplayerMessageReceivedEvent : dd.Snapshot, dd.fields.native.ExternalSubsystemMultiplayerMessageReceivedEvent
+---native.ExternalSubsystemMultiplayerMessageReceivedEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.ExternalSubsystemMultiplayerMessageReceivedEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.ExternalSubsystemMultiplayerMessageReceivedEvent : dd.OnOptions
+---@field filter? dd.filter.native.ExternalSubsystemMultiplayerMessageReceivedEvent
+
+-- ---- native.RaidStartEvent
+---游戏事件 RaidStartEvent（只读）
+---@class dd.fields.native.RaidStartEvent
+---@field name string
+---@field time integer
+---@field raid nil 游戏指针，Lua 里恒为 nil
+---native.RaidStartEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.RaidStartEvent : dd.Event, dd.fields.native.RaidStartEvent
+---native.RaidStartEvent 的 dd.wait_event 快照
+---@class dd.snap.native.RaidStartEvent : dd.Snapshot, dd.fields.native.RaidStartEvent
+---native.RaidStartEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.RaidStartEvent
+---@field name? string
+---@field time? integer
+---@field raid? dd.Actor
+---@class dd.opts.native.RaidStartEvent : dd.OnOptions
+---@field filter? dd.filter.native.RaidStartEvent
+
+-- ---- native.PartyStepEvent
+---游戏事件 PartyStepEvent（只读）
+---@class dd.fields.native.PartyStepEvent
+---@field name string
+---@field time integer
+---native.PartyStepEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.PartyStepEvent : dd.Event, dd.fields.native.PartyStepEvent
+---native.PartyStepEvent 的 dd.wait_event 快照
+---@class dd.snap.native.PartyStepEvent : dd.Snapshot, dd.fields.native.PartyStepEvent
+---native.PartyStepEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.PartyStepEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.PartyStepEvent : dd.OnOptions
+---@field filter? dd.filter.native.PartyStepEvent
+
+-- ---- native.RaidFinishResultsEvent
+---游戏事件 RaidFinishResultsEvent（只读）
+---@class dd.fields.native.RaidFinishResultsEvent
+---@field name string
+---@field time integer
+---@field results nil 游戏指针，Lua 里恒为 nil
+---native.RaidFinishResultsEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.RaidFinishResultsEvent : dd.Event, dd.fields.native.RaidFinishResultsEvent
+---native.RaidFinishResultsEvent 的 dd.wait_event 快照
+---@class dd.snap.native.RaidFinishResultsEvent : dd.Snapshot, dd.fields.native.RaidFinishResultsEvent
+---native.RaidFinishResultsEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.RaidFinishResultsEvent
+---@field name? string
+---@field time? integer
+---@field results? dd.Actor
+---@class dd.opts.native.RaidFinishResultsEvent : dd.OnOptions
+---@field filter? dd.filter.native.RaidFinishResultsEvent
+
+-- ---- native.RaidGoalsCompleteEvent
+---游戏事件 RaidGoalsCompleteEvent（只读）
+---@class dd.fields.native.RaidGoalsCompleteEvent
+---@field name string
+---@field time integer
+---native.RaidGoalsCompleteEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.RaidGoalsCompleteEvent : dd.Event, dd.fields.native.RaidGoalsCompleteEvent
+---native.RaidGoalsCompleteEvent 的 dd.wait_event 快照
+---@class dd.snap.native.RaidGoalsCompleteEvent : dd.Snapshot, dd.fields.native.RaidGoalsCompleteEvent
+---native.RaidGoalsCompleteEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.RaidGoalsCompleteEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.RaidGoalsCompleteEvent : dd.OnOptions
+---@field filter? dd.filter.native.RaidGoalsCompleteEvent
+
+-- ---- native.RaidMapGenerated
+---游戏事件 RaidMapGenerated（只读）
+---@class dd.fields.native.RaidMapGenerated
+---@field name string
+---@field time integer
+---native.RaidMapGenerated 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.RaidMapGenerated : dd.Event, dd.fields.native.RaidMapGenerated
+---native.RaidMapGenerated 的 dd.wait_event 快照
+---@class dd.snap.native.RaidMapGenerated : dd.Snapshot, dd.fields.native.RaidMapGenerated
+---native.RaidMapGenerated 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.RaidMapGenerated
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.RaidMapGenerated : dd.OnOptions
+---@field filter? dd.filter.native.RaidMapGenerated
+
+-- ---- native.PreRaidFinishResultsEvent
+---游戏事件 PreRaidFinishResultsEvent（只读）
+---@class dd.fields.native.PreRaidFinishResultsEvent
+---@field name string
+---@field time integer
+---native.PreRaidFinishResultsEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.PreRaidFinishResultsEvent : dd.Event, dd.fields.native.PreRaidFinishResultsEvent
+---native.PreRaidFinishResultsEvent 的 dd.wait_event 快照
+---@class dd.snap.native.PreRaidFinishResultsEvent : dd.Snapshot, dd.fields.native.PreRaidFinishResultsEvent
+---native.PreRaidFinishResultsEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.PreRaidFinishResultsEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.PreRaidFinishResultsEvent : dd.OnOptions
+---@field filter? dd.filter.native.PreRaidFinishResultsEvent
+
+-- ---- native.TorchModifiedEvent
+---游戏事件 TorchModifiedEvent（只读）
+---@class dd.fields.native.TorchModifiedEvent
+---@field name string
+---@field time integer
+---@field torch_before number
+---@field torch_after number
+---@field delta number
+---@field flag boolean
+---native.TorchModifiedEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.TorchModifiedEvent : dd.Event, dd.fields.native.TorchModifiedEvent
+---native.TorchModifiedEvent 的 dd.wait_event 快照
+---@class dd.snap.native.TorchModifiedEvent : dd.Snapshot, dd.fields.native.TorchModifiedEvent
+---native.TorchModifiedEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.TorchModifiedEvent
+---@field name? string
+---@field time? integer
+---@field torch_before? number
+---@field torch_after? number
+---@field delta? number
+---@field flag? boolean
+---@class dd.opts.native.TorchModifiedEvent : dd.OnOptions
+---@field filter? dd.filter.native.TorchModifiedEvent
+
+-- ---- native.PrisonerRescuedEvent
+---游戏事件 PrisonerRescuedEvent（只读）
+---@class dd.fields.native.PrisonerRescuedEvent
+---@field name string
+---@field time integer
+---native.PrisonerRescuedEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.PrisonerRescuedEvent : dd.Event, dd.fields.native.PrisonerRescuedEvent
+---native.PrisonerRescuedEvent 的 dd.wait_event 快照
+---@class dd.snap.native.PrisonerRescuedEvent : dd.Snapshot, dd.fields.native.PrisonerRescuedEvent
+---native.PrisonerRescuedEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.PrisonerRescuedEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.PrisonerRescuedEvent : dd.OnOptions
+---@field filter? dd.filter.native.PrisonerRescuedEvent
+
+-- ---- native.QueueWaveLogicBarkEvent
+---游戏事件 QueueWaveLogicBarkEvent（只读）
+---@class dd.fields.native.QueueWaveLogicBarkEvent
+---@field name string
+---@field time integer
+---native.QueueWaveLogicBarkEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.QueueWaveLogicBarkEvent : dd.Event, dd.fields.native.QueueWaveLogicBarkEvent
+---native.QueueWaveLogicBarkEvent 的 dd.wait_event 快照
+---@class dd.snap.native.QueueWaveLogicBarkEvent : dd.Snapshot, dd.fields.native.QueueWaveLogicBarkEvent
+---native.QueueWaveLogicBarkEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.QueueWaveLogicBarkEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.QueueWaveLogicBarkEvent : dd.OnOptions
+---@field filter? dd.filter.native.QueueWaveLogicBarkEvent
+
+-- ---- native.MaxPrestigeEvent
+---游戏事件 MaxPrestigeEvent（只读）
+---@class dd.fields.native.MaxPrestigeEvent
+---@field name string
+---@field time integer
+---native.MaxPrestigeEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.MaxPrestigeEvent : dd.Event, dd.fields.native.MaxPrestigeEvent
+---native.MaxPrestigeEvent 的 dd.wait_event 快照
+---@class dd.snap.native.MaxPrestigeEvent : dd.Snapshot, dd.fields.native.MaxPrestigeEvent
+---native.MaxPrestigeEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.MaxPrestigeEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.MaxPrestigeEvent : dd.OnOptions
+---@field filter? dd.filter.native.MaxPrestigeEvent
+
+-- ---- native.RosterListHeroDDEffectEvent
+---游戏事件 RosterListHeroDDEffectEvent（只读）
+---@class dd.fields.native.RosterListHeroDDEffectEvent
+---@field name string
+---@field time integer
+---native.RosterListHeroDDEffectEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.RosterListHeroDDEffectEvent : dd.Event, dd.fields.native.RosterListHeroDDEffectEvent
+---native.RosterListHeroDDEffectEvent 的 dd.wait_event 快照
+---@class dd.snap.native.RosterListHeroDDEffectEvent : dd.Snapshot, dd.fields.native.RosterListHeroDDEffectEvent
+---native.RosterListHeroDDEffectEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.RosterListHeroDDEffectEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.RosterListHeroDDEffectEvent : dd.OnOptions
+---@field filter? dd.filter.native.RosterListHeroDDEffectEvent
+
+-- ---- native.RosterListHeroDDEffectClearedEvent
+---游戏事件 RosterListHeroDDEffectClearedEvent（只读）
+---@class dd.fields.native.RosterListHeroDDEffectClearedEvent
+---@field name string
+---@field time integer
+---native.RosterListHeroDDEffectClearedEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.RosterListHeroDDEffectClearedEvent : dd.Event, dd.fields.native.RosterListHeroDDEffectClearedEvent
+---native.RosterListHeroDDEffectClearedEvent 的 dd.wait_event 快照
+---@class dd.snap.native.RosterListHeroDDEffectClearedEvent : dd.Snapshot, dd.fields.native.RosterListHeroDDEffectClearedEvent
+---native.RosterListHeroDDEffectClearedEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.RosterListHeroDDEffectClearedEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.RosterListHeroDDEffectClearedEvent : dd.OnOptions
+---@field filter? dd.filter.native.RosterListHeroDDEffectClearedEvent
+
+-- ---- native.JournalPopupStartEvent
+---游戏事件 JournalPopupStartEvent（只读）
+---@class dd.fields.native.JournalPopupStartEvent
+---@field name string
+---@field time integer
+---native.JournalPopupStartEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.JournalPopupStartEvent : dd.Event, dd.fields.native.JournalPopupStartEvent
+---native.JournalPopupStartEvent 的 dd.wait_event 快照
+---@class dd.snap.native.JournalPopupStartEvent : dd.Snapshot, dd.fields.native.JournalPopupStartEvent
+---native.JournalPopupStartEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.JournalPopupStartEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.JournalPopupStartEvent : dd.OnOptions
+---@field filter? dd.filter.native.JournalPopupStartEvent
+
+-- ---- native.HeroStartBarkEvent
+---游戏事件 HeroStartBarkEvent（只读）
+---@class dd.fields.native.HeroStartBarkEvent
+---@field name string
+---@field time integer
+---native.HeroStartBarkEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.HeroStartBarkEvent : dd.Event, dd.fields.native.HeroStartBarkEvent
+---native.HeroStartBarkEvent 的 dd.wait_event 快照
+---@class dd.snap.native.HeroStartBarkEvent : dd.Snapshot, dd.fields.native.HeroStartBarkEvent
+---native.HeroStartBarkEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.HeroStartBarkEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.HeroStartBarkEvent : dd.OnOptions
+---@field filter? dd.filter.native.HeroStartBarkEvent
+
+-- ---- native.ActivityOpenedEvent
+---游戏事件 ActivityOpenedEvent（只读）
+---@class dd.fields.native.ActivityOpenedEvent
+---@field name string
+---@field time integer
+---@field activity nil 游戏指针，Lua 里恒为 nil
+---@field flag boolean
+---native.ActivityOpenedEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.ActivityOpenedEvent : dd.Event, dd.fields.native.ActivityOpenedEvent
+---native.ActivityOpenedEvent 的 dd.wait_event 快照
+---@class dd.snap.native.ActivityOpenedEvent : dd.Snapshot, dd.fields.native.ActivityOpenedEvent
+---native.ActivityOpenedEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.ActivityOpenedEvent
+---@field name? string
+---@field time? integer
+---@field activity? dd.Actor
+---@field flag? boolean
+---@class dd.opts.native.ActivityOpenedEvent : dd.OnOptions
+---@field filter? dd.filter.native.ActivityOpenedEvent
+
+-- ---- native.ActivityFinishedEvent
+---游戏事件 ActivityFinishedEvent（只读）
+---@class dd.fields.native.ActivityFinishedEvent
+---@field name string
+---@field time integer
+---@field activity_id integer
+---native.ActivityFinishedEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.ActivityFinishedEvent : dd.Event, dd.fields.native.ActivityFinishedEvent
+---native.ActivityFinishedEvent 的 dd.wait_event 快照
+---@class dd.snap.native.ActivityFinishedEvent : dd.Snapshot, dd.fields.native.ActivityFinishedEvent
+---native.ActivityFinishedEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.ActivityFinishedEvent
+---@field name? string
+---@field time? integer
+---@field activity_id? integer
+---@class dd.opts.native.ActivityFinishedEvent : dd.OnOptions
+---@field filter? dd.filter.native.ActivityFinishedEvent
+
+-- ---- native.QuirkLockedEvent
+---游戏事件 QuirkLockedEvent（只读）
+---@class dd.fields.native.QuirkLockedEvent
+---@field name string
+---@field time integer
+---native.QuirkLockedEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.QuirkLockedEvent : dd.Event, dd.fields.native.QuirkLockedEvent
+---native.QuirkLockedEvent 的 dd.wait_event 快照
+---@class dd.snap.native.QuirkLockedEvent : dd.Snapshot, dd.fields.native.QuirkLockedEvent
+---native.QuirkLockedEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.QuirkLockedEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.QuirkLockedEvent : dd.OnOptions
+---@field filter? dd.filter.native.QuirkLockedEvent
+
+-- ---- native.PositiveQuirkTreatedEvent
+---游戏事件 PositiveQuirkTreatedEvent（只读）
+---@class dd.fields.native.PositiveQuirkTreatedEvent
+---@field name string
+---@field time integer
+---native.PositiveQuirkTreatedEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.PositiveQuirkTreatedEvent : dd.Event, dd.fields.native.PositiveQuirkTreatedEvent
+---native.PositiveQuirkTreatedEvent 的 dd.wait_event 快照
+---@class dd.snap.native.PositiveQuirkTreatedEvent : dd.Snapshot, dd.fields.native.PositiveQuirkTreatedEvent
+---native.PositiveQuirkTreatedEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.PositiveQuirkTreatedEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.PositiveQuirkTreatedEvent : dd.OnOptions
+---@field filter? dd.filter.native.PositiveQuirkTreatedEvent
+
+-- ---- native.NegativeQuirkTreatedEvent
+---游戏事件 NegativeQuirkTreatedEvent（只读）
+---@class dd.fields.native.NegativeQuirkTreatedEvent
+---@field name string
+---@field time integer
+---native.NegativeQuirkTreatedEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.NegativeQuirkTreatedEvent : dd.Event, dd.fields.native.NegativeQuirkTreatedEvent
+---native.NegativeQuirkTreatedEvent 的 dd.wait_event 快照
+---@class dd.snap.native.NegativeQuirkTreatedEvent : dd.Snapshot, dd.fields.native.NegativeQuirkTreatedEvent
+---native.NegativeQuirkTreatedEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.NegativeQuirkTreatedEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.NegativeQuirkTreatedEvent : dd.OnOptions
+---@field filter? dd.filter.native.NegativeQuirkTreatedEvent
+
+-- ---- native.BuildingStateChangedEvent
+---游戏事件 BuildingStateChangedEvent（只读）
+---@class dd.fields.native.BuildingStateChangedEvent
+---@field name string
+---@field time integer
+---@field value integer
+---@field flag boolean
+---native.BuildingStateChangedEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.BuildingStateChangedEvent : dd.Event, dd.fields.native.BuildingStateChangedEvent
+---native.BuildingStateChangedEvent 的 dd.wait_event 快照
+---@class dd.snap.native.BuildingStateChangedEvent : dd.Snapshot, dd.fields.native.BuildingStateChangedEvent
+---native.BuildingStateChangedEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.BuildingStateChangedEvent
+---@field name? string
+---@field time? integer
+---@field value? integer
+---@field flag? boolean
+---@class dd.opts.native.BuildingStateChangedEvent : dd.OnOptions
+---@field filter? dd.filter.native.BuildingStateChangedEvent
+
+-- ---- native.EstateCurrencyChangeEvent
+---游戏事件 EstateCurrencyChangeEvent（只读）
+---@class dd.fields.native.EstateCurrencyChangeEvent
+---@field name string
+---@field time integer
+---@field currency integer
+---@field delta integer
+---native.EstateCurrencyChangeEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.EstateCurrencyChangeEvent : dd.Event, dd.fields.native.EstateCurrencyChangeEvent
+---native.EstateCurrencyChangeEvent 的 dd.wait_event 快照
+---@class dd.snap.native.EstateCurrencyChangeEvent : dd.Snapshot, dd.fields.native.EstateCurrencyChangeEvent
+---native.EstateCurrencyChangeEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.EstateCurrencyChangeEvent
+---@field name? string
+---@field time? integer
+---@field currency? integer
+---@field delta? integer
+---@class dd.opts.native.EstateCurrencyChangeEvent : dd.OnOptions
+---@field filter? dd.filter.native.EstateCurrencyChangeEvent
+
+-- ---- native.HeroDismissedEvent
+---游戏事件 HeroDismissedEvent（只读）
+---@class dd.fields.native.HeroDismissedEvent
+---@field name string
+---@field time integer
+---@field hero_id integer
+---native.HeroDismissedEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.HeroDismissedEvent : dd.Event, dd.fields.native.HeroDismissedEvent
+---native.HeroDismissedEvent 的 dd.wait_event 快照
+---@class dd.snap.native.HeroDismissedEvent : dd.Snapshot, dd.fields.native.HeroDismissedEvent
+---native.HeroDismissedEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.HeroDismissedEvent
+---@field name? string
+---@field time? integer
+---@field hero_id? integer
+---@class dd.opts.native.HeroDismissedEvent : dd.OnOptions
+---@field filter? dd.filter.native.HeroDismissedEvent
+
+-- ---- native.BuildingUpgradedEvent
+---游戏事件 BuildingUpgradedEvent（只读）
+---@class dd.fields.native.BuildingUpgradedEvent
+---@field name string
+---@field time integer
+---native.BuildingUpgradedEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.BuildingUpgradedEvent : dd.Event, dd.fields.native.BuildingUpgradedEvent
+---native.BuildingUpgradedEvent 的 dd.wait_event 快照
+---@class dd.snap.native.BuildingUpgradedEvent : dd.Snapshot, dd.fields.native.BuildingUpgradedEvent
+---native.BuildingUpgradedEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.BuildingUpgradedEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.BuildingUpgradedEvent : dd.OnOptions
+---@field filter? dd.filter.native.BuildingUpgradedEvent
+
+-- ---- native.RealmInventoryChangedEvent
+---游戏事件 RealmInventoryChangedEvent（只读）
+---@class dd.fields.native.RealmInventoryChangedEvent
+---@field name string
+---@field time integer
+---native.RealmInventoryChangedEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.RealmInventoryChangedEvent : dd.Event, dd.fields.native.RealmInventoryChangedEvent
+---native.RealmInventoryChangedEvent 的 dd.wait_event 快照
+---@class dd.snap.native.RealmInventoryChangedEvent : dd.Snapshot, dd.fields.native.RealmInventoryChangedEvent
+---native.RealmInventoryChangedEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.RealmInventoryChangedEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.RealmInventoryChangedEvent : dd.OnOptions
+---@field filter? dd.filter.native.RealmInventoryChangedEvent
+
+-- ---- native.HeroRecruitedEvent
+---游戏事件 HeroRecruitedEvent（只读）
+---@class dd.fields.native.HeroRecruitedEvent
+---@field name string
+---@field time integer
+---@field hero_id integer
+---native.HeroRecruitedEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.HeroRecruitedEvent : dd.Event, dd.fields.native.HeroRecruitedEvent
+---native.HeroRecruitedEvent 的 dd.wait_event 快照
+---@class dd.snap.native.HeroRecruitedEvent : dd.Snapshot, dd.fields.native.HeroRecruitedEvent
+---native.HeroRecruitedEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.HeroRecruitedEvent
+---@field name? string
+---@field time? integer
+---@field hero_id? integer
+---@class dd.opts.native.HeroRecruitedEvent : dd.OnOptions
+---@field filter? dd.filter.native.HeroRecruitedEvent
+
+-- ---- native.TownEventOnStartTownVisitEvent
+---游戏事件 TownEventOnStartTownVisitEvent（只读）
+---@class dd.fields.native.TownEventOnStartTownVisitEvent
+---@field name string
+---@field time integer
+---@field event nil 游戏指针，Lua 里恒为 nil
+---native.TownEventOnStartTownVisitEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.TownEventOnStartTownVisitEvent : dd.Event, dd.fields.native.TownEventOnStartTownVisitEvent
+---native.TownEventOnStartTownVisitEvent 的 dd.wait_event 快照
+---@class dd.snap.native.TownEventOnStartTownVisitEvent : dd.Snapshot, dd.fields.native.TownEventOnStartTownVisitEvent
+---native.TownEventOnStartTownVisitEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.TownEventOnStartTownVisitEvent
+---@field name? string
+---@field time? integer
+---@field event? dd.Actor
+---@class dd.opts.native.TownEventOnStartTownVisitEvent : dd.OnOptions
+---@field filter? dd.filter.native.TownEventOnStartTownVisitEvent
+
+-- ---- native.PreOnStartTownVisitEvent
+---游戏事件 PreOnStartTownVisitEvent（只读）
+---@class dd.fields.native.PreOnStartTownVisitEvent
+---@field name string
+---@field time integer
+---@field flag boolean
+---native.PreOnStartTownVisitEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.PreOnStartTownVisitEvent : dd.Event, dd.fields.native.PreOnStartTownVisitEvent
+---native.PreOnStartTownVisitEvent 的 dd.wait_event 快照
+---@class dd.snap.native.PreOnStartTownVisitEvent : dd.Snapshot, dd.fields.native.PreOnStartTownVisitEvent
+---native.PreOnStartTownVisitEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.PreOnStartTownVisitEvent
+---@field name? string
+---@field time? integer
+---@field flag? boolean
+---@class dd.opts.native.PreOnStartTownVisitEvent : dd.OnOptions
+---@field filter? dd.filter.native.PreOnStartTownVisitEvent
+
+-- ---- native.PostOnStartTownVisitEvent
+---游戏事件 PostOnStartTownVisitEvent（只读）
+---@class dd.fields.native.PostOnStartTownVisitEvent
+---@field name string
+---@field time integer
+---native.PostOnStartTownVisitEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.PostOnStartTownVisitEvent : dd.Event, dd.fields.native.PostOnStartTownVisitEvent
+---native.PostOnStartTownVisitEvent 的 dd.wait_event 快照
+---@class dd.snap.native.PostOnStartTownVisitEvent : dd.Snapshot, dd.fields.native.PostOnStartTownVisitEvent
+---native.PostOnStartTownVisitEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.PostOnStartTownVisitEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.PostOnStartTownVisitEvent : dd.OnOptions
+---@field filter? dd.filter.native.PostOnStartTownVisitEvent
+
+-- ---- native.DistrictBuildingBuiltEvent
+---游戏事件 DistrictBuildingBuiltEvent（只读）
+---@class dd.fields.native.DistrictBuildingBuiltEvent
+---@field name string
+---@field time integer
+---native.DistrictBuildingBuiltEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.DistrictBuildingBuiltEvent : dd.Event, dd.fields.native.DistrictBuildingBuiltEvent
+---native.DistrictBuildingBuiltEvent 的 dd.wait_event 快照
+---@class dd.snap.native.DistrictBuildingBuiltEvent : dd.Snapshot, dd.fields.native.DistrictBuildingBuiltEvent
+---native.DistrictBuildingBuiltEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.DistrictBuildingBuiltEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.DistrictBuildingBuiltEvent : dd.OnOptions
+---@field filter? dd.filter.native.DistrictBuildingBuiltEvent
+
+-- ---- native.PrestigeUpdatedEvent
+---游戏事件 PrestigeUpdatedEvent（只读）
+---@class dd.fields.native.PrestigeUpdatedEvent
+---@field name string
+---@field time integer
+---native.PrestigeUpdatedEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.PrestigeUpdatedEvent : dd.Event, dd.fields.native.PrestigeUpdatedEvent
+---native.PrestigeUpdatedEvent 的 dd.wait_event 快照
+---@class dd.snap.native.PrestigeUpdatedEvent : dd.Snapshot, dd.fields.native.PrestigeUpdatedEvent
+---native.PrestigeUpdatedEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.PrestigeUpdatedEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.PrestigeUpdatedEvent : dd.OnOptions
+---@field filter? dd.filter.native.PrestigeUpdatedEvent
+
+-- ---- native.PlayFabAchievementsUpdatedEvent
+---游戏事件 PlayFabAchievementsUpdatedEvent（只读）
+---@class dd.fields.native.PlayFabAchievementsUpdatedEvent
+---@field name string
+---@field time integer
+---native.PlayFabAchievementsUpdatedEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.PlayFabAchievementsUpdatedEvent : dd.Event, dd.fields.native.PlayFabAchievementsUpdatedEvent
+---native.PlayFabAchievementsUpdatedEvent 的 dd.wait_event 快照
+---@class dd.snap.native.PlayFabAchievementsUpdatedEvent : dd.Snapshot, dd.fields.native.PlayFabAchievementsUpdatedEvent
+---native.PlayFabAchievementsUpdatedEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.PlayFabAchievementsUpdatedEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.PlayFabAchievementsUpdatedEvent : dd.OnOptions
+---@field filter? dd.filter.native.PlayFabAchievementsUpdatedEvent
+
+-- ---- native.PrestigeAndPlayFabAchievementsUpdatedEvent
+---游戏事件 PrestigeAndPlayFabAchievementsUpdatedEvent（只读）
+---@class dd.fields.native.PrestigeAndPlayFabAchievementsUpdatedEvent
+---@field name string
+---@field time integer
+---native.PrestigeAndPlayFabAchievementsUpdatedEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.PrestigeAndPlayFabAchievementsUpdatedEvent : dd.Event, dd.fields.native.PrestigeAndPlayFabAchievementsUpdatedEvent
+---native.PrestigeAndPlayFabAchievementsUpdatedEvent 的 dd.wait_event 快照
+---@class dd.snap.native.PrestigeAndPlayFabAchievementsUpdatedEvent : dd.Snapshot, dd.fields.native.PrestigeAndPlayFabAchievementsUpdatedEvent
+---native.PrestigeAndPlayFabAchievementsUpdatedEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.PrestigeAndPlayFabAchievementsUpdatedEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.PrestigeAndPlayFabAchievementsUpdatedEvent : dd.OnOptions
+---@field filter? dd.filter.native.PrestigeAndPlayFabAchievementsUpdatedEvent
+
+-- ---- native.ArenaUnlocksUpdatedEvent
+---游戏事件 ArenaUnlocksUpdatedEvent（只读）
+---@class dd.fields.native.ArenaUnlocksUpdatedEvent
+---@field name string
+---@field time integer
+---native.ArenaUnlocksUpdatedEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.ArenaUnlocksUpdatedEvent : dd.Event, dd.fields.native.ArenaUnlocksUpdatedEvent
+---native.ArenaUnlocksUpdatedEvent 的 dd.wait_event 快照
+---@class dd.snap.native.ArenaUnlocksUpdatedEvent : dd.Snapshot, dd.fields.native.ArenaUnlocksUpdatedEvent
+---native.ArenaUnlocksUpdatedEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.ArenaUnlocksUpdatedEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.ArenaUnlocksUpdatedEvent : dd.OnOptions
+---@field filter? dd.filter.native.ArenaUnlocksUpdatedEvent
+
+-- ---- native.TutorialPopupStartEvent
+---游戏事件 TutorialPopupStartEvent（只读）
+---@class dd.fields.native.TutorialPopupStartEvent
+---@field name string
+---@field time integer
+---native.TutorialPopupStartEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.TutorialPopupStartEvent : dd.Event, dd.fields.native.TutorialPopupStartEvent
+---native.TutorialPopupStartEvent 的 dd.wait_event 快照
+---@class dd.snap.native.TutorialPopupStartEvent : dd.Snapshot, dd.fields.native.TutorialPopupStartEvent
+---native.TutorialPopupStartEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.TutorialPopupStartEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.TutorialPopupStartEvent : dd.OnOptions
+---@field filter? dd.filter.native.TutorialPopupStartEvent
+
+-- ---- native.TutorialPopupFinishEvent
+---游戏事件 TutorialPopupFinishEvent（只读）
+---@class dd.fields.native.TutorialPopupFinishEvent
+---@field name string
+---@field time integer
+---native.TutorialPopupFinishEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.TutorialPopupFinishEvent : dd.Event, dd.fields.native.TutorialPopupFinishEvent
+---native.TutorialPopupFinishEvent 的 dd.wait_event 快照
+---@class dd.snap.native.TutorialPopupFinishEvent : dd.Snapshot, dd.fields.native.TutorialPopupFinishEvent
+---native.TutorialPopupFinishEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.TutorialPopupFinishEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.TutorialPopupFinishEvent : dd.OnOptions
+---@field filter? dd.filter.native.TutorialPopupFinishEvent
+
+-- ---- native.ResidentOccupiesActivityEvent
+---游戏事件 ResidentOccupiesActivityEvent（只读）
+---@class dd.fields.native.ResidentOccupiesActivityEvent
+---@field name string
+---@field time integer
+---native.ResidentOccupiesActivityEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.ResidentOccupiesActivityEvent : dd.Event, dd.fields.native.ResidentOccupiesActivityEvent
+---native.ResidentOccupiesActivityEvent 的 dd.wait_event 快照
+---@class dd.snap.native.ResidentOccupiesActivityEvent : dd.Snapshot, dd.fields.native.ResidentOccupiesActivityEvent
+---native.ResidentOccupiesActivityEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.ResidentOccupiesActivityEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.ResidentOccupiesActivityEvent : dd.OnOptions
+---@field filter? dd.filter.native.ResidentOccupiesActivityEvent
+
+-- ---- native.ActivitySlotTakenEvent
+---游戏事件 ActivitySlotTakenEvent（只读）
+---@class dd.fields.native.ActivitySlotTakenEvent
+---@field name string
+---@field time integer
+---native.ActivitySlotTakenEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.ActivitySlotTakenEvent : dd.Event, dd.fields.native.ActivitySlotTakenEvent
+---native.ActivitySlotTakenEvent 的 dd.wait_event 快照
+---@class dd.snap.native.ActivitySlotTakenEvent : dd.Snapshot, dd.fields.native.ActivitySlotTakenEvent
+---native.ActivitySlotTakenEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.ActivitySlotTakenEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.ActivitySlotTakenEvent : dd.OnOptions
+---@field filter? dd.filter.native.ActivitySlotTakenEvent
+
+-- ---- native.ActivityUnconfirmedSlotCountEvent
+---游戏事件 ActivityUnconfirmedSlotCountEvent（只读）
+---@class dd.fields.native.ActivityUnconfirmedSlotCountEvent
+---@field name string
+---@field time integer
+---native.ActivityUnconfirmedSlotCountEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.ActivityUnconfirmedSlotCountEvent : dd.Event, dd.fields.native.ActivityUnconfirmedSlotCountEvent
+---native.ActivityUnconfirmedSlotCountEvent 的 dd.wait_event 快照
+---@class dd.snap.native.ActivityUnconfirmedSlotCountEvent : dd.Snapshot, dd.fields.native.ActivityUnconfirmedSlotCountEvent
+---native.ActivityUnconfirmedSlotCountEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.ActivityUnconfirmedSlotCountEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.ActivityUnconfirmedSlotCountEvent : dd.OnOptions
+---@field filter? dd.filter.native.ActivityUnconfirmedSlotCountEvent
+
+-- ---- native.UpdateHeroStressEvent
+---游戏事件 UpdateHeroStressEvent（只读）
+---@class dd.fields.native.UpdateHeroStressEvent
+---@field name string
+---@field time integer
+---native.UpdateHeroStressEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.UpdateHeroStressEvent : dd.Event, dd.fields.native.UpdateHeroStressEvent
+---native.UpdateHeroStressEvent 的 dd.wait_event 快照
+---@class dd.snap.native.UpdateHeroStressEvent : dd.Snapshot, dd.fields.native.UpdateHeroStressEvent
+---native.UpdateHeroStressEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.UpdateHeroStressEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.UpdateHeroStressEvent : dd.OnOptions
+---@field filter? dd.filter.native.UpdateHeroStressEvent
+
+-- ---- native.RosterListRandomBarkEvent
+---游戏事件 RosterListRandomBarkEvent（只读）
+---@class dd.fields.native.RosterListRandomBarkEvent
+---@field name string
+---@field time integer
+---native.RosterListRandomBarkEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.RosterListRandomBarkEvent : dd.Event, dd.fields.native.RosterListRandomBarkEvent
+---native.RosterListRandomBarkEvent 的 dd.wait_event 快照
+---@class dd.snap.native.RosterListRandomBarkEvent : dd.Snapshot, dd.fields.native.RosterListRandomBarkEvent
+---native.RosterListRandomBarkEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.RosterListRandomBarkEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.RosterListRandomBarkEvent : dd.OnOptions
+---@field filter? dd.filter.native.RosterListRandomBarkEvent
+
+-- ---- native.StageCoachBarkEvent
+---游戏事件 StageCoachBarkEvent（只读）
+---@class dd.fields.native.StageCoachBarkEvent
+---@field name string
+---@field time integer
+---native.StageCoachBarkEvent 的事件负载，只在回调执行期间有效
+---@class dd.ev.native.StageCoachBarkEvent : dd.Event, dd.fields.native.StageCoachBarkEvent
+---native.StageCoachBarkEvent 的 dd.wait_event 快照
+---@class dd.snap.native.StageCoachBarkEvent : dd.Snapshot, dd.fields.native.StageCoachBarkEvent
+---native.StageCoachBarkEvent 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.native.StageCoachBarkEvent
+---@field name? string
+---@field time? integer
+---@class dd.opts.native.StageCoachBarkEvent : dd.OnOptions
+---@field filter? dd.filter.native.StageCoachBarkEvent
+
+-- ---- query.CampingPointBuffQuery
+---游戏询问 CampingPointBuffQuery：可写结果字段，不能取消
+---@class dd.fields.query.CampingPointBuffQuery
+---@field name string
+---@field points integer 可写
+---query.CampingPointBuffQuery 的事件负载，只在回调执行期间有效
+---@class dd.ev.query.CampingPointBuffQuery : dd.Event, dd.fields.query.CampingPointBuffQuery
+---query.CampingPointBuffQuery 的 dd.wait_event 快照
+---@class dd.snap.query.CampingPointBuffQuery : dd.Snapshot, dd.fields.query.CampingPointBuffQuery
+---query.CampingPointBuffQuery 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.query.CampingPointBuffQuery
+---@field name? string
+---@field points? integer
+---@class dd.opts.query.CampingPointBuffQuery : dd.OnOptions
+---@field filter? dd.filter.query.CampingPointBuffQuery
+
+-- ---- query.CurioInteractionBuffQuery
+---游戏询问 CurioInteractionBuffQuery：可写结果字段，不能取消
+---@class dd.fields.query.CurioInteractionBuffQuery
+---@field name string
+---@field hero dd.Actor? Hero/Monster 转成 actor 句柄，其他指针和延迟事件为 nil
+---@field curio nil 游戏指针，Lua 里恒为 nil
+---@field stress number 可写
+---@field heal number 可写
+---query.CurioInteractionBuffQuery 的事件负载，只在回调执行期间有效
+---@class dd.ev.query.CurioInteractionBuffQuery : dd.Event, dd.fields.query.CurioInteractionBuffQuery
+---query.CurioInteractionBuffQuery 的 dd.wait_event 快照
+---@class dd.snap.query.CurioInteractionBuffQuery : dd.Snapshot, dd.fields.query.CurioInteractionBuffQuery
+---query.CurioInteractionBuffQuery 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.query.CurioInteractionBuffQuery
+---@field name? string
+---@field hero? dd.Actor
+---@field curio? dd.Actor
+---@field stress? number
+---@field heal? number
+---@class dd.opts.query.CurioInteractionBuffQuery : dd.OnOptions
+---@field filter? dd.filter.query.CurioInteractionBuffQuery
+
+-- ---- query.IsDisabledQuery
+---游戏询问 IsDisabledQuery：可写结果字段，不能取消
+---@class dd.fields.query.IsDisabledQuery
+---@field name string
+---@field hero_id integer
+---@field disabled boolean 可写
+---query.IsDisabledQuery 的事件负载，只在回调执行期间有效
+---@class dd.ev.query.IsDisabledQuery : dd.Event, dd.fields.query.IsDisabledQuery
+---query.IsDisabledQuery 的 dd.wait_event 快照
+---@class dd.snap.query.IsDisabledQuery : dd.Snapshot, dd.fields.query.IsDisabledQuery
+---query.IsDisabledQuery 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.query.IsDisabledQuery
+---@field name? string
+---@field hero_id? integer
+---@field disabled? boolean
+---@class dd.opts.query.IsDisabledQuery : dd.OnOptions
+---@field filter? dd.filter.query.IsDisabledQuery
+
+-- ---- query.InventoryExtraStackingLimitQuery
+---游戏询问 InventoryExtraStackingLimitQuery：可写结果字段，不能取消
+---@class dd.fields.query.InventoryExtraStackingLimitQuery
+---@field name string
+---@field item_id integer
+---@field arg integer
+---@field limit integer 可写
+---query.InventoryExtraStackingLimitQuery 的事件负载，只在回调执行期间有效
+---@class dd.ev.query.InventoryExtraStackingLimitQuery : dd.Event, dd.fields.query.InventoryExtraStackingLimitQuery
+---query.InventoryExtraStackingLimitQuery 的 dd.wait_event 快照
+---@class dd.snap.query.InventoryExtraStackingLimitQuery : dd.Snapshot, dd.fields.query.InventoryExtraStackingLimitQuery
+---query.InventoryExtraStackingLimitQuery 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.query.InventoryExtraStackingLimitQuery
+---@field name? string
+---@field item_id? integer
+---@field arg? integer
+---@field limit? integer
+---@class dd.opts.query.InventoryExtraStackingLimitQuery : dd.OnOptions
+---@field filter? dd.filter.query.InventoryExtraStackingLimitQuery
+
+-- ---- query.InventoryReplacementEffectIdQuery
+---游戏询问 InventoryReplacementEffectIdQuery：可写结果字段，不能取消
+---@class dd.fields.query.InventoryReplacementEffectIdQuery
+---@field name string
+---@field item_id integer
+---@field arg integer
+---@field effect_id integer 可写
+---query.InventoryReplacementEffectIdQuery 的事件负载，只在回调执行期间有效
+---@class dd.ev.query.InventoryReplacementEffectIdQuery : dd.Event, dd.fields.query.InventoryReplacementEffectIdQuery
+---query.InventoryReplacementEffectIdQuery 的 dd.wait_event 快照
+---@class dd.snap.query.InventoryReplacementEffectIdQuery : dd.Snapshot, dd.fields.query.InventoryReplacementEffectIdQuery
+---query.InventoryReplacementEffectIdQuery 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.query.InventoryReplacementEffectIdQuery
+---@field name? string
+---@field item_id? integer
+---@field arg? integer
+---@field effect_id? integer
+---@class dd.opts.query.InventoryReplacementEffectIdQuery : dd.OnOptions
+---@field filter? dd.filter.query.InventoryReplacementEffectIdQuery
+
+-- ---- query.LootDarknessBuffQuery
+---游戏询问 LootDarknessBuffQuery：可写结果字段，不能取消
+---@class dd.fields.query.LootDarknessBuffQuery
+---@field name string
+---@field light number
+---@field result nil 游戏指针，Lua 里恒为 nil，SDK 可写，Lua 不能写
+---@field arg integer
+---query.LootDarknessBuffQuery 的事件负载，只在回调执行期间有效
+---@class dd.ev.query.LootDarknessBuffQuery : dd.Event, dd.fields.query.LootDarknessBuffQuery
+---query.LootDarknessBuffQuery 的 dd.wait_event 快照
+---@class dd.snap.query.LootDarknessBuffQuery : dd.Snapshot, dd.fields.query.LootDarknessBuffQuery
+---query.LootDarknessBuffQuery 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.query.LootDarknessBuffQuery
+---@field name? string
+---@field light? number
+---@field result? dd.Actor
+---@field arg? integer
+---@class dd.opts.query.LootDarknessBuffQuery : dd.OnOptions
+---@field filter? dd.filter.query.LootDarknessBuffQuery
+
+-- ---- query.TownGoldInterestBuffQuery
+---游戏询问 TownGoldInterestBuffQuery：可写结果字段，不能取消（不可用：没有 Listener<T> 虚表：游戏没有对应的 Listener 类型描述符（类型没有派发点，无法用 __RTDynamicCast 伪造））
+---@class dd.fields.query.TownGoldInterestBuffQuery
+---@field name string
+---@field interest integer 可写
+---query.TownGoldInterestBuffQuery 的事件负载，只在回调执行期间有效
+---@class dd.ev.query.TownGoldInterestBuffQuery : dd.Event, dd.fields.query.TownGoldInterestBuffQuery
+---query.TownGoldInterestBuffQuery 的 dd.wait_event 快照
+---@class dd.snap.query.TownGoldInterestBuffQuery : dd.Snapshot, dd.fields.query.TownGoldInterestBuffQuery
+---query.TownGoldInterestBuffQuery 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.query.TownGoldInterestBuffQuery
+---@field name? string
+---@field interest? integer
+---@class dd.opts.query.TownGoldInterestBuffQuery : dd.OnOptions
+---@field filter? dd.filter.query.TownGoldInterestBuffQuery
+
+-- ---- query.TownVisitIdleStressBuffQuery
+---游戏询问 TownVisitIdleStressBuffQuery：可写结果字段，不能取消
+---@class dd.fields.query.TownVisitIdleStressBuffQuery
+---@field name string
+---@field stress_relief number 可写
+---@field flag boolean 可写
+---query.TownVisitIdleStressBuffQuery 的事件负载，只在回调执行期间有效
+---@class dd.ev.query.TownVisitIdleStressBuffQuery : dd.Event, dd.fields.query.TownVisitIdleStressBuffQuery
+---query.TownVisitIdleStressBuffQuery 的 dd.wait_event 快照
+---@class dd.snap.query.TownVisitIdleStressBuffQuery : dd.Snapshot, dd.fields.query.TownVisitIdleStressBuffQuery
+---query.TownVisitIdleStressBuffQuery 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.query.TownVisitIdleStressBuffQuery
+---@field name? string
+---@field stress_relief? number
+---@field flag? boolean
+---@class dd.opts.query.TownVisitIdleStressBuffQuery : dd.OnOptions
+---@field filter? dd.filter.query.TownVisitIdleStressBuffQuery
+
+-- ---- query.ProvisionSupplyBuffQuery
+---游戏询问 ProvisionSupplyBuffQuery：可写结果字段，不能取消
+---@class dd.fields.query.ProvisionSupplyBuffQuery
+---@field name string
+---@field items_first nil 游戏指针，Lua 里恒为 nil
+---query.ProvisionSupplyBuffQuery 的事件负载，只在回调执行期间有效
+---@class dd.ev.query.ProvisionSupplyBuffQuery : dd.Event, dd.fields.query.ProvisionSupplyBuffQuery
+---query.ProvisionSupplyBuffQuery 的 dd.wait_event 快照
+---@class dd.snap.query.ProvisionSupplyBuffQuery : dd.Snapshot, dd.fields.query.ProvisionSupplyBuffQuery
+---query.ProvisionSupplyBuffQuery 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.query.ProvisionSupplyBuffQuery
+---@field name? string
+---@field items_first? dd.Actor
+---@class dd.opts.query.ProvisionSupplyBuffQuery : dd.OnOptions
+---@field filter? dd.filter.query.ProvisionSupplyBuffQuery
+
+-- ---- query.ProvisionIsItemTooltipsEnabledQuery
+---游戏询问 ProvisionIsItemTooltipsEnabledQuery：可写结果字段，不能取消
+---@class dd.fields.query.ProvisionIsItemTooltipsEnabledQuery
+---@field name string
+---@field enabled boolean 可写
+---query.ProvisionIsItemTooltipsEnabledQuery 的事件负载，只在回调执行期间有效
+---@class dd.ev.query.ProvisionIsItemTooltipsEnabledQuery : dd.Event, dd.fields.query.ProvisionIsItemTooltipsEnabledQuery
+---query.ProvisionIsItemTooltipsEnabledQuery 的 dd.wait_event 快照
+---@class dd.snap.query.ProvisionIsItemTooltipsEnabledQuery : dd.Snapshot, dd.fields.query.ProvisionIsItemTooltipsEnabledQuery
+---query.ProvisionIsItemTooltipsEnabledQuery 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.query.ProvisionIsItemTooltipsEnabledQuery
+---@field name? string
+---@field enabled? boolean
+---@class dd.opts.query.ProvisionIsItemTooltipsEnabledQuery : dd.OnOptions
+---@field filter? dd.filter.query.ProvisionIsItemTooltipsEnabledQuery
+
+-- ---- query.FindNonRosterHeroesQuery
+---游戏询问 FindNonRosterHeroesQuery：可写结果字段，不能取消
+---@class dd.fields.query.FindNonRosterHeroesQuery
+---@field name string
+---@field container nil 游戏指针，Lua 里恒为 nil
+---query.FindNonRosterHeroesQuery 的事件负载，只在回调执行期间有效
+---@class dd.ev.query.FindNonRosterHeroesQuery : dd.Event, dd.fields.query.FindNonRosterHeroesQuery
+---query.FindNonRosterHeroesQuery 的 dd.wait_event 快照
+---@class dd.snap.query.FindNonRosterHeroesQuery : dd.Snapshot, dd.fields.query.FindNonRosterHeroesQuery
+---query.FindNonRosterHeroesQuery 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.query.FindNonRosterHeroesQuery
+---@field name? string
+---@field container? dd.Actor
+---@class dd.opts.query.FindNonRosterHeroesQuery : dd.OnOptions
+---@field filter? dd.filter.query.FindNonRosterHeroesQuery
+
+---订阅主题，回调在主线程执行，每次调用有执行预算。主题不存在或不可用、actor 作用域的句柄已失效时
+---返回 nil 和原因（并写日志）；参数或选项写错直接报错。订阅从下一次派发开始生效。
+---回调出错写日志（带 traceback），连续出错 3 次（DDLua.cfg 的 max_failures）或超出执行预算时停用。
+---@param topic dd.Topic|string
+---@param fn fun(ev: dd.Event)
+---@param opts? dd.OnOptions
+---@return dd.Subscription? sub
+---@return string? reason
+---@overload fun(topic: "damage.pre", fn: fun(ev: dd.ev.damage.pre), opts?: dd.opts.damage.pre): dd.Subscription?, string?
+---@overload fun(topic: "damage.post", fn: fun(ev: dd.ev.damage.post), opts?: dd.opts.damage.post): dd.Subscription?, string?
+---@overload fun(topic: "effect.pre", fn: fun(ev: dd.ev.effect.pre), opts?: dd.opts.effect.pre): dd.Subscription?, string?
+---@overload fun(topic: "effect.post", fn: fun(ev: dd.ev.effect.post), opts?: dd.opts.effect.post): dd.Subscription?, string?
+---@overload fun(topic: "skill.pre", fn: fun(ev: dd.ev.skill.pre), opts?: dd.opts.skill.pre): dd.Subscription?, string?
+---@overload fun(topic: "skill.post", fn: fun(ev: dd.ev.skill.post), opts?: dd.opts.skill.post): dd.Subscription?, string?
+---@overload fun(topic: "hit.pre", fn: fun(ev: dd.ev.hit.pre), opts?: dd.opts.hit.pre): dd.Subscription?, string?
+---@overload fun(topic: "hit.post", fn: fun(ev: dd.ev.hit.post), opts?: dd.opts.hit.post): dd.Subscription?, string?
+---@overload fun(topic: "battle.round.start", fn: fun(ev: dd.ev.battle.round.start), opts?: dd.opts.battle.round.start): dd.Subscription?, string?
+---@overload fun(topic: "battle.round.end", fn: fun(ev: dd.ev.battle.round.end), opts?: dd.opts.battle.round.end): dd.Subscription?, string?
+---@overload fun(topic: "battle.turn.start", fn: fun(ev: dd.ev.battle.turn.start), opts?: dd.opts.battle.turn.start): dd.Subscription?, string?
+---@overload fun(topic: "battle.turn.end", fn: fun(ev: dd.ev.battle.turn.end), opts?: dd.opts.battle.turn.end): dd.Subscription?, string?
+---@overload fun(topic: "stress.pre", fn: fun(ev: dd.ev.stress.pre), opts?: dd.opts.stress.pre): dd.Subscription?, string?
+---@overload fun(topic: "stress.post", fn: fun(ev: dd.ev.stress.post), opts?: dd.opts.stress.post): dd.Subscription?, string?
+---@overload fun(topic: "heal.pre", fn: fun(ev: dd.ev.heal.pre), opts?: dd.opts.heal.pre): dd.Subscription?, string?
+---@overload fun(topic: "heal.post", fn: fun(ev: dd.ev.heal.post), opts?: dd.opts.heal.post): dd.Subscription?, string?
+---@overload fun(topic: "app.tick", fn: fun(ev: dd.ev.app.tick), opts?: dd.opts.app.tick): dd.Subscription?, string?
+---@overload fun(topic: "app.state", fn: fun(ev: dd.ev.app.state), opts?: dd.opts.app.state): dd.Subscription?, string?
+---@overload fun(topic: "campaign.load", fn: fun(ev: dd.ev.campaign.load), opts?: dd.opts.campaign.load): dd.Subscription?, string?
+---@overload fun(topic: "campaign.unload", fn: fun(ev: dd.ev.campaign.unload), opts?: dd.opts.campaign.unload): dd.Subscription?, string?
+---@overload fun(topic: "battle.start", fn: fun(ev: dd.ev.battle.start), opts?: dd.opts.battle.start): dd.Subscription?, string?
+---@overload fun(topic: "battle.end", fn: fun(ev: dd.ev.battle.end), opts?: dd.opts.battle.end): dd.Subscription?, string?
+---@overload fun(topic: "actor.deathsdoor", fn: fun(ev: dd.ev.actor.deathsdoor), opts?: dd.opts.actor.deathsdoor): dd.Subscription?, string?
+---@overload fun(topic: "actor.heartattack", fn: fun(ev: dd.ev.actor.heartattack), opts?: dd.opts.actor.heartattack): dd.Subscription?, string?
+---@overload fun(topic: "actor.death", fn: fun(ev: dd.ev.actor.death), opts?: dd.opts.actor.death): dd.Subscription?, string?
+---@overload fun(topic: "actor.affliction", fn: fun(ev: dd.ev.actor.affliction), opts?: dd.opts.actor.affliction): dd.Subscription?, string?
+---@overload fun(topic: "raid.start", fn: fun(ev: dd.ev.raid.start), opts?: dd.opts.raid.start): dd.Subscription?, string?
+---@overload fun(topic: "raid.finish", fn: fun(ev: dd.ev.raid.finish), opts?: dd.opts.raid.finish): dd.Subscription?, string?
+---@overload fun(topic: "raid.step", fn: fun(ev: dd.ev.raid.step), opts?: dd.opts.raid.step): dd.Subscription?, string?
+---@overload fun(topic: "raid.torch", fn: fun(ev: dd.ev.raid.torch), opts?: dd.opts.raid.torch): dd.Subscription?, string?
+---@overload fun(topic: "town.enter", fn: fun(ev: dd.ev.town.enter), opts?: dd.opts.town.enter): dd.Subscription?, string?
+---@overload fun(topic: "town.event", fn: fun(ev: dd.ev.town.event), opts?: dd.opts.town.event): dd.Subscription?, string?
+---@overload fun(topic: "town.building", fn: fun(ev: dd.ev.town.building), opts?: dd.opts.town.building): dd.Subscription?, string?
+---@overload fun(topic: "town.activity", fn: fun(ev: dd.ev.town.activity), opts?: dd.opts.town.activity): dd.Subscription?, string?
+---@overload fun(topic: "town.activity.finish", fn: fun(ev: dd.ev.town.activity.finish), opts?: dd.opts.town.activity.finish): dd.Subscription?, string?
+---@overload fun(topic: "hero.recruit", fn: fun(ev: dd.ev.hero.recruit), opts?: dd.opts.hero.recruit): dd.Subscription?, string?
+---@overload fun(topic: "hero.dismiss", fn: fun(ev: dd.ev.hero.dismiss), opts?: dd.opts.hero.dismiss): dd.Subscription?, string?
+---@overload fun(topic: "hero.quirk", fn: fun(ev: dd.ev.hero.quirk), opts?: dd.opts.hero.quirk): dd.Subscription?, string?
+---@overload fun(topic: "hero.skill", fn: fun(ev: dd.ev.hero.skill), opts?: dd.opts.hero.skill): dd.Subscription?, string?
+---@overload fun(topic: "inventory.add", fn: fun(ev: dd.ev.inventory.add), opts?: dd.opts.inventory.add): dd.Subscription?, string?
+---@overload fun(topic: "inventory.modified", fn: fun(ev: dd.ev.inventory.modified), opts?: dd.opts.inventory.modified): dd.Subscription?, string?
+---@overload fun(topic: "inventory.premerge", fn: fun(ev: dd.ev.inventory.premerge), opts?: dd.opts.inventory.premerge): dd.Subscription?, string?
+---@overload fun(topic: "inventory.postmerge", fn: fun(ev: dd.ev.inventory.postmerge), opts?: dd.opts.inventory.postmerge): dd.Subscription?, string?
+---@overload fun(topic: "estate.currency", fn: fun(ev: dd.ev.estate.currency), opts?: dd.opts.estate.currency): dd.Subscription?, string?
+---@overload fun(topic: "native.EvaluateAchievementsEvent", fn: fun(ev: dd.ev.native.EvaluateAchievementsEvent), opts?: dd.opts.native.EvaluateAchievementsEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.InitedAchievementsEvent", fn: fun(ev: dd.ev.native.InitedAchievementsEvent), opts?: dd.opts.native.InitedAchievementsEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.SaveAchievementStateEvent", fn: fun(ev: dd.ev.native.SaveAchievementStateEvent), opts?: dd.opts.native.SaveAchievementStateEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.AwardAchievementEvent", fn: fun(ev: dd.ev.native.AwardAchievementEvent), opts?: dd.opts.native.AwardAchievementEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.MailingListSignUpEvent", fn: fun(ev: dd.ev.native.MailingListSignUpEvent), opts?: dd.opts.native.MailingListSignUpEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.MailingListReminderEvent", fn: fun(ev: dd.ev.native.MailingListReminderEvent), opts?: dd.opts.native.MailingListReminderEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.MailingListReminderSeenEvent", fn: fun(ev: dd.ev.native.MailingListReminderSeenEvent), opts?: dd.opts.native.MailingListReminderSeenEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.LocalizationAvailableEvent", fn: fun(ev: dd.ev.native.LocalizationAvailableEvent), opts?: dd.opts.native.LocalizationAvailableEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.AreaTileContentsChangedEvent", fn: fun(ev: dd.ev.native.AreaTileContentsChangedEvent), opts?: dd.opts.native.AreaTileContentsChangedEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.AreaTileKnowledgeEvent", fn: fun(ev: dd.ev.native.AreaTileKnowledgeEvent), opts?: dd.opts.native.AreaTileKnowledgeEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.AreaKnowledgeEvent", fn: fun(ev: dd.ev.native.AreaKnowledgeEvent), opts?: dd.opts.native.AreaKnowledgeEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.ScoutingEvent", fn: fun(ev: dd.ev.native.ScoutingEvent), opts?: dd.opts.native.ScoutingEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.ScoutingCurioEvent", fn: fun(ev: dd.ev.native.ScoutingCurioEvent), opts?: dd.opts.native.ScoutingCurioEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.BattleAttackEvent", fn: fun(ev: dd.ev.native.BattleAttackEvent), opts?: dd.opts.native.BattleAttackEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.TrinketTriggeredEvent", fn: fun(ev: dd.ev.native.TrinketTriggeredEvent), opts?: dd.opts.native.TrinketTriggeredEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.CaptorBurnRedirectEvent", fn: fun(ev: dd.ev.native.CaptorBurnRedirectEvent), opts?: dd.opts.native.CaptorBurnRedirectEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.BattleCreatedEvent", fn: fun(ev: dd.ev.native.BattleCreatedEvent), opts?: dd.opts.native.BattleCreatedEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.BattleDestroyedEvent", fn: fun(ev: dd.ev.native.BattleDestroyedEvent), opts?: dd.opts.native.BattleDestroyedEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.MonsterDeathEvent", fn: fun(ev: dd.ev.native.MonsterDeathEvent), opts?: dd.opts.native.MonsterDeathEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.CaptureEvent", fn: fun(ev: dd.ev.native.CaptureEvent), opts?: dd.opts.native.CaptureEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.ReleaseStartEvent", fn: fun(ev: dd.ev.native.ReleaseStartEvent), opts?: dd.opts.native.ReleaseStartEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.ReleaseFinishEvent", fn: fun(ev: dd.ev.native.ReleaseFinishEvent), opts?: dd.opts.native.ReleaseFinishEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.TeleportEvent", fn: fun(ev: dd.ev.native.TeleportEvent), opts?: dd.opts.native.TeleportEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.MonsterBattleStageEvent", fn: fun(ev: dd.ev.native.MonsterBattleStageEvent), opts?: dd.opts.native.MonsterBattleStageEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.DeathDamageEvent", fn: fun(ev: dd.ev.native.DeathDamageEvent), opts?: dd.opts.native.DeathDamageEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.HeartAttackEvent", fn: fun(ev: dd.ev.native.HeartAttackEvent), opts?: dd.opts.native.HeartAttackEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.ActorDazedEvent", fn: fun(ev: dd.ev.native.ActorDazedEvent), opts?: dd.opts.native.ActorDazedEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.HeroDeathEvent", fn: fun(ev: dd.ev.native.HeroDeathEvent), opts?: dd.opts.native.HeroDeathEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.HeroSurvivedDeathsDoorAttackEvent", fn: fun(ev: dd.ev.native.HeroSurvivedDeathsDoorAttackEvent), opts?: dd.opts.native.HeroSurvivedDeathsDoorAttackEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.HeroSkillUpgradedEvent", fn: fun(ev: dd.ev.native.HeroSkillUpgradedEvent), opts?: dd.opts.native.HeroSkillUpgradedEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.HeroWeaponAndArmourUpgradedEvent", fn: fun(ev: dd.ev.native.HeroWeaponAndArmourUpgradedEvent), opts?: dd.opts.native.HeroWeaponAndArmourUpgradedEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.QuirkAppliedEvent", fn: fun(ev: dd.ev.native.QuirkAppliedEvent), opts?: dd.opts.native.QuirkAppliedEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.HeroActOutStartEvent", fn: fun(ev: dd.ev.native.HeroActOutStartEvent), opts?: dd.opts.native.HeroActOutStartEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.HeroActOutFinishEvent", fn: fun(ev: dd.ev.native.HeroActOutFinishEvent), opts?: dd.opts.native.HeroActOutFinishEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.HeroAfflictionVirtueEvent", fn: fun(ev: dd.ev.native.HeroAfflictionVirtueEvent), opts?: dd.opts.native.HeroAfflictionVirtueEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.HeroUsedItemEvent", fn: fun(ev: dd.ev.native.HeroUsedItemEvent), opts?: dd.opts.native.HeroUsedItemEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.HeroReachedDeathsDoorEvent", fn: fun(ev: dd.ev.native.HeroReachedDeathsDoorEvent), opts?: dd.opts.native.HeroReachedDeathsDoorEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.InventoryAddItemEvent", fn: fun(ev: dd.ev.native.InventoryAddItemEvent), opts?: dd.opts.native.InventoryAddItemEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.InventoryPreMergeEvent", fn: fun(ev: dd.ev.native.InventoryPreMergeEvent), opts?: dd.opts.native.InventoryPreMergeEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.InventoryPostMergeEvent", fn: fun(ev: dd.ev.native.InventoryPostMergeEvent), opts?: dd.opts.native.InventoryPostMergeEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.InventoryModifiedEvent", fn: fun(ev: dd.ev.native.InventoryModifiedEvent), opts?: dd.opts.native.InventoryModifiedEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.LaunchCreditsEvent", fn: fun(ev: dd.ev.native.LaunchCreditsEvent), opts?: dd.opts.native.LaunchCreditsEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.OptionsSavedEvent", fn: fun(ev: dd.ev.native.OptionsSavedEvent), opts?: dd.opts.native.OptionsSavedEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.PlayFabConnectionInitializedEvent", fn: fun(ev: dd.ev.native.PlayFabConnectionInitializedEvent), opts?: dd.opts.native.PlayFabConnectionInitializedEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.PlayFabReconnectedEvent", fn: fun(ev: dd.ev.native.PlayFabReconnectedEvent), opts?: dd.opts.native.PlayFabReconnectedEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.PlayFabConnectionLostEvent", fn: fun(ev: dd.ev.native.PlayFabConnectionLostEvent), opts?: dd.opts.native.PlayFabConnectionLostEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.PlayFabLocalizedDataAvailableEvent", fn: fun(ev: dd.ev.native.PlayFabLocalizedDataAvailableEvent), opts?: dd.opts.native.PlayFabLocalizedDataAvailableEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.PlayFabFinishPostMatchDataUpdatesEvent", fn: fun(ev: dd.ev.native.PlayFabFinishPostMatchDataUpdatesEvent), opts?: dd.opts.native.PlayFabFinishPostMatchDataUpdatesEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.ReceivedExternalTurnMetaDataInSimpleMPEvent", fn: fun(ev: dd.ev.native.ReceivedExternalTurnMetaDataInSimpleMPEvent), opts?: dd.opts.native.ReceivedExternalTurnMetaDataInSimpleMPEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.ExternalSubsystemMultiplayerMessageReceivedEvent", fn: fun(ev: dd.ev.native.ExternalSubsystemMultiplayerMessageReceivedEvent), opts?: dd.opts.native.ExternalSubsystemMultiplayerMessageReceivedEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.RaidStartEvent", fn: fun(ev: dd.ev.native.RaidStartEvent), opts?: dd.opts.native.RaidStartEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.PartyStepEvent", fn: fun(ev: dd.ev.native.PartyStepEvent), opts?: dd.opts.native.PartyStepEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.RaidFinishResultsEvent", fn: fun(ev: dd.ev.native.RaidFinishResultsEvent), opts?: dd.opts.native.RaidFinishResultsEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.RaidGoalsCompleteEvent", fn: fun(ev: dd.ev.native.RaidGoalsCompleteEvent), opts?: dd.opts.native.RaidGoalsCompleteEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.RaidMapGenerated", fn: fun(ev: dd.ev.native.RaidMapGenerated), opts?: dd.opts.native.RaidMapGenerated): dd.Subscription?, string?
+---@overload fun(topic: "native.PreRaidFinishResultsEvent", fn: fun(ev: dd.ev.native.PreRaidFinishResultsEvent), opts?: dd.opts.native.PreRaidFinishResultsEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.TorchModifiedEvent", fn: fun(ev: dd.ev.native.TorchModifiedEvent), opts?: dd.opts.native.TorchModifiedEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.PrisonerRescuedEvent", fn: fun(ev: dd.ev.native.PrisonerRescuedEvent), opts?: dd.opts.native.PrisonerRescuedEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.QueueWaveLogicBarkEvent", fn: fun(ev: dd.ev.native.QueueWaveLogicBarkEvent), opts?: dd.opts.native.QueueWaveLogicBarkEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.MaxPrestigeEvent", fn: fun(ev: dd.ev.native.MaxPrestigeEvent), opts?: dd.opts.native.MaxPrestigeEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.RosterListHeroDDEffectEvent", fn: fun(ev: dd.ev.native.RosterListHeroDDEffectEvent), opts?: dd.opts.native.RosterListHeroDDEffectEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.RosterListHeroDDEffectClearedEvent", fn: fun(ev: dd.ev.native.RosterListHeroDDEffectClearedEvent), opts?: dd.opts.native.RosterListHeroDDEffectClearedEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.JournalPopupStartEvent", fn: fun(ev: dd.ev.native.JournalPopupStartEvent), opts?: dd.opts.native.JournalPopupStartEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.HeroStartBarkEvent", fn: fun(ev: dd.ev.native.HeroStartBarkEvent), opts?: dd.opts.native.HeroStartBarkEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.ActivityOpenedEvent", fn: fun(ev: dd.ev.native.ActivityOpenedEvent), opts?: dd.opts.native.ActivityOpenedEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.ActivityFinishedEvent", fn: fun(ev: dd.ev.native.ActivityFinishedEvent), opts?: dd.opts.native.ActivityFinishedEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.QuirkLockedEvent", fn: fun(ev: dd.ev.native.QuirkLockedEvent), opts?: dd.opts.native.QuirkLockedEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.PositiveQuirkTreatedEvent", fn: fun(ev: dd.ev.native.PositiveQuirkTreatedEvent), opts?: dd.opts.native.PositiveQuirkTreatedEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.NegativeQuirkTreatedEvent", fn: fun(ev: dd.ev.native.NegativeQuirkTreatedEvent), opts?: dd.opts.native.NegativeQuirkTreatedEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.BuildingStateChangedEvent", fn: fun(ev: dd.ev.native.BuildingStateChangedEvent), opts?: dd.opts.native.BuildingStateChangedEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.EstateCurrencyChangeEvent", fn: fun(ev: dd.ev.native.EstateCurrencyChangeEvent), opts?: dd.opts.native.EstateCurrencyChangeEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.HeroDismissedEvent", fn: fun(ev: dd.ev.native.HeroDismissedEvent), opts?: dd.opts.native.HeroDismissedEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.BuildingUpgradedEvent", fn: fun(ev: dd.ev.native.BuildingUpgradedEvent), opts?: dd.opts.native.BuildingUpgradedEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.RealmInventoryChangedEvent", fn: fun(ev: dd.ev.native.RealmInventoryChangedEvent), opts?: dd.opts.native.RealmInventoryChangedEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.HeroRecruitedEvent", fn: fun(ev: dd.ev.native.HeroRecruitedEvent), opts?: dd.opts.native.HeroRecruitedEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.TownEventOnStartTownVisitEvent", fn: fun(ev: dd.ev.native.TownEventOnStartTownVisitEvent), opts?: dd.opts.native.TownEventOnStartTownVisitEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.PreOnStartTownVisitEvent", fn: fun(ev: dd.ev.native.PreOnStartTownVisitEvent), opts?: dd.opts.native.PreOnStartTownVisitEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.PostOnStartTownVisitEvent", fn: fun(ev: dd.ev.native.PostOnStartTownVisitEvent), opts?: dd.opts.native.PostOnStartTownVisitEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.DistrictBuildingBuiltEvent", fn: fun(ev: dd.ev.native.DistrictBuildingBuiltEvent), opts?: dd.opts.native.DistrictBuildingBuiltEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.PrestigeUpdatedEvent", fn: fun(ev: dd.ev.native.PrestigeUpdatedEvent), opts?: dd.opts.native.PrestigeUpdatedEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.PlayFabAchievementsUpdatedEvent", fn: fun(ev: dd.ev.native.PlayFabAchievementsUpdatedEvent), opts?: dd.opts.native.PlayFabAchievementsUpdatedEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.PrestigeAndPlayFabAchievementsUpdatedEvent", fn: fun(ev: dd.ev.native.PrestigeAndPlayFabAchievementsUpdatedEvent), opts?: dd.opts.native.PrestigeAndPlayFabAchievementsUpdatedEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.ArenaUnlocksUpdatedEvent", fn: fun(ev: dd.ev.native.ArenaUnlocksUpdatedEvent), opts?: dd.opts.native.ArenaUnlocksUpdatedEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.TutorialPopupStartEvent", fn: fun(ev: dd.ev.native.TutorialPopupStartEvent), opts?: dd.opts.native.TutorialPopupStartEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.TutorialPopupFinishEvent", fn: fun(ev: dd.ev.native.TutorialPopupFinishEvent), opts?: dd.opts.native.TutorialPopupFinishEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.ResidentOccupiesActivityEvent", fn: fun(ev: dd.ev.native.ResidentOccupiesActivityEvent), opts?: dd.opts.native.ResidentOccupiesActivityEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.ActivitySlotTakenEvent", fn: fun(ev: dd.ev.native.ActivitySlotTakenEvent), opts?: dd.opts.native.ActivitySlotTakenEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.ActivityUnconfirmedSlotCountEvent", fn: fun(ev: dd.ev.native.ActivityUnconfirmedSlotCountEvent), opts?: dd.opts.native.ActivityUnconfirmedSlotCountEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.UpdateHeroStressEvent", fn: fun(ev: dd.ev.native.UpdateHeroStressEvent), opts?: dd.opts.native.UpdateHeroStressEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.RosterListRandomBarkEvent", fn: fun(ev: dd.ev.native.RosterListRandomBarkEvent), opts?: dd.opts.native.RosterListRandomBarkEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.StageCoachBarkEvent", fn: fun(ev: dd.ev.native.StageCoachBarkEvent), opts?: dd.opts.native.StageCoachBarkEvent): dd.Subscription?, string?
+---@overload fun(topic: "query.CampingPointBuffQuery", fn: fun(ev: dd.ev.query.CampingPointBuffQuery), opts?: dd.opts.query.CampingPointBuffQuery): dd.Subscription?, string?
+---@overload fun(topic: "query.CurioInteractionBuffQuery", fn: fun(ev: dd.ev.query.CurioInteractionBuffQuery), opts?: dd.opts.query.CurioInteractionBuffQuery): dd.Subscription?, string?
+---@overload fun(topic: "query.IsDisabledQuery", fn: fun(ev: dd.ev.query.IsDisabledQuery), opts?: dd.opts.query.IsDisabledQuery): dd.Subscription?, string?
+---@overload fun(topic: "query.InventoryExtraStackingLimitQuery", fn: fun(ev: dd.ev.query.InventoryExtraStackingLimitQuery), opts?: dd.opts.query.InventoryExtraStackingLimitQuery): dd.Subscription?, string?
+---@overload fun(topic: "query.InventoryReplacementEffectIdQuery", fn: fun(ev: dd.ev.query.InventoryReplacementEffectIdQuery), opts?: dd.opts.query.InventoryReplacementEffectIdQuery): dd.Subscription?, string?
+---@overload fun(topic: "query.LootDarknessBuffQuery", fn: fun(ev: dd.ev.query.LootDarknessBuffQuery), opts?: dd.opts.query.LootDarknessBuffQuery): dd.Subscription?, string?
+---@overload fun(topic: "query.TownGoldInterestBuffQuery", fn: fun(ev: dd.ev.query.TownGoldInterestBuffQuery), opts?: dd.opts.query.TownGoldInterestBuffQuery): dd.Subscription?, string?
+---@overload fun(topic: "query.TownVisitIdleStressBuffQuery", fn: fun(ev: dd.ev.query.TownVisitIdleStressBuffQuery), opts?: dd.opts.query.TownVisitIdleStressBuffQuery): dd.Subscription?, string?
+---@overload fun(topic: "query.ProvisionSupplyBuffQuery", fn: fun(ev: dd.ev.query.ProvisionSupplyBuffQuery), opts?: dd.opts.query.ProvisionSupplyBuffQuery): dd.Subscription?, string?
+---@overload fun(topic: "query.ProvisionIsItemTooltipsEnabledQuery", fn: fun(ev: dd.ev.query.ProvisionIsItemTooltipsEnabledQuery), opts?: dd.opts.query.ProvisionIsItemTooltipsEnabledQuery): dd.Subscription?, string?
+---@overload fun(topic: "query.FindNonRosterHeroesQuery", fn: fun(ev: dd.ev.query.FindNonRosterHeroesQuery), opts?: dd.opts.query.FindNonRosterHeroesQuery): dd.Subscription?, string?
+function dd.on(topic, fn, opts) end
+
+---和 dd.on 相同，回调调用一次后自动撤销（在调用回调之前撤销）。
+---@param topic dd.Topic|string
+---@param fn fun(ev: dd.Event)
+---@param opts? dd.OnOptions
+---@return dd.Subscription? sub
+---@return string? reason
+---@overload fun(topic: "damage.pre", fn: fun(ev: dd.ev.damage.pre), opts?: dd.opts.damage.pre): dd.Subscription?, string?
+---@overload fun(topic: "damage.post", fn: fun(ev: dd.ev.damage.post), opts?: dd.opts.damage.post): dd.Subscription?, string?
+---@overload fun(topic: "effect.pre", fn: fun(ev: dd.ev.effect.pre), opts?: dd.opts.effect.pre): dd.Subscription?, string?
+---@overload fun(topic: "effect.post", fn: fun(ev: dd.ev.effect.post), opts?: dd.opts.effect.post): dd.Subscription?, string?
+---@overload fun(topic: "skill.pre", fn: fun(ev: dd.ev.skill.pre), opts?: dd.opts.skill.pre): dd.Subscription?, string?
+---@overload fun(topic: "skill.post", fn: fun(ev: dd.ev.skill.post), opts?: dd.opts.skill.post): dd.Subscription?, string?
+---@overload fun(topic: "hit.pre", fn: fun(ev: dd.ev.hit.pre), opts?: dd.opts.hit.pre): dd.Subscription?, string?
+---@overload fun(topic: "hit.post", fn: fun(ev: dd.ev.hit.post), opts?: dd.opts.hit.post): dd.Subscription?, string?
+---@overload fun(topic: "battle.round.start", fn: fun(ev: dd.ev.battle.round.start), opts?: dd.opts.battle.round.start): dd.Subscription?, string?
+---@overload fun(topic: "battle.round.end", fn: fun(ev: dd.ev.battle.round.end), opts?: dd.opts.battle.round.end): dd.Subscription?, string?
+---@overload fun(topic: "battle.turn.start", fn: fun(ev: dd.ev.battle.turn.start), opts?: dd.opts.battle.turn.start): dd.Subscription?, string?
+---@overload fun(topic: "battle.turn.end", fn: fun(ev: dd.ev.battle.turn.end), opts?: dd.opts.battle.turn.end): dd.Subscription?, string?
+---@overload fun(topic: "stress.pre", fn: fun(ev: dd.ev.stress.pre), opts?: dd.opts.stress.pre): dd.Subscription?, string?
+---@overload fun(topic: "stress.post", fn: fun(ev: dd.ev.stress.post), opts?: dd.opts.stress.post): dd.Subscription?, string?
+---@overload fun(topic: "heal.pre", fn: fun(ev: dd.ev.heal.pre), opts?: dd.opts.heal.pre): dd.Subscription?, string?
+---@overload fun(topic: "heal.post", fn: fun(ev: dd.ev.heal.post), opts?: dd.opts.heal.post): dd.Subscription?, string?
+---@overload fun(topic: "app.tick", fn: fun(ev: dd.ev.app.tick), opts?: dd.opts.app.tick): dd.Subscription?, string?
+---@overload fun(topic: "app.state", fn: fun(ev: dd.ev.app.state), opts?: dd.opts.app.state): dd.Subscription?, string?
+---@overload fun(topic: "campaign.load", fn: fun(ev: dd.ev.campaign.load), opts?: dd.opts.campaign.load): dd.Subscription?, string?
+---@overload fun(topic: "campaign.unload", fn: fun(ev: dd.ev.campaign.unload), opts?: dd.opts.campaign.unload): dd.Subscription?, string?
+---@overload fun(topic: "battle.start", fn: fun(ev: dd.ev.battle.start), opts?: dd.opts.battle.start): dd.Subscription?, string?
+---@overload fun(topic: "battle.end", fn: fun(ev: dd.ev.battle.end), opts?: dd.opts.battle.end): dd.Subscription?, string?
+---@overload fun(topic: "actor.deathsdoor", fn: fun(ev: dd.ev.actor.deathsdoor), opts?: dd.opts.actor.deathsdoor): dd.Subscription?, string?
+---@overload fun(topic: "actor.heartattack", fn: fun(ev: dd.ev.actor.heartattack), opts?: dd.opts.actor.heartattack): dd.Subscription?, string?
+---@overload fun(topic: "actor.death", fn: fun(ev: dd.ev.actor.death), opts?: dd.opts.actor.death): dd.Subscription?, string?
+---@overload fun(topic: "actor.affliction", fn: fun(ev: dd.ev.actor.affliction), opts?: dd.opts.actor.affliction): dd.Subscription?, string?
+---@overload fun(topic: "raid.start", fn: fun(ev: dd.ev.raid.start), opts?: dd.opts.raid.start): dd.Subscription?, string?
+---@overload fun(topic: "raid.finish", fn: fun(ev: dd.ev.raid.finish), opts?: dd.opts.raid.finish): dd.Subscription?, string?
+---@overload fun(topic: "raid.step", fn: fun(ev: dd.ev.raid.step), opts?: dd.opts.raid.step): dd.Subscription?, string?
+---@overload fun(topic: "raid.torch", fn: fun(ev: dd.ev.raid.torch), opts?: dd.opts.raid.torch): dd.Subscription?, string?
+---@overload fun(topic: "town.enter", fn: fun(ev: dd.ev.town.enter), opts?: dd.opts.town.enter): dd.Subscription?, string?
+---@overload fun(topic: "town.event", fn: fun(ev: dd.ev.town.event), opts?: dd.opts.town.event): dd.Subscription?, string?
+---@overload fun(topic: "town.building", fn: fun(ev: dd.ev.town.building), opts?: dd.opts.town.building): dd.Subscription?, string?
+---@overload fun(topic: "town.activity", fn: fun(ev: dd.ev.town.activity), opts?: dd.opts.town.activity): dd.Subscription?, string?
+---@overload fun(topic: "town.activity.finish", fn: fun(ev: dd.ev.town.activity.finish), opts?: dd.opts.town.activity.finish): dd.Subscription?, string?
+---@overload fun(topic: "hero.recruit", fn: fun(ev: dd.ev.hero.recruit), opts?: dd.opts.hero.recruit): dd.Subscription?, string?
+---@overload fun(topic: "hero.dismiss", fn: fun(ev: dd.ev.hero.dismiss), opts?: dd.opts.hero.dismiss): dd.Subscription?, string?
+---@overload fun(topic: "hero.quirk", fn: fun(ev: dd.ev.hero.quirk), opts?: dd.opts.hero.quirk): dd.Subscription?, string?
+---@overload fun(topic: "hero.skill", fn: fun(ev: dd.ev.hero.skill), opts?: dd.opts.hero.skill): dd.Subscription?, string?
+---@overload fun(topic: "inventory.add", fn: fun(ev: dd.ev.inventory.add), opts?: dd.opts.inventory.add): dd.Subscription?, string?
+---@overload fun(topic: "inventory.modified", fn: fun(ev: dd.ev.inventory.modified), opts?: dd.opts.inventory.modified): dd.Subscription?, string?
+---@overload fun(topic: "inventory.premerge", fn: fun(ev: dd.ev.inventory.premerge), opts?: dd.opts.inventory.premerge): dd.Subscription?, string?
+---@overload fun(topic: "inventory.postmerge", fn: fun(ev: dd.ev.inventory.postmerge), opts?: dd.opts.inventory.postmerge): dd.Subscription?, string?
+---@overload fun(topic: "estate.currency", fn: fun(ev: dd.ev.estate.currency), opts?: dd.opts.estate.currency): dd.Subscription?, string?
+---@overload fun(topic: "native.EvaluateAchievementsEvent", fn: fun(ev: dd.ev.native.EvaluateAchievementsEvent), opts?: dd.opts.native.EvaluateAchievementsEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.InitedAchievementsEvent", fn: fun(ev: dd.ev.native.InitedAchievementsEvent), opts?: dd.opts.native.InitedAchievementsEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.SaveAchievementStateEvent", fn: fun(ev: dd.ev.native.SaveAchievementStateEvent), opts?: dd.opts.native.SaveAchievementStateEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.AwardAchievementEvent", fn: fun(ev: dd.ev.native.AwardAchievementEvent), opts?: dd.opts.native.AwardAchievementEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.MailingListSignUpEvent", fn: fun(ev: dd.ev.native.MailingListSignUpEvent), opts?: dd.opts.native.MailingListSignUpEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.MailingListReminderEvent", fn: fun(ev: dd.ev.native.MailingListReminderEvent), opts?: dd.opts.native.MailingListReminderEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.MailingListReminderSeenEvent", fn: fun(ev: dd.ev.native.MailingListReminderSeenEvent), opts?: dd.opts.native.MailingListReminderSeenEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.LocalizationAvailableEvent", fn: fun(ev: dd.ev.native.LocalizationAvailableEvent), opts?: dd.opts.native.LocalizationAvailableEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.AreaTileContentsChangedEvent", fn: fun(ev: dd.ev.native.AreaTileContentsChangedEvent), opts?: dd.opts.native.AreaTileContentsChangedEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.AreaTileKnowledgeEvent", fn: fun(ev: dd.ev.native.AreaTileKnowledgeEvent), opts?: dd.opts.native.AreaTileKnowledgeEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.AreaKnowledgeEvent", fn: fun(ev: dd.ev.native.AreaKnowledgeEvent), opts?: dd.opts.native.AreaKnowledgeEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.ScoutingEvent", fn: fun(ev: dd.ev.native.ScoutingEvent), opts?: dd.opts.native.ScoutingEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.ScoutingCurioEvent", fn: fun(ev: dd.ev.native.ScoutingCurioEvent), opts?: dd.opts.native.ScoutingCurioEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.BattleAttackEvent", fn: fun(ev: dd.ev.native.BattleAttackEvent), opts?: dd.opts.native.BattleAttackEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.TrinketTriggeredEvent", fn: fun(ev: dd.ev.native.TrinketTriggeredEvent), opts?: dd.opts.native.TrinketTriggeredEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.CaptorBurnRedirectEvent", fn: fun(ev: dd.ev.native.CaptorBurnRedirectEvent), opts?: dd.opts.native.CaptorBurnRedirectEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.BattleCreatedEvent", fn: fun(ev: dd.ev.native.BattleCreatedEvent), opts?: dd.opts.native.BattleCreatedEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.BattleDestroyedEvent", fn: fun(ev: dd.ev.native.BattleDestroyedEvent), opts?: dd.opts.native.BattleDestroyedEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.MonsterDeathEvent", fn: fun(ev: dd.ev.native.MonsterDeathEvent), opts?: dd.opts.native.MonsterDeathEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.CaptureEvent", fn: fun(ev: dd.ev.native.CaptureEvent), opts?: dd.opts.native.CaptureEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.ReleaseStartEvent", fn: fun(ev: dd.ev.native.ReleaseStartEvent), opts?: dd.opts.native.ReleaseStartEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.ReleaseFinishEvent", fn: fun(ev: dd.ev.native.ReleaseFinishEvent), opts?: dd.opts.native.ReleaseFinishEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.TeleportEvent", fn: fun(ev: dd.ev.native.TeleportEvent), opts?: dd.opts.native.TeleportEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.MonsterBattleStageEvent", fn: fun(ev: dd.ev.native.MonsterBattleStageEvent), opts?: dd.opts.native.MonsterBattleStageEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.DeathDamageEvent", fn: fun(ev: dd.ev.native.DeathDamageEvent), opts?: dd.opts.native.DeathDamageEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.HeartAttackEvent", fn: fun(ev: dd.ev.native.HeartAttackEvent), opts?: dd.opts.native.HeartAttackEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.ActorDazedEvent", fn: fun(ev: dd.ev.native.ActorDazedEvent), opts?: dd.opts.native.ActorDazedEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.HeroDeathEvent", fn: fun(ev: dd.ev.native.HeroDeathEvent), opts?: dd.opts.native.HeroDeathEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.HeroSurvivedDeathsDoorAttackEvent", fn: fun(ev: dd.ev.native.HeroSurvivedDeathsDoorAttackEvent), opts?: dd.opts.native.HeroSurvivedDeathsDoorAttackEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.HeroSkillUpgradedEvent", fn: fun(ev: dd.ev.native.HeroSkillUpgradedEvent), opts?: dd.opts.native.HeroSkillUpgradedEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.HeroWeaponAndArmourUpgradedEvent", fn: fun(ev: dd.ev.native.HeroWeaponAndArmourUpgradedEvent), opts?: dd.opts.native.HeroWeaponAndArmourUpgradedEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.QuirkAppliedEvent", fn: fun(ev: dd.ev.native.QuirkAppliedEvent), opts?: dd.opts.native.QuirkAppliedEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.HeroActOutStartEvent", fn: fun(ev: dd.ev.native.HeroActOutStartEvent), opts?: dd.opts.native.HeroActOutStartEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.HeroActOutFinishEvent", fn: fun(ev: dd.ev.native.HeroActOutFinishEvent), opts?: dd.opts.native.HeroActOutFinishEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.HeroAfflictionVirtueEvent", fn: fun(ev: dd.ev.native.HeroAfflictionVirtueEvent), opts?: dd.opts.native.HeroAfflictionVirtueEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.HeroUsedItemEvent", fn: fun(ev: dd.ev.native.HeroUsedItemEvent), opts?: dd.opts.native.HeroUsedItemEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.HeroReachedDeathsDoorEvent", fn: fun(ev: dd.ev.native.HeroReachedDeathsDoorEvent), opts?: dd.opts.native.HeroReachedDeathsDoorEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.InventoryAddItemEvent", fn: fun(ev: dd.ev.native.InventoryAddItemEvent), opts?: dd.opts.native.InventoryAddItemEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.InventoryPreMergeEvent", fn: fun(ev: dd.ev.native.InventoryPreMergeEvent), opts?: dd.opts.native.InventoryPreMergeEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.InventoryPostMergeEvent", fn: fun(ev: dd.ev.native.InventoryPostMergeEvent), opts?: dd.opts.native.InventoryPostMergeEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.InventoryModifiedEvent", fn: fun(ev: dd.ev.native.InventoryModifiedEvent), opts?: dd.opts.native.InventoryModifiedEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.LaunchCreditsEvent", fn: fun(ev: dd.ev.native.LaunchCreditsEvent), opts?: dd.opts.native.LaunchCreditsEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.OptionsSavedEvent", fn: fun(ev: dd.ev.native.OptionsSavedEvent), opts?: dd.opts.native.OptionsSavedEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.PlayFabConnectionInitializedEvent", fn: fun(ev: dd.ev.native.PlayFabConnectionInitializedEvent), opts?: dd.opts.native.PlayFabConnectionInitializedEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.PlayFabReconnectedEvent", fn: fun(ev: dd.ev.native.PlayFabReconnectedEvent), opts?: dd.opts.native.PlayFabReconnectedEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.PlayFabConnectionLostEvent", fn: fun(ev: dd.ev.native.PlayFabConnectionLostEvent), opts?: dd.opts.native.PlayFabConnectionLostEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.PlayFabLocalizedDataAvailableEvent", fn: fun(ev: dd.ev.native.PlayFabLocalizedDataAvailableEvent), opts?: dd.opts.native.PlayFabLocalizedDataAvailableEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.PlayFabFinishPostMatchDataUpdatesEvent", fn: fun(ev: dd.ev.native.PlayFabFinishPostMatchDataUpdatesEvent), opts?: dd.opts.native.PlayFabFinishPostMatchDataUpdatesEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.ReceivedExternalTurnMetaDataInSimpleMPEvent", fn: fun(ev: dd.ev.native.ReceivedExternalTurnMetaDataInSimpleMPEvent), opts?: dd.opts.native.ReceivedExternalTurnMetaDataInSimpleMPEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.ExternalSubsystemMultiplayerMessageReceivedEvent", fn: fun(ev: dd.ev.native.ExternalSubsystemMultiplayerMessageReceivedEvent), opts?: dd.opts.native.ExternalSubsystemMultiplayerMessageReceivedEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.RaidStartEvent", fn: fun(ev: dd.ev.native.RaidStartEvent), opts?: dd.opts.native.RaidStartEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.PartyStepEvent", fn: fun(ev: dd.ev.native.PartyStepEvent), opts?: dd.opts.native.PartyStepEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.RaidFinishResultsEvent", fn: fun(ev: dd.ev.native.RaidFinishResultsEvent), opts?: dd.opts.native.RaidFinishResultsEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.RaidGoalsCompleteEvent", fn: fun(ev: dd.ev.native.RaidGoalsCompleteEvent), opts?: dd.opts.native.RaidGoalsCompleteEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.RaidMapGenerated", fn: fun(ev: dd.ev.native.RaidMapGenerated), opts?: dd.opts.native.RaidMapGenerated): dd.Subscription?, string?
+---@overload fun(topic: "native.PreRaidFinishResultsEvent", fn: fun(ev: dd.ev.native.PreRaidFinishResultsEvent), opts?: dd.opts.native.PreRaidFinishResultsEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.TorchModifiedEvent", fn: fun(ev: dd.ev.native.TorchModifiedEvent), opts?: dd.opts.native.TorchModifiedEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.PrisonerRescuedEvent", fn: fun(ev: dd.ev.native.PrisonerRescuedEvent), opts?: dd.opts.native.PrisonerRescuedEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.QueueWaveLogicBarkEvent", fn: fun(ev: dd.ev.native.QueueWaveLogicBarkEvent), opts?: dd.opts.native.QueueWaveLogicBarkEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.MaxPrestigeEvent", fn: fun(ev: dd.ev.native.MaxPrestigeEvent), opts?: dd.opts.native.MaxPrestigeEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.RosterListHeroDDEffectEvent", fn: fun(ev: dd.ev.native.RosterListHeroDDEffectEvent), opts?: dd.opts.native.RosterListHeroDDEffectEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.RosterListHeroDDEffectClearedEvent", fn: fun(ev: dd.ev.native.RosterListHeroDDEffectClearedEvent), opts?: dd.opts.native.RosterListHeroDDEffectClearedEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.JournalPopupStartEvent", fn: fun(ev: dd.ev.native.JournalPopupStartEvent), opts?: dd.opts.native.JournalPopupStartEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.HeroStartBarkEvent", fn: fun(ev: dd.ev.native.HeroStartBarkEvent), opts?: dd.opts.native.HeroStartBarkEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.ActivityOpenedEvent", fn: fun(ev: dd.ev.native.ActivityOpenedEvent), opts?: dd.opts.native.ActivityOpenedEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.ActivityFinishedEvent", fn: fun(ev: dd.ev.native.ActivityFinishedEvent), opts?: dd.opts.native.ActivityFinishedEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.QuirkLockedEvent", fn: fun(ev: dd.ev.native.QuirkLockedEvent), opts?: dd.opts.native.QuirkLockedEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.PositiveQuirkTreatedEvent", fn: fun(ev: dd.ev.native.PositiveQuirkTreatedEvent), opts?: dd.opts.native.PositiveQuirkTreatedEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.NegativeQuirkTreatedEvent", fn: fun(ev: dd.ev.native.NegativeQuirkTreatedEvent), opts?: dd.opts.native.NegativeQuirkTreatedEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.BuildingStateChangedEvent", fn: fun(ev: dd.ev.native.BuildingStateChangedEvent), opts?: dd.opts.native.BuildingStateChangedEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.EstateCurrencyChangeEvent", fn: fun(ev: dd.ev.native.EstateCurrencyChangeEvent), opts?: dd.opts.native.EstateCurrencyChangeEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.HeroDismissedEvent", fn: fun(ev: dd.ev.native.HeroDismissedEvent), opts?: dd.opts.native.HeroDismissedEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.BuildingUpgradedEvent", fn: fun(ev: dd.ev.native.BuildingUpgradedEvent), opts?: dd.opts.native.BuildingUpgradedEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.RealmInventoryChangedEvent", fn: fun(ev: dd.ev.native.RealmInventoryChangedEvent), opts?: dd.opts.native.RealmInventoryChangedEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.HeroRecruitedEvent", fn: fun(ev: dd.ev.native.HeroRecruitedEvent), opts?: dd.opts.native.HeroRecruitedEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.TownEventOnStartTownVisitEvent", fn: fun(ev: dd.ev.native.TownEventOnStartTownVisitEvent), opts?: dd.opts.native.TownEventOnStartTownVisitEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.PreOnStartTownVisitEvent", fn: fun(ev: dd.ev.native.PreOnStartTownVisitEvent), opts?: dd.opts.native.PreOnStartTownVisitEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.PostOnStartTownVisitEvent", fn: fun(ev: dd.ev.native.PostOnStartTownVisitEvent), opts?: dd.opts.native.PostOnStartTownVisitEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.DistrictBuildingBuiltEvent", fn: fun(ev: dd.ev.native.DistrictBuildingBuiltEvent), opts?: dd.opts.native.DistrictBuildingBuiltEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.PrestigeUpdatedEvent", fn: fun(ev: dd.ev.native.PrestigeUpdatedEvent), opts?: dd.opts.native.PrestigeUpdatedEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.PlayFabAchievementsUpdatedEvent", fn: fun(ev: dd.ev.native.PlayFabAchievementsUpdatedEvent), opts?: dd.opts.native.PlayFabAchievementsUpdatedEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.PrestigeAndPlayFabAchievementsUpdatedEvent", fn: fun(ev: dd.ev.native.PrestigeAndPlayFabAchievementsUpdatedEvent), opts?: dd.opts.native.PrestigeAndPlayFabAchievementsUpdatedEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.ArenaUnlocksUpdatedEvent", fn: fun(ev: dd.ev.native.ArenaUnlocksUpdatedEvent), opts?: dd.opts.native.ArenaUnlocksUpdatedEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.TutorialPopupStartEvent", fn: fun(ev: dd.ev.native.TutorialPopupStartEvent), opts?: dd.opts.native.TutorialPopupStartEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.TutorialPopupFinishEvent", fn: fun(ev: dd.ev.native.TutorialPopupFinishEvent), opts?: dd.opts.native.TutorialPopupFinishEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.ResidentOccupiesActivityEvent", fn: fun(ev: dd.ev.native.ResidentOccupiesActivityEvent), opts?: dd.opts.native.ResidentOccupiesActivityEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.ActivitySlotTakenEvent", fn: fun(ev: dd.ev.native.ActivitySlotTakenEvent), opts?: dd.opts.native.ActivitySlotTakenEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.ActivityUnconfirmedSlotCountEvent", fn: fun(ev: dd.ev.native.ActivityUnconfirmedSlotCountEvent), opts?: dd.opts.native.ActivityUnconfirmedSlotCountEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.UpdateHeroStressEvent", fn: fun(ev: dd.ev.native.UpdateHeroStressEvent), opts?: dd.opts.native.UpdateHeroStressEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.RosterListRandomBarkEvent", fn: fun(ev: dd.ev.native.RosterListRandomBarkEvent), opts?: dd.opts.native.RosterListRandomBarkEvent): dd.Subscription?, string?
+---@overload fun(topic: "native.StageCoachBarkEvent", fn: fun(ev: dd.ev.native.StageCoachBarkEvent), opts?: dd.opts.native.StageCoachBarkEvent): dd.Subscription?, string?
+---@overload fun(topic: "query.CampingPointBuffQuery", fn: fun(ev: dd.ev.query.CampingPointBuffQuery), opts?: dd.opts.query.CampingPointBuffQuery): dd.Subscription?, string?
+---@overload fun(topic: "query.CurioInteractionBuffQuery", fn: fun(ev: dd.ev.query.CurioInteractionBuffQuery), opts?: dd.opts.query.CurioInteractionBuffQuery): dd.Subscription?, string?
+---@overload fun(topic: "query.IsDisabledQuery", fn: fun(ev: dd.ev.query.IsDisabledQuery), opts?: dd.opts.query.IsDisabledQuery): dd.Subscription?, string?
+---@overload fun(topic: "query.InventoryExtraStackingLimitQuery", fn: fun(ev: dd.ev.query.InventoryExtraStackingLimitQuery), opts?: dd.opts.query.InventoryExtraStackingLimitQuery): dd.Subscription?, string?
+---@overload fun(topic: "query.InventoryReplacementEffectIdQuery", fn: fun(ev: dd.ev.query.InventoryReplacementEffectIdQuery), opts?: dd.opts.query.InventoryReplacementEffectIdQuery): dd.Subscription?, string?
+---@overload fun(topic: "query.LootDarknessBuffQuery", fn: fun(ev: dd.ev.query.LootDarknessBuffQuery), opts?: dd.opts.query.LootDarknessBuffQuery): dd.Subscription?, string?
+---@overload fun(topic: "query.TownGoldInterestBuffQuery", fn: fun(ev: dd.ev.query.TownGoldInterestBuffQuery), opts?: dd.opts.query.TownGoldInterestBuffQuery): dd.Subscription?, string?
+---@overload fun(topic: "query.TownVisitIdleStressBuffQuery", fn: fun(ev: dd.ev.query.TownVisitIdleStressBuffQuery), opts?: dd.opts.query.TownVisitIdleStressBuffQuery): dd.Subscription?, string?
+---@overload fun(topic: "query.ProvisionSupplyBuffQuery", fn: fun(ev: dd.ev.query.ProvisionSupplyBuffQuery), opts?: dd.opts.query.ProvisionSupplyBuffQuery): dd.Subscription?, string?
+---@overload fun(topic: "query.ProvisionIsItemTooltipsEnabledQuery", fn: fun(ev: dd.ev.query.ProvisionIsItemTooltipsEnabledQuery), opts?: dd.opts.query.ProvisionIsItemTooltipsEnabledQuery): dd.Subscription?, string?
+---@overload fun(topic: "query.FindNonRosterHeroesQuery", fn: fun(ev: dd.ev.query.FindNonRosterHeroesQuery), opts?: dd.opts.query.FindNonRosterHeroesQuery): dd.Subscription?, string?
+function dd.once(topic, fn, opts) end
+
+---挂起当前协程，等下一次匹配 filter 的事件，下一帧把字段快照交给协程（不是活的负载，改 .pre 要用 dd.on）。
+---超时（秒）返回 nil；主题不存在或不可用时立即返回 nil 和原因。只能在 dd.spawn 的协程里直接调用。
+---@async
+---@param topic dd.Topic|string
+---@param filter? table<string, integer|number|boolean|string|dd.Actor>
+---@param timeout? number
+---@return dd.Snapshot? snapshot
+---@return string? reason
+---@overload async fun(topic: "damage.pre", filter?: dd.filter.damage.pre, timeout?: number): dd.snap.damage.pre?, string?
+---@overload async fun(topic: "damage.post", filter?: dd.filter.damage.post, timeout?: number): dd.snap.damage.post?, string?
+---@overload async fun(topic: "effect.pre", filter?: dd.filter.effect.pre, timeout?: number): dd.snap.effect.pre?, string?
+---@overload async fun(topic: "effect.post", filter?: dd.filter.effect.post, timeout?: number): dd.snap.effect.post?, string?
+---@overload async fun(topic: "skill.pre", filter?: dd.filter.skill.pre, timeout?: number): dd.snap.skill.pre?, string?
+---@overload async fun(topic: "skill.post", filter?: dd.filter.skill.post, timeout?: number): dd.snap.skill.post?, string?
+---@overload async fun(topic: "hit.pre", filter?: dd.filter.hit.pre, timeout?: number): dd.snap.hit.pre?, string?
+---@overload async fun(topic: "hit.post", filter?: dd.filter.hit.post, timeout?: number): dd.snap.hit.post?, string?
+---@overload async fun(topic: "battle.round.start", filter?: dd.filter.battle.round.start, timeout?: number): dd.snap.battle.round.start?, string?
+---@overload async fun(topic: "battle.round.end", filter?: dd.filter.battle.round.end, timeout?: number): dd.snap.battle.round.end?, string?
+---@overload async fun(topic: "battle.turn.start", filter?: dd.filter.battle.turn.start, timeout?: number): dd.snap.battle.turn.start?, string?
+---@overload async fun(topic: "battle.turn.end", filter?: dd.filter.battle.turn.end, timeout?: number): dd.snap.battle.turn.end?, string?
+---@overload async fun(topic: "stress.pre", filter?: dd.filter.stress.pre, timeout?: number): dd.snap.stress.pre?, string?
+---@overload async fun(topic: "stress.post", filter?: dd.filter.stress.post, timeout?: number): dd.snap.stress.post?, string?
+---@overload async fun(topic: "heal.pre", filter?: dd.filter.heal.pre, timeout?: number): dd.snap.heal.pre?, string?
+---@overload async fun(topic: "heal.post", filter?: dd.filter.heal.post, timeout?: number): dd.snap.heal.post?, string?
+---@overload async fun(topic: "app.tick", filter?: dd.filter.app.tick, timeout?: number): dd.snap.app.tick?, string?
+---@overload async fun(topic: "app.state", filter?: dd.filter.app.state, timeout?: number): dd.snap.app.state?, string?
+---@overload async fun(topic: "campaign.load", filter?: dd.filter.campaign.load, timeout?: number): dd.snap.campaign.load?, string?
+---@overload async fun(topic: "campaign.unload", filter?: dd.filter.campaign.unload, timeout?: number): dd.snap.campaign.unload?, string?
+---@overload async fun(topic: "battle.start", filter?: dd.filter.battle.start, timeout?: number): dd.snap.battle.start?, string?
+---@overload async fun(topic: "battle.end", filter?: dd.filter.battle.end, timeout?: number): dd.snap.battle.end?, string?
+---@overload async fun(topic: "actor.deathsdoor", filter?: dd.filter.actor.deathsdoor, timeout?: number): dd.snap.actor.deathsdoor?, string?
+---@overload async fun(topic: "actor.heartattack", filter?: dd.filter.actor.heartattack, timeout?: number): dd.snap.actor.heartattack?, string?
+---@overload async fun(topic: "actor.death", filter?: dd.filter.actor.death, timeout?: number): dd.snap.actor.death?, string?
+---@overload async fun(topic: "actor.affliction", filter?: dd.filter.actor.affliction, timeout?: number): dd.snap.actor.affliction?, string?
+---@overload async fun(topic: "raid.start", filter?: dd.filter.raid.start, timeout?: number): dd.snap.raid.start?, string?
+---@overload async fun(topic: "raid.finish", filter?: dd.filter.raid.finish, timeout?: number): dd.snap.raid.finish?, string?
+---@overload async fun(topic: "raid.step", filter?: dd.filter.raid.step, timeout?: number): dd.snap.raid.step?, string?
+---@overload async fun(topic: "raid.torch", filter?: dd.filter.raid.torch, timeout?: number): dd.snap.raid.torch?, string?
+---@overload async fun(topic: "town.enter", filter?: dd.filter.town.enter, timeout?: number): dd.snap.town.enter?, string?
+---@overload async fun(topic: "town.event", filter?: dd.filter.town.event, timeout?: number): dd.snap.town.event?, string?
+---@overload async fun(topic: "town.building", filter?: dd.filter.town.building, timeout?: number): dd.snap.town.building?, string?
+---@overload async fun(topic: "town.activity", filter?: dd.filter.town.activity, timeout?: number): dd.snap.town.activity?, string?
+---@overload async fun(topic: "town.activity.finish", filter?: dd.filter.town.activity.finish, timeout?: number): dd.snap.town.activity.finish?, string?
+---@overload async fun(topic: "hero.recruit", filter?: dd.filter.hero.recruit, timeout?: number): dd.snap.hero.recruit?, string?
+---@overload async fun(topic: "hero.dismiss", filter?: dd.filter.hero.dismiss, timeout?: number): dd.snap.hero.dismiss?, string?
+---@overload async fun(topic: "hero.quirk", filter?: dd.filter.hero.quirk, timeout?: number): dd.snap.hero.quirk?, string?
+---@overload async fun(topic: "hero.skill", filter?: dd.filter.hero.skill, timeout?: number): dd.snap.hero.skill?, string?
+---@overload async fun(topic: "inventory.add", filter?: dd.filter.inventory.add, timeout?: number): dd.snap.inventory.add?, string?
+---@overload async fun(topic: "inventory.modified", filter?: dd.filter.inventory.modified, timeout?: number): dd.snap.inventory.modified?, string?
+---@overload async fun(topic: "inventory.premerge", filter?: dd.filter.inventory.premerge, timeout?: number): dd.snap.inventory.premerge?, string?
+---@overload async fun(topic: "inventory.postmerge", filter?: dd.filter.inventory.postmerge, timeout?: number): dd.snap.inventory.postmerge?, string?
+---@overload async fun(topic: "estate.currency", filter?: dd.filter.estate.currency, timeout?: number): dd.snap.estate.currency?, string?
+---@overload async fun(topic: "native.EvaluateAchievementsEvent", filter?: dd.filter.native.EvaluateAchievementsEvent, timeout?: number): dd.snap.native.EvaluateAchievementsEvent?, string?
+---@overload async fun(topic: "native.InitedAchievementsEvent", filter?: dd.filter.native.InitedAchievementsEvent, timeout?: number): dd.snap.native.InitedAchievementsEvent?, string?
+---@overload async fun(topic: "native.SaveAchievementStateEvent", filter?: dd.filter.native.SaveAchievementStateEvent, timeout?: number): dd.snap.native.SaveAchievementStateEvent?, string?
+---@overload async fun(topic: "native.AwardAchievementEvent", filter?: dd.filter.native.AwardAchievementEvent, timeout?: number): dd.snap.native.AwardAchievementEvent?, string?
+---@overload async fun(topic: "native.MailingListSignUpEvent", filter?: dd.filter.native.MailingListSignUpEvent, timeout?: number): dd.snap.native.MailingListSignUpEvent?, string?
+---@overload async fun(topic: "native.MailingListReminderEvent", filter?: dd.filter.native.MailingListReminderEvent, timeout?: number): dd.snap.native.MailingListReminderEvent?, string?
+---@overload async fun(topic: "native.MailingListReminderSeenEvent", filter?: dd.filter.native.MailingListReminderSeenEvent, timeout?: number): dd.snap.native.MailingListReminderSeenEvent?, string?
+---@overload async fun(topic: "native.LocalizationAvailableEvent", filter?: dd.filter.native.LocalizationAvailableEvent, timeout?: number): dd.snap.native.LocalizationAvailableEvent?, string?
+---@overload async fun(topic: "native.AreaTileContentsChangedEvent", filter?: dd.filter.native.AreaTileContentsChangedEvent, timeout?: number): dd.snap.native.AreaTileContentsChangedEvent?, string?
+---@overload async fun(topic: "native.AreaTileKnowledgeEvent", filter?: dd.filter.native.AreaTileKnowledgeEvent, timeout?: number): dd.snap.native.AreaTileKnowledgeEvent?, string?
+---@overload async fun(topic: "native.AreaKnowledgeEvent", filter?: dd.filter.native.AreaKnowledgeEvent, timeout?: number): dd.snap.native.AreaKnowledgeEvent?, string?
+---@overload async fun(topic: "native.ScoutingEvent", filter?: dd.filter.native.ScoutingEvent, timeout?: number): dd.snap.native.ScoutingEvent?, string?
+---@overload async fun(topic: "native.ScoutingCurioEvent", filter?: dd.filter.native.ScoutingCurioEvent, timeout?: number): dd.snap.native.ScoutingCurioEvent?, string?
+---@overload async fun(topic: "native.BattleAttackEvent", filter?: dd.filter.native.BattleAttackEvent, timeout?: number): dd.snap.native.BattleAttackEvent?, string?
+---@overload async fun(topic: "native.TrinketTriggeredEvent", filter?: dd.filter.native.TrinketTriggeredEvent, timeout?: number): dd.snap.native.TrinketTriggeredEvent?, string?
+---@overload async fun(topic: "native.CaptorBurnRedirectEvent", filter?: dd.filter.native.CaptorBurnRedirectEvent, timeout?: number): dd.snap.native.CaptorBurnRedirectEvent?, string?
+---@overload async fun(topic: "native.BattleCreatedEvent", filter?: dd.filter.native.BattleCreatedEvent, timeout?: number): dd.snap.native.BattleCreatedEvent?, string?
+---@overload async fun(topic: "native.BattleDestroyedEvent", filter?: dd.filter.native.BattleDestroyedEvent, timeout?: number): dd.snap.native.BattleDestroyedEvent?, string?
+---@overload async fun(topic: "native.MonsterDeathEvent", filter?: dd.filter.native.MonsterDeathEvent, timeout?: number): dd.snap.native.MonsterDeathEvent?, string?
+---@overload async fun(topic: "native.CaptureEvent", filter?: dd.filter.native.CaptureEvent, timeout?: number): dd.snap.native.CaptureEvent?, string?
+---@overload async fun(topic: "native.ReleaseStartEvent", filter?: dd.filter.native.ReleaseStartEvent, timeout?: number): dd.snap.native.ReleaseStartEvent?, string?
+---@overload async fun(topic: "native.ReleaseFinishEvent", filter?: dd.filter.native.ReleaseFinishEvent, timeout?: number): dd.snap.native.ReleaseFinishEvent?, string?
+---@overload async fun(topic: "native.TeleportEvent", filter?: dd.filter.native.TeleportEvent, timeout?: number): dd.snap.native.TeleportEvent?, string?
+---@overload async fun(topic: "native.MonsterBattleStageEvent", filter?: dd.filter.native.MonsterBattleStageEvent, timeout?: number): dd.snap.native.MonsterBattleStageEvent?, string?
+---@overload async fun(topic: "native.DeathDamageEvent", filter?: dd.filter.native.DeathDamageEvent, timeout?: number): dd.snap.native.DeathDamageEvent?, string?
+---@overload async fun(topic: "native.HeartAttackEvent", filter?: dd.filter.native.HeartAttackEvent, timeout?: number): dd.snap.native.HeartAttackEvent?, string?
+---@overload async fun(topic: "native.ActorDazedEvent", filter?: dd.filter.native.ActorDazedEvent, timeout?: number): dd.snap.native.ActorDazedEvent?, string?
+---@overload async fun(topic: "native.HeroDeathEvent", filter?: dd.filter.native.HeroDeathEvent, timeout?: number): dd.snap.native.HeroDeathEvent?, string?
+---@overload async fun(topic: "native.HeroSurvivedDeathsDoorAttackEvent", filter?: dd.filter.native.HeroSurvivedDeathsDoorAttackEvent, timeout?: number): dd.snap.native.HeroSurvivedDeathsDoorAttackEvent?, string?
+---@overload async fun(topic: "native.HeroSkillUpgradedEvent", filter?: dd.filter.native.HeroSkillUpgradedEvent, timeout?: number): dd.snap.native.HeroSkillUpgradedEvent?, string?
+---@overload async fun(topic: "native.HeroWeaponAndArmourUpgradedEvent", filter?: dd.filter.native.HeroWeaponAndArmourUpgradedEvent, timeout?: number): dd.snap.native.HeroWeaponAndArmourUpgradedEvent?, string?
+---@overload async fun(topic: "native.QuirkAppliedEvent", filter?: dd.filter.native.QuirkAppliedEvent, timeout?: number): dd.snap.native.QuirkAppliedEvent?, string?
+---@overload async fun(topic: "native.HeroActOutStartEvent", filter?: dd.filter.native.HeroActOutStartEvent, timeout?: number): dd.snap.native.HeroActOutStartEvent?, string?
+---@overload async fun(topic: "native.HeroActOutFinishEvent", filter?: dd.filter.native.HeroActOutFinishEvent, timeout?: number): dd.snap.native.HeroActOutFinishEvent?, string?
+---@overload async fun(topic: "native.HeroAfflictionVirtueEvent", filter?: dd.filter.native.HeroAfflictionVirtueEvent, timeout?: number): dd.snap.native.HeroAfflictionVirtueEvent?, string?
+---@overload async fun(topic: "native.HeroUsedItemEvent", filter?: dd.filter.native.HeroUsedItemEvent, timeout?: number): dd.snap.native.HeroUsedItemEvent?, string?
+---@overload async fun(topic: "native.HeroReachedDeathsDoorEvent", filter?: dd.filter.native.HeroReachedDeathsDoorEvent, timeout?: number): dd.snap.native.HeroReachedDeathsDoorEvent?, string?
+---@overload async fun(topic: "native.InventoryAddItemEvent", filter?: dd.filter.native.InventoryAddItemEvent, timeout?: number): dd.snap.native.InventoryAddItemEvent?, string?
+---@overload async fun(topic: "native.InventoryPreMergeEvent", filter?: dd.filter.native.InventoryPreMergeEvent, timeout?: number): dd.snap.native.InventoryPreMergeEvent?, string?
+---@overload async fun(topic: "native.InventoryPostMergeEvent", filter?: dd.filter.native.InventoryPostMergeEvent, timeout?: number): dd.snap.native.InventoryPostMergeEvent?, string?
+---@overload async fun(topic: "native.InventoryModifiedEvent", filter?: dd.filter.native.InventoryModifiedEvent, timeout?: number): dd.snap.native.InventoryModifiedEvent?, string?
+---@overload async fun(topic: "native.LaunchCreditsEvent", filter?: dd.filter.native.LaunchCreditsEvent, timeout?: number): dd.snap.native.LaunchCreditsEvent?, string?
+---@overload async fun(topic: "native.OptionsSavedEvent", filter?: dd.filter.native.OptionsSavedEvent, timeout?: number): dd.snap.native.OptionsSavedEvent?, string?
+---@overload async fun(topic: "native.PlayFabConnectionInitializedEvent", filter?: dd.filter.native.PlayFabConnectionInitializedEvent, timeout?: number): dd.snap.native.PlayFabConnectionInitializedEvent?, string?
+---@overload async fun(topic: "native.PlayFabReconnectedEvent", filter?: dd.filter.native.PlayFabReconnectedEvent, timeout?: number): dd.snap.native.PlayFabReconnectedEvent?, string?
+---@overload async fun(topic: "native.PlayFabConnectionLostEvent", filter?: dd.filter.native.PlayFabConnectionLostEvent, timeout?: number): dd.snap.native.PlayFabConnectionLostEvent?, string?
+---@overload async fun(topic: "native.PlayFabLocalizedDataAvailableEvent", filter?: dd.filter.native.PlayFabLocalizedDataAvailableEvent, timeout?: number): dd.snap.native.PlayFabLocalizedDataAvailableEvent?, string?
+---@overload async fun(topic: "native.PlayFabFinishPostMatchDataUpdatesEvent", filter?: dd.filter.native.PlayFabFinishPostMatchDataUpdatesEvent, timeout?: number): dd.snap.native.PlayFabFinishPostMatchDataUpdatesEvent?, string?
+---@overload async fun(topic: "native.ReceivedExternalTurnMetaDataInSimpleMPEvent", filter?: dd.filter.native.ReceivedExternalTurnMetaDataInSimpleMPEvent, timeout?: number): dd.snap.native.ReceivedExternalTurnMetaDataInSimpleMPEvent?, string?
+---@overload async fun(topic: "native.ExternalSubsystemMultiplayerMessageReceivedEvent", filter?: dd.filter.native.ExternalSubsystemMultiplayerMessageReceivedEvent, timeout?: number): dd.snap.native.ExternalSubsystemMultiplayerMessageReceivedEvent?, string?
+---@overload async fun(topic: "native.RaidStartEvent", filter?: dd.filter.native.RaidStartEvent, timeout?: number): dd.snap.native.RaidStartEvent?, string?
+---@overload async fun(topic: "native.PartyStepEvent", filter?: dd.filter.native.PartyStepEvent, timeout?: number): dd.snap.native.PartyStepEvent?, string?
+---@overload async fun(topic: "native.RaidFinishResultsEvent", filter?: dd.filter.native.RaidFinishResultsEvent, timeout?: number): dd.snap.native.RaidFinishResultsEvent?, string?
+---@overload async fun(topic: "native.RaidGoalsCompleteEvent", filter?: dd.filter.native.RaidGoalsCompleteEvent, timeout?: number): dd.snap.native.RaidGoalsCompleteEvent?, string?
+---@overload async fun(topic: "native.RaidMapGenerated", filter?: dd.filter.native.RaidMapGenerated, timeout?: number): dd.snap.native.RaidMapGenerated?, string?
+---@overload async fun(topic: "native.PreRaidFinishResultsEvent", filter?: dd.filter.native.PreRaidFinishResultsEvent, timeout?: number): dd.snap.native.PreRaidFinishResultsEvent?, string?
+---@overload async fun(topic: "native.TorchModifiedEvent", filter?: dd.filter.native.TorchModifiedEvent, timeout?: number): dd.snap.native.TorchModifiedEvent?, string?
+---@overload async fun(topic: "native.PrisonerRescuedEvent", filter?: dd.filter.native.PrisonerRescuedEvent, timeout?: number): dd.snap.native.PrisonerRescuedEvent?, string?
+---@overload async fun(topic: "native.QueueWaveLogicBarkEvent", filter?: dd.filter.native.QueueWaveLogicBarkEvent, timeout?: number): dd.snap.native.QueueWaveLogicBarkEvent?, string?
+---@overload async fun(topic: "native.MaxPrestigeEvent", filter?: dd.filter.native.MaxPrestigeEvent, timeout?: number): dd.snap.native.MaxPrestigeEvent?, string?
+---@overload async fun(topic: "native.RosterListHeroDDEffectEvent", filter?: dd.filter.native.RosterListHeroDDEffectEvent, timeout?: number): dd.snap.native.RosterListHeroDDEffectEvent?, string?
+---@overload async fun(topic: "native.RosterListHeroDDEffectClearedEvent", filter?: dd.filter.native.RosterListHeroDDEffectClearedEvent, timeout?: number): dd.snap.native.RosterListHeroDDEffectClearedEvent?, string?
+---@overload async fun(topic: "native.JournalPopupStartEvent", filter?: dd.filter.native.JournalPopupStartEvent, timeout?: number): dd.snap.native.JournalPopupStartEvent?, string?
+---@overload async fun(topic: "native.HeroStartBarkEvent", filter?: dd.filter.native.HeroStartBarkEvent, timeout?: number): dd.snap.native.HeroStartBarkEvent?, string?
+---@overload async fun(topic: "native.ActivityOpenedEvent", filter?: dd.filter.native.ActivityOpenedEvent, timeout?: number): dd.snap.native.ActivityOpenedEvent?, string?
+---@overload async fun(topic: "native.ActivityFinishedEvent", filter?: dd.filter.native.ActivityFinishedEvent, timeout?: number): dd.snap.native.ActivityFinishedEvent?, string?
+---@overload async fun(topic: "native.QuirkLockedEvent", filter?: dd.filter.native.QuirkLockedEvent, timeout?: number): dd.snap.native.QuirkLockedEvent?, string?
+---@overload async fun(topic: "native.PositiveQuirkTreatedEvent", filter?: dd.filter.native.PositiveQuirkTreatedEvent, timeout?: number): dd.snap.native.PositiveQuirkTreatedEvent?, string?
+---@overload async fun(topic: "native.NegativeQuirkTreatedEvent", filter?: dd.filter.native.NegativeQuirkTreatedEvent, timeout?: number): dd.snap.native.NegativeQuirkTreatedEvent?, string?
+---@overload async fun(topic: "native.BuildingStateChangedEvent", filter?: dd.filter.native.BuildingStateChangedEvent, timeout?: number): dd.snap.native.BuildingStateChangedEvent?, string?
+---@overload async fun(topic: "native.EstateCurrencyChangeEvent", filter?: dd.filter.native.EstateCurrencyChangeEvent, timeout?: number): dd.snap.native.EstateCurrencyChangeEvent?, string?
+---@overload async fun(topic: "native.HeroDismissedEvent", filter?: dd.filter.native.HeroDismissedEvent, timeout?: number): dd.snap.native.HeroDismissedEvent?, string?
+---@overload async fun(topic: "native.BuildingUpgradedEvent", filter?: dd.filter.native.BuildingUpgradedEvent, timeout?: number): dd.snap.native.BuildingUpgradedEvent?, string?
+---@overload async fun(topic: "native.RealmInventoryChangedEvent", filter?: dd.filter.native.RealmInventoryChangedEvent, timeout?: number): dd.snap.native.RealmInventoryChangedEvent?, string?
+---@overload async fun(topic: "native.HeroRecruitedEvent", filter?: dd.filter.native.HeroRecruitedEvent, timeout?: number): dd.snap.native.HeroRecruitedEvent?, string?
+---@overload async fun(topic: "native.TownEventOnStartTownVisitEvent", filter?: dd.filter.native.TownEventOnStartTownVisitEvent, timeout?: number): dd.snap.native.TownEventOnStartTownVisitEvent?, string?
+---@overload async fun(topic: "native.PreOnStartTownVisitEvent", filter?: dd.filter.native.PreOnStartTownVisitEvent, timeout?: number): dd.snap.native.PreOnStartTownVisitEvent?, string?
+---@overload async fun(topic: "native.PostOnStartTownVisitEvent", filter?: dd.filter.native.PostOnStartTownVisitEvent, timeout?: number): dd.snap.native.PostOnStartTownVisitEvent?, string?
+---@overload async fun(topic: "native.DistrictBuildingBuiltEvent", filter?: dd.filter.native.DistrictBuildingBuiltEvent, timeout?: number): dd.snap.native.DistrictBuildingBuiltEvent?, string?
+---@overload async fun(topic: "native.PrestigeUpdatedEvent", filter?: dd.filter.native.PrestigeUpdatedEvent, timeout?: number): dd.snap.native.PrestigeUpdatedEvent?, string?
+---@overload async fun(topic: "native.PlayFabAchievementsUpdatedEvent", filter?: dd.filter.native.PlayFabAchievementsUpdatedEvent, timeout?: number): dd.snap.native.PlayFabAchievementsUpdatedEvent?, string?
+---@overload async fun(topic: "native.PrestigeAndPlayFabAchievementsUpdatedEvent", filter?: dd.filter.native.PrestigeAndPlayFabAchievementsUpdatedEvent, timeout?: number): dd.snap.native.PrestigeAndPlayFabAchievementsUpdatedEvent?, string?
+---@overload async fun(topic: "native.ArenaUnlocksUpdatedEvent", filter?: dd.filter.native.ArenaUnlocksUpdatedEvent, timeout?: number): dd.snap.native.ArenaUnlocksUpdatedEvent?, string?
+---@overload async fun(topic: "native.TutorialPopupStartEvent", filter?: dd.filter.native.TutorialPopupStartEvent, timeout?: number): dd.snap.native.TutorialPopupStartEvent?, string?
+---@overload async fun(topic: "native.TutorialPopupFinishEvent", filter?: dd.filter.native.TutorialPopupFinishEvent, timeout?: number): dd.snap.native.TutorialPopupFinishEvent?, string?
+---@overload async fun(topic: "native.ResidentOccupiesActivityEvent", filter?: dd.filter.native.ResidentOccupiesActivityEvent, timeout?: number): dd.snap.native.ResidentOccupiesActivityEvent?, string?
+---@overload async fun(topic: "native.ActivitySlotTakenEvent", filter?: dd.filter.native.ActivitySlotTakenEvent, timeout?: number): dd.snap.native.ActivitySlotTakenEvent?, string?
+---@overload async fun(topic: "native.ActivityUnconfirmedSlotCountEvent", filter?: dd.filter.native.ActivityUnconfirmedSlotCountEvent, timeout?: number): dd.snap.native.ActivityUnconfirmedSlotCountEvent?, string?
+---@overload async fun(topic: "native.UpdateHeroStressEvent", filter?: dd.filter.native.UpdateHeroStressEvent, timeout?: number): dd.snap.native.UpdateHeroStressEvent?, string?
+---@overload async fun(topic: "native.RosterListRandomBarkEvent", filter?: dd.filter.native.RosterListRandomBarkEvent, timeout?: number): dd.snap.native.RosterListRandomBarkEvent?, string?
+---@overload async fun(topic: "native.StageCoachBarkEvent", filter?: dd.filter.native.StageCoachBarkEvent, timeout?: number): dd.snap.native.StageCoachBarkEvent?, string?
+---@overload async fun(topic: "query.CampingPointBuffQuery", filter?: dd.filter.query.CampingPointBuffQuery, timeout?: number): dd.snap.query.CampingPointBuffQuery?, string?
+---@overload async fun(topic: "query.CurioInteractionBuffQuery", filter?: dd.filter.query.CurioInteractionBuffQuery, timeout?: number): dd.snap.query.CurioInteractionBuffQuery?, string?
+---@overload async fun(topic: "query.IsDisabledQuery", filter?: dd.filter.query.IsDisabledQuery, timeout?: number): dd.snap.query.IsDisabledQuery?, string?
+---@overload async fun(topic: "query.InventoryExtraStackingLimitQuery", filter?: dd.filter.query.InventoryExtraStackingLimitQuery, timeout?: number): dd.snap.query.InventoryExtraStackingLimitQuery?, string?
+---@overload async fun(topic: "query.InventoryReplacementEffectIdQuery", filter?: dd.filter.query.InventoryReplacementEffectIdQuery, timeout?: number): dd.snap.query.InventoryReplacementEffectIdQuery?, string?
+---@overload async fun(topic: "query.LootDarknessBuffQuery", filter?: dd.filter.query.LootDarknessBuffQuery, timeout?: number): dd.snap.query.LootDarknessBuffQuery?, string?
+---@overload async fun(topic: "query.TownGoldInterestBuffQuery", filter?: dd.filter.query.TownGoldInterestBuffQuery, timeout?: number): dd.snap.query.TownGoldInterestBuffQuery?, string?
+---@overload async fun(topic: "query.TownVisitIdleStressBuffQuery", filter?: dd.filter.query.TownVisitIdleStressBuffQuery, timeout?: number): dd.snap.query.TownVisitIdleStressBuffQuery?, string?
+---@overload async fun(topic: "query.ProvisionSupplyBuffQuery", filter?: dd.filter.query.ProvisionSupplyBuffQuery, timeout?: number): dd.snap.query.ProvisionSupplyBuffQuery?, string?
+---@overload async fun(topic: "query.ProvisionIsItemTooltipsEnabledQuery", filter?: dd.filter.query.ProvisionIsItemTooltipsEnabledQuery, timeout?: number): dd.snap.query.ProvisionIsItemTooltipsEnabledQuery?, string?
+---@overload async fun(topic: "query.FindNonRosterHeroesQuery", filter?: dd.filter.query.FindNonRosterHeroesQuery, timeout?: number): dd.snap.query.FindNonRosterHeroesQuery?, string?
+function dd.wait_event(topic, filter, timeout) end
