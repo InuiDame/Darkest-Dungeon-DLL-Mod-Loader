@@ -1,0 +1,1 @@
+{ "id": "dev_dependent", "version": "1.0.0", "api": 1, "dependencies": [ { "id": "dev_selftest", "version": "1.0" } ] }

@@ -1,0 +1,1 @@
+{ "id": "p3d_broken", "version": "1.0.0", "api": 1, "name": "P3d 场景测试：main.lua 故意出错，应当加载失败" }

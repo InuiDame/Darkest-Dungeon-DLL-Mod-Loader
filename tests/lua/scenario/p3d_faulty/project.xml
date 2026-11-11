@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<project>
+	<PreviewIconFile/>
+	<ItemDescriptionShort/>
+	<ModDataPath/>
+	<Title>DDLua Test P3d Faulty</Title>
+	<Language>english</Language>
+	<UpdateDetails/>
+	<Visibility>private</Visibility>
+	<UploadMode>dont_submit</UploadMode>
+	<VersionMajor>1</VersionMajor>
+	<VersionMinor>0</VersionMinor>
+	<TargetBuild>0</TargetBuild>
+	<Tags/>
+	<ItemDescription>DD.ModLoader P3d scenario test: callbacks that raise errors and infinite loops (each interrupted after 50 ms). Changes no game data.</ItemDescription>
+	<PublishedFileId/>
+</project>

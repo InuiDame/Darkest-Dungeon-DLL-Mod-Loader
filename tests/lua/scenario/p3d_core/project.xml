@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<project>
+	<PreviewIconFile/>
+	<ItemDescriptionShort/>
+	<ModDataPath/>
+	<Title>DDLua Test P3d Core</Title>
+	<Language>english</Language>
+	<UpdateDetails/>
+	<Visibility>private</Visibility>
+	<UploadMode>dont_submit</UploadMode>
+	<VersionMajor>1</VersionMajor>
+	<VersionMinor>0</VersionMinor>
+	<TargetBuild>0</TargetBuild>
+	<Tags/>
+	<ItemDescription>DD.ModLoader P3d scenario test. CHANGES GAMEPLAY a few times per save entry: halves one hit and cancels one hit on heroes, turns one hit on a hero into a miss, zeroes one heal and one stress gain. Use a throwaway save.</ItemDescription>
+	<PublishedFileId/>
+</project>

@@ -1,0 +1,2 @@
+{ "id": "p3d_faulty", "version": "1.0.0", "api": 1, "dependencies": [ { "id": "p3d_core", "version": "1.0" } ],
+  "name": "P3d 场景测试：出错和超预算的回调（不改游戏）" }

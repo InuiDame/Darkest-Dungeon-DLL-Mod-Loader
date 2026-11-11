@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<project>
+	<PreviewIconFile/>
+	<ItemDescriptionShort/>
+	<ModDataPath/>
+	<Title>DDLua Test P3c Actor</Title>
+	<Language>english</Language>
+	<UpdateDetails/>
+	<Visibility>private</Visibility>
+	<UploadMode>dont_submit</UploadMode>
+	<VersionMajor>1</VersionMajor>
+	<VersionMinor>0</VersionMinor>
+	<TargetBuild>0</TargetBuild>
+	<Tags/>
+	<ItemDescription>DD.ModLoader P3c scenario test: Lua actor handles. Logs only, changes nothing.</ItemDescription>
+	<PublishedFileId/>
+</project>
