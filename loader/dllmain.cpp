@@ -12,6 +12,8 @@
 #include <vector>
 #include <algorithm>
 
+#include "../common/pe_exports.h"
+
 #pragma comment(lib, "shlwapi.lib")
 
 // ===================== 日志 =====================
@@ -258,7 +260,22 @@ static void ScanAndLoadDLLs(const std::wstring& directory,
                     Log(L"新 DLL（默认启用，未在 cfg 中）-> " + fullPath);
                 }
             }
-            else {
+
+            // 新协议插件和 DDCore 本身由 DDCore 加载。判断靠解析 PE 导出表，不运行 DLL 的 DllMain。
+            // 强制目录里的同名 DLL 仍然按“已加载”去重，语义和旧式 DLL 一致
+            const std::wstring lowerName = ToLowerName(fd.cFileName);
+            if (lowerName == L"ddcore.dll") {
+                Log(L"[DDCore] 跳过 DDCore 自身 -> " + fullPath);
+                if (forceLoad) g_forceLoadedNames.insert(lowerName);
+                continue;
+            }
+            if (dd::common::DllIsNewProtocol(fullPath.c_str())) {
+                Log(L"[DDCore] 跳过（新协议插件，由 DDCore 加载）-> " + fullPath);
+                if (forceLoad) g_forceLoadedNames.insert(lowerName);
+                continue;
+            }
+
+            if (forceLoad) {
                 Log(L"强制加载前置 DLL -> " + fullPath);
             }
 
@@ -319,6 +336,13 @@ static std::vector<std::wstring> LoadExtraDirs(const std::wstring& gameRoot) {
 // ===================== MOD 加载线程（修改）=====================
 static DWORD WINAPI ModLoaderThread(LPVOID lpParam) {
     HMODULE hSelf = (HMODULE)lpParam;
+
+    // 系统 dbghelp.dll 在这里加载，DllMain 持有加载器锁，不做这件事。
+    // 这条线程在 DllMain 返回后才开始运行，导出函数本身也会在需要时补做
+    if (!InitMiniDumpForwarder()) {
+        Log(L"警告：无法加载系统 dbghelp.dll，MiniDumpWriteDump 将不可用");
+    }
+
     Sleep(1500);
 
     std::wstring binDir = GetModuleDirectory(hSelf);
@@ -371,19 +395,23 @@ static DWORD WINAPI ModLoaderThread(LPVOID lpParam) {
     return 0;
 }
 
+#include "early_hook.h"
+
 // ===================== DllMain（修改改名调用）=====================
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
-        DisableThreadLibraryCalls(hModule);
-
+        // 静态 CRT 依赖线程通知，这里不能调用 DisableThreadLibraryCalls
         std::wstring binDir = GetModuleDirectory(hModule);
         std::wstring gameRoot = GetGameRootFromBinDir(binDir);
         LogInit(GetDataDir(gameRoot, L"log") + L"\\DDModLoader.log");
         LoadConfig(GetDataDir(gameRoot, L"cfg") + L"\\DDModLoader.cfg");
         Log(L"========== DDModLoader 启动 ==========");
 
-        if (!InitMiniDumpForwarder()) {
-            Log(L"警告：无法加载系统 dbghelp.dll，MiniDumpWriteDump 将不可用");
+        // DllMain 持有加载器锁，这里只做内存补丁，加载 DDCore 等主线程进入 CreateAppSystems 时再做
+        if (dd_early::InstallGuarded(gameRoot, binDir)) {
+            Log(L"[DDCore] 早期 hook 已安装（CreateAppSystems）");
+        } else if (!dd_early::g_installed) {
+            Log(L"[DDCore] 早期 hook 未安装，DDCore 不会启动，旧式 DLL 不受影响");
         }
 
         HANDLE hThread = CreateThread(nullptr, 0, ModLoaderThread, hModule, 0, nullptr);
