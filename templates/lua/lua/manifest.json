@@ -1,0 +1,7 @@
+{
+  "id": "my_lua_mod",
+  "version": "1.0.0",
+  "api": 1,
+  "dependencies": [],
+  "name": "我的 Lua Mod"
+}
