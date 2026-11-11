@@ -7,7 +7,7 @@ And delete dbghelp.dll under DarkestDungeon\_windows\win64
 
 The test files in the directory can be used to check whether the installation is successful
 
-A log file will be generated in C:\Users\username\AppData\Local\DDModLoader
+Log files will be generated in the DDModLoader\log folder in the game's root directory
 
 Some simple example mods will be released later (if I have time)
 

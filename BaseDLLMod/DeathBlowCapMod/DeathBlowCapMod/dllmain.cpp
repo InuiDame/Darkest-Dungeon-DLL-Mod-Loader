@@ -40,21 +40,25 @@ static bool IsReadable(BYTE* addr, SIZE_T n) {
 }
 
 // ============ cfg 路径 ============
-static void BuildCfgPath(HMODULE hMod) {
-    char dllPath[MAX_PATH] = { 0 };
-    if (!GetModuleFileNameA(hMod, dllPath, MAX_PATH)) {
-        strcpy_s(g_cfgPath, MAX_PATH, "DeathBlowCap.cfg");   // [DB]
-        return;
+static void BuildCfgPath() {
+    const char* const fileName = "DeathBlowCap.cfg";
+    strcpy_s(g_cfgPath, MAX_PATH, fileName);
+
+    // 配置统一放在 <游戏根目录>\DDModLoader\cfg，主程序位于 <游戏根目录>\_windows\win64
+    char root[MAX_PATH] = { 0 };
+    if (!GetModuleFileNameA(nullptr, root, MAX_PATH)) return;
+    for (int i = 0; i < 3; ++i) {
+        char* lastSlash = strrchr(root, '\\');
+        if (!lastSlash) return;
+        *lastSlash = 0;
     }
-    char* lastSlash = strrchr(dllPath, '\\');
-    if (!lastSlash) lastSlash = strrchr(dllPath, '/');
-    if (lastSlash) {
-        *(lastSlash + 1) = 0;
-        _snprintf_s(g_cfgPath, MAX_PATH, _TRUNCATE, "%sDeathBlowCap.cfg", dllPath); // [DB]
-    }
-    else {
-        strcpy_s(g_cfgPath, MAX_PATH, "DeathBlowCap.cfg");   // [DB]
-    }
+
+    char dir[MAX_PATH] = { 0 };
+    _snprintf_s(dir, MAX_PATH, _TRUNCATE, "%s\\DDModLoader", root);
+    CreateDirectoryA(dir, nullptr);
+    _snprintf_s(dir, MAX_PATH, _TRUNCATE, "%s\\DDModLoader\\cfg", root);
+    CreateDirectoryA(dir, nullptr);
+    _snprintf_s(g_cfgPath, MAX_PATH, _TRUNCATE, "%s\\%s", dir, fileName);
 }
 
 // ============ 读取 cfg ============
@@ -293,7 +297,7 @@ static DWORD WINAPI Worker(LPVOID) {
 BOOL APIENTRY DllMain(HMODULE hMod, DWORD r, LPVOID) {
     if (r == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hMod);
-        BuildCfgPath(hMod);
+        BuildCfgPath();
         CreateThread(nullptr, 0, Worker, nullptr, 0, nullptr);
     }
     return TRUE;
