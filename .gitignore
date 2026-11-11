@@ -30,3 +30,11 @@
 *.exe
 *.out
 *.app
+
+# xmake
+build/
+.xmake/
+.vs/
+vsxmake*/
+extern/
+__pycache__/

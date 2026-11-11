@@ -1,0 +1,24 @@
+#ifndef DD_PLUGIN_H
+#define DD_PLUGIN_H
+
+#define PLUGIN_NAME "${PLUGIN_NAME}"
+#define PLUGIN_AUTHOR "${PLUGIN_AUTHOR}"
+#define PLUGIN_LICENSE "${PLUGIN_LICENSE}"
+#define PLUGIN_VERSION_MAJOR ${VERSION_MAJOR}
+#define PLUGIN_VERSION_MINOR ${VERSION_MINOR}
+#define PLUGIN_VERSION_PATCH ${VERSION_ALTER}
+#define PLUGIN_VERSION_STRING "${VERSION}"
+
+#ifndef RC_INVOKED
+namespace Plugin
+{
+	inline constexpr auto NAME = std::string_view{ PLUGIN_NAME };
+	inline constexpr auto AUTHOR = std::string_view{ PLUGIN_AUTHOR };
+	inline constexpr auto Version =
+		PLUGIN_VERSION_MAJOR * 10000u +
+		PLUGIN_VERSION_MINOR * 100u +
+		PLUGIN_VERSION_PATCH;
+}
+#endif
+
+#endif
