@@ -1,0 +1,33 @@
+// shield_lite：护盾 effect。这些 effect 本身不改任何属性，游戏施加时 DDLua 按名字把它们交给 shield_lite 的 Lua 代码结算护盾。
+// 名字规则（数字可以换）：shield_gain_N 加 N 点，shield_heal_pct_N 加上限的 N%，shield_max_N 上限加 N，shield_max_pct_N 上限加 N%，
+// shield_damage_N 扣 N 点，shield_damage_pct_N 扣上限的 N%，shield_full 加满，shield_break 清零，shield_regen_N_T / shield_decay_N_T
+// 之后 T 个回合每回合开始时加 / 扣 N 点，shield_pierce_N 这个执行者对目标的下一次命中有 N% 无视护盾。
+// 带 self_ 的给执行者自己（.target "performer"），不带的给技能的目标。技能里引用：.effect "shield_self_gain_5"
+// 用新数字时在这里照样加一行（effect 要先在数据里定义，技能才引用得到），Lua 按名字解析，不用改代码。
+
+// 给自己
+effect: .name "shield_self_gain_5"      .target "performer" .chance 100% .on_hit true .on_miss true .has_description false
+effect: .name "shield_self_gain_10"     .target "performer" .chance 100% .on_hit true .on_miss true .has_description false
+effect: .name "shield_self_max_10"      .target "performer" .chance 100% .on_hit true .on_miss true .has_description false
+effect: .name "shield_self_full"        .target "performer" .chance 100% .on_hit true .on_miss true .has_description false
+effect: .name "shield_self_break"       .target "performer" .chance 100% .on_hit true .on_miss true .has_description false
+effect: .name "shield_self_regen_2_3"   .target "performer" .chance 100% .on_hit true .on_miss true .has_description false
+effect: .name "shield_self_decay_2_3"   .target "performer" .chance 100% .on_hit true .on_miss true .has_description false
+
+// 给目标（友方技能的目标，或者被攻击的敌人）
+effect: .name "shield_gain_5"           .target "target" .chance 100% .on_hit true .on_miss false .has_description false
+effect: .name "shield_gain_10"          .target "target" .chance 100% .on_hit true .on_miss false .has_description false
+effect: .name "shield_heal_pct_25"      .target "target" .chance 100% .on_hit true .on_miss false .has_description false
+effect: .name "shield_damage_5"         .target "target" .chance 100% .on_hit true .on_miss false .has_description false
+effect: .name "shield_damage_pct_25"    .target "target" .chance 100% .on_hit true .on_miss false .has_description false
+effect: .name "shield_max_10"           .target "target" .chance 100% .on_hit true .on_miss true .has_description false
+effect: .name "shield_max_pct_50"       .target "target" .chance 100% .on_hit true .on_miss true .has_description false
+effect: .name "shield_full"             .target "target" .chance 100% .on_hit true .on_miss true .has_description false
+effect: .name "shield_break"            .target "target" .chance 100% .on_hit true .on_miss true .has_description false
+effect: .name "shield_set_10"           .target "target" .chance 100% .on_hit true .on_miss true .has_description false
+effect: .name "shield_regen_2_3"        .target "target" .chance 100% .on_hit true .on_miss true .has_description false
+effect: .name "shield_decay_2_3"        .target "target" .chance 100% .on_hit true .on_miss true .has_description false
+
+// 穿透：写在攻击技能上、作用于被攻击的目标，只影响这个技能对它的这一次命中
+effect: .name "shield_pierce_50"        .target "target" .chance 100% .on_hit true .on_miss false .has_description false
+effect: .name "shield_pierce_100"       .target "target" .chance 100% .on_hit true .on_miss false .has_description false
