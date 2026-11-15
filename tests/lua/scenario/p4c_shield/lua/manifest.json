@@ -1,0 +1,1 @@
+{ "id": "p4c_shield", "version": "1.0.0", "api": 1, "dependencies": ["shield_lite"], "name": "P4c2 场景测试：驱动 shield_lite 的各种护盾规则（每场战斗开始 2 秒后，最多两场）" }

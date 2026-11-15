@@ -12,7 +12,8 @@ target("dd_core_tests")
     add_includedirs("../sdk/include")
     add_files("unit/test_main.cpp", "unit/c_compat.c")
     add_files("../core/src/logic/*.cpp", "../core/src/hook/*.cpp", "../core/src/runtime/*.cpp", "../core/src/events/hub.cpp",
-        "../core/src/game/phase_tracker.cpp", "../core/src/game/actors.cpp", "../core/src/guard.cpp")
+        "../core/src/game/phase_tracker.cpp", "../core/src/game/actors.cpp", "../core/src/guard.cpp",
+        "../core/src/combat/logic.cpp", "../core/src/persist/store.cpp")
     add_syslinks("user32", "shlwapi")
 target_end()
 
@@ -38,7 +39,8 @@ target("dd_lua_tests")
     set_values("dd.rc", "off")
     set_default(false)
     set_group("tests")
-    add_files("unit/lua_tests.cpp", "../lua/src/*.cpp", "../core/src/events/hub.cpp")
+    -- P4b：假的 combat 服务用 DDCore 的 combat/logic.cpp（枚举表、校验、时机判断），语义和真实服务一致
+    add_files("unit/lua_tests.cpp", "../lua/src/*.cpp", "../core/src/events/hub.cpp", "../core/src/combat/logic.cpp")
     add_includedirs("../lua/src", "../core/src")
     add_packages("lua", "nlohmann_json")
     local fixtures = (path.join(os.scriptdir(), "lua"):gsub("\\", "/"))
@@ -101,6 +103,28 @@ target("probe_p3c")
     set_default(false)
     set_group("tests")
     add_files("plugins/probe_p3c.cpp")
+target_end()
+
+-- P4-0C 的运行探针：hook buff、effect、规则、tray、存档读写和技能执行，在主线程帧边界做少量主动测试
+-- （加、删测试 buff，施加 effect，运行时解析 effect/buff 文件），用法见 plugins/probe_p4.cpp 开头的注释
+target("probe_p4")
+    add_rules("dd.native")
+    set_values("dd.dkutil", "off")
+    set_values("dd.rc", "off")
+    set_default(false)
+    set_group("tests")
+    add_files("plugins/probe_p4.cpp")
+target_end()
+
+-- P4a：combat 服务的验证插件。主菜单自检（hook 按需装卸、存档外拒绝写操作），进存档后在城镇、走廊、战斗中
+-- 各做一轮 buff 增删、effect、定义、规则、排队的验证，用法见 docs/10-p4-scenario.md 的「第二段」
+target("test_combat")
+    add_rules("dd.native")
+    set_values("dd.dkutil", "off")
+    set_values("dd.rc", "off")
+    set_default(false)
+    set_group("tests")
+    add_files("plugins/test_combat.cpp")
 target_end()
 
 -- P3d：把 DDCore 的主题表写成 JSON（只查询，不订阅事件），tools/gen_lua_types.py 据此生成 LuaLS 的主题注解

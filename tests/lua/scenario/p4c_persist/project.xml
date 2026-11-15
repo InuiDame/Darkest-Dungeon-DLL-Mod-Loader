@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<project>
+	<PreviewIconFile/>
+	<ItemDescriptionShort/>
+	<ModDataPath/>
+	<Title>DDLua Test P4c Persist</Title>
+	<Language>english</Language>
+	<UpdateDetails/>
+	<Visibility>private</Visibility>
+	<UploadMode>dont_submit</UploadMode>
+	<VersionMajor>1</VersionMajor>
+	<VersionMinor>0</VersionMinor>
+	<TargetBuild>0</TargetBuild>
+	<Tags/>
+	<ItemDescription>DD.ModLoader P4c scenario test: dd.store and script buff state survive save and load. Adds speed +0 marker buffs to one hero and one monster.</ItemDescription>
+	<PublishedFileId/>
+</project>

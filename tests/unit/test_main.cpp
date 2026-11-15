@@ -1,10 +1,12 @@
 // 不依赖游戏的单元测试：依赖排序、ABI 协商、PE 导出解析、入口解码、hook 链（假函数）、
-// 任务队列、生命周期订阅、状态机判定（含探索序号）、actor 句柄的解析（假内存布局）。
+// 任务队列、生命周期订阅、状态机判定（含探索序号）、actor 句柄的解析（假内存布局）、combat 逻辑、persist 旁路
+// （格式、合并、原子写入、一致性判断、backup 同步、标签表）。
 // 运行：xmake build dd_core_tests && xmake run dd_core_tests [DLL 目录]
 // 给出 DLL 目录时额外校验真实构建出来的 DLL 的协议判定。
 
 #include "../../common/pattern.h"
 #include "../../common/pe_exports.h"
+#include "../../core/src/combat/logic.h"
 #include "../../core/src/events/access.h"
 #include "../../core/src/events/churn_log.h"
 #include "../../core/src/events/hub.h"
@@ -14,6 +16,7 @@
 #include "../../core/src/hook/prologue.h"
 #include "../../core/src/logic/abi.h"
 #include "../../core/src/logic/deps.h"
+#include "../../core/src/persist/store.h"
 #include "../../core/src/runtime/lifecycle.h"
 #include "../../core/src/runtime/task_queue.h"
 
@@ -22,7 +25,11 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <limits>
+#include <map>
+#include <mutex>
 #include <string>
+#include <string_view>
 #include <vector>
 
 static int g_checks = 0;
@@ -1187,6 +1194,45 @@ static void Run()
     CHECK(!ActorFind(env, DD_ACTOR_MONSTER, 14, &f));  // 怪物表里的英雄不算怪物
     CHECK(ActorFind(env, DD_ACTOR_MONSTER, 4501, &f) && f.raid_serial == 2 && f.battle_serial == 7);
 
+    // 枚举（F5）：队伍按 Raid+8 的顺序，每个指针都要在名册里；怪物按 Battle+0x38 的顺序，表里的英雄跳过
+    {
+        std::vector<std::uintptr_t> party = { Addr(e2, kEntryHero), Addr(stray, kEntryHero), 0, Addr(e1, kEntryHero), Addr(m1) };
+        PutVec(raid, kRaidHeroes, party);
+        DDActorRef list[4] = {};
+        CHECK(ActorListParty(env, list, 4) == 2);
+        CHECK(list[0].kind == DD_ACTOR_HERO && list[0].id == 13 && list[0].size == sizeof(DDActorRef) && list[0].campaign_serial == 3);
+        CHECK(list[1].id == 12 && list[1].roster == 0 && ActorResolve(env, list[1]) == hero1);
+        CHECK(ActorListParty(env, nullptr, 0) == 2);       // 只取个数
+        DDActorRef one[1] = {};
+        CHECK(ActorListParty(env, one, 1) == 2 && one[0].id == 13);  // 只写 capacity 个，返回总数
+        std::vector<std::uintptr_t> altParty = { Addr(alt, kEntryHero) };
+        PutVec(raid, kRaidHeroes, altParty);
+        CHECK(ActorListParty(env, list, 4) == 1 && list[0].id == 12 && list[0].roster == 1);  // 备用名册里的英雄带 roster 1
+        std::vector<std::uintptr_t> big(kMaxPartyHeroes + 1, Addr(e1, kEntryHero));
+        PutVec(raid, kRaidHeroes, big);
+        CHECK(ActorListParty(env, list, 4) == 0);          // 超过上限：当作结构读错
+        Put(raid, kRaidHeroes, Vec3{ 0x10, 0x18, 0x18 });  // 元素不可读（SEH）
+        CHECK(ActorListParty(env, list, 4) == 0);
+        PutVec(raid, kRaidHeroes, party);
+        CHECK(ActorListMonsters(env, list, 4) == 2);
+        CHECK(list[0].kind == DD_ACTOR_MONSTER && list[0].id == 4500 && list[0].battle_serial == 7 && list[0].raid_serial == 2);
+        CHECK(list[1].id == 4501 && ActorResolve(env, list[0]) == monster1);
+        ActorEnv other = env;
+        other.campaignActive = false;
+        CHECK(ActorListParty(other, list, 4) == 0 && ActorListMonsters(other, list, 4) == 0);
+        other = env;
+        other.heroVtable = nullptr;
+        CHECK(ActorListParty(other, list, 4) == 0 && ActorListMonsters(other, list, 4) == 2);
+        void* noRaid = nullptr;
+        other = env;
+        other.raidCurrent = &noRaid;
+        CHECK(ActorListParty(other, list, 4) == 0 && ActorListMonsters(other, list, 4) == 0);  // 城镇里没有 Raid
+        void* badRaid = AsPtr(0x10);
+        other.raidCurrent = &badRaid;
+        CHECK(ActorListParty(other, list, 4) == 0 && ActorListMonsters(other, list, 4) == 0);
+        Put(raid, kRaidHeroes, Vec3{ 0, 0, 0 });  // party 是这个块里的局部变量
+    }
+
     // 战斗取样：状态、guid 计数、怪物表的元素个数（含表里的英雄）
     {
         const ddc::BattleSample b = ReadBattleSample(&raidGlobal);
@@ -1779,6 +1825,1015 @@ static void TestChurnLog()
     CHECK(out.size() == 1 && churn.Idle());
 }
 
+// ---------------------------------------------------------------- combat 服务的逻辑（P4a）
+namespace combattest {
+
+using namespace ddc::combat;
+
+static DDActorRef Hero(std::uint32_t id, std::uint32_t campaign = 1)
+{
+    DDActorRef ref{};
+    ref.size = sizeof(ref);
+    ref.kind = DD_ACTOR_HERO;
+    ref.id = id;
+    ref.campaign_serial = campaign;
+    return ref;
+}
+
+static DDActorRef Monster(std::uint32_t guid, std::uint32_t battle)
+{
+    DDActorRef ref{};
+    ref.size = sizeof(ref);
+    ref.kind = DD_ACTOR_MONSTER;
+    ref.id = guid;
+    ref.campaign_serial = 1;
+    ref.raid_serial = 1;
+    ref.battle_serial = battle;
+    return ref;
+}
+
+static void TestHashAndEnums()
+{
+    CHECK(GameHash("") == 0);
+    CHECK(GameHash("ab") == 97u * 53u + 98u);
+    // 无符号 32 位回绕
+    std::uint32_t h = 0;
+    for (const char c : std::string("a_very_long_rule_name_for_overflow")) {
+        h = h * 53u + static_cast<unsigned char>(c);
+    }
+    CHECK(GameHash("a_very_long_rule_name_for_overflow") == h);
+    // 两个不同的名字哈希相同（规则注册要拒绝第二个）
+    CHECK(GameHash("Ab") == GameHash("B-"));
+
+    CHECK(EnumCount(DD_ENUM_STAT) == 102 && EnumCount(DD_ENUM_SOURCE) == 34 && EnumCount(DD_ENUM_DURATION) == 11 &&
+        EnumCount(DD_ENUM_RULE) == 55);
+    CHECK(EnumCount(9) == 0 && EnumName(9, 0) == nullptr && EnumValue(9, "always") == -1);
+    CHECK(std::string(EnumName(DD_ENUM_STAT, 2)) == "combat_stat_add");
+    CHECK(std::string(EnumName(DD_ENUM_STAT, 0x58)) == "hp_dot_burn");  // DOT 的值和 combat.md 的 [运行] 结论一致
+    CHECK(std::string(EnumName(DD_ENUM_STAT, 101)) == "disable_combat_skill");
+    CHECK(EnumName(DD_ENUM_STAT, 102) == nullptr && EnumName(DD_ENUM_STAT, -1) == nullptr);
+    CHECK(EnumValue(DD_ENUM_RULE, "is_actor_status") == 42 && EnumValue(DD_ENUM_RULE, "actorStatus") == 13);
+    CHECK(EnumValue(DD_ENUM_SOURCE, "skill") == 1 && EnumValue(DD_ENUM_SOURCE, "bsrc_skill") == 1);
+    CHECK(std::string(EnumName(DD_ENUM_SOURCE, 33)) == "last_hero");
+    CHECK(EnumValue(DD_ENUM_DURATION, "after_turn") == 9 && EnumValue(DD_ENUM_DURATION, "till_removed") == 6);
+    CHECK(EnumValue(DD_ENUM_STAT, "no_such_stat") == -1 && EnumValue(DD_ENUM_STAT, "") == -1);
+    // 来源表的三个标志（P4-0D：skill 三个都为真，notspecified 只回城清，quirk 都没有，companion 只进 tray）
+    CHECK(SourceFlags(1) == (DD_SOURCE_F_SAVED | DD_SOURCE_F_TOWN_CLEAR | DD_SOURCE_F_TRAY));
+    CHECK(SourceFlags(0) == DD_SOURCE_F_TOWN_CLEAR && SourceFlags(5) == 0 && SourceFlags(17) == DD_SOURCE_F_TRAY);
+    CHECK(SourceFlags(26) == DD_SOURCE_F_SAVED && SourceFlags(34) == 0 && SourceFlags(-1) == 0);
+    // 每张表名字和数值互查一致
+    for (std::uint32_t t = 0; t < 4; ++t) {
+        bool ok = true;
+        for (std::uint32_t i = 0; i < EnumCount(t); ++i) {
+            ok = ok && EnumValue(t, EnumName(t, static_cast<std::int32_t>(i))) == static_cast<std::int32_t>(i);
+        }
+        CHECK(ok);
+    }
+}
+
+static DDBuffDef GoodDef()
+{
+    DDBuffDef def{};
+    def.size = sizeof(def);
+    strcpy_s(def.id, "lua_shield_carrier");
+    def.stat_type = 2;
+    strcpy_s(def.stat_sub_type, "speed_rating");
+    def.amount = 1.0f;
+    def.duration = -1;
+    def.duration_type = 6;
+    def.source = 1;
+    def.rule_type = 42;
+    strcpy_s(def.rule_string, "lua_shielded");
+    return def;
+}
+
+static void TestValidation()
+{
+    std::string why;
+    DDBuffDef def = GoodDef();
+    CHECK(ValidateBuffDef(def, &why));
+    def.duration = 3;
+    CHECK(ValidateBuffDef(def, &why));
+    def.duration = 0;
+    CHECK(!ValidateBuffDef(def, &why) && why.find("duration") != std::string::npos);
+    def = GoodDef();
+    def.id[0] = 0;
+    CHECK(!ValidateBuffDef(def, &why));
+    def = GoodDef();
+    std::memset(def.id, 'x', sizeof(def.id));  // 没有结尾的 0
+    CHECK(!ValidateBuffDef(def, &why));
+    def = GoodDef();
+    strcpy_s(def.id, "bad\"id");
+    CHECK(!ValidateBuffDef(def, &why));
+    def = GoodDef();
+    def.stat_type = 102;
+    CHECK(!ValidateBuffDef(def, &why));
+    // C-Y3 / A-N4：sub_stat 按 stat 校验
+    def = GoodDef();
+    strcpy_s(def.stat_sub_type, "speed");  // 常见笔误：应为 speed_rating
+    CHECK(!ValidateBuffDef(def, &why) && why.find("speed_rating") != std::string::npos);
+    def.stat_sub_type[0] = 0;
+    CHECK(!ValidateBuffDef(def, &why) && why.find("不能为空") != std::string::npos);
+    def.stat_type = 3;
+    strcpy_s(def.stat_sub_type, "riposte_on_miss_chance");
+    CHECK(ValidateBuffDef(def, &why));
+    CHECK(ValidateSubStat(11, "death_blow", &why) && !ValidateSubStat(11, "", &why) && !ValidateSubStat(11, "deathblow", &why));
+    CHECK(ValidateSubStat(32, "activity_lock", &why) && !ValidateSubStat(32, "lock", &why));
+    CHECK(ValidateSubStat(33, "daze", &why) && !ValidateSubStat(33, "", &why));
+    CHECK(ValidateSubStat(9, "", &why) && ValidateSubStat(30, "unkown", &why) && !ValidateSubStat(10, "unknown", &why));
+    CHECK(ValidateSubStat(6, "", &why) && ValidateSubStat(98, "damage_heal", &why) && !ValidateSubStat(7, "heal", &why));
+    CHECK(ValidateSubStat(101, "any_skill_id", &why) && ValidateSubStat(0, "whatever", &why) && ValidateSubStat(26, "", &why));
+    def = GoodDef();
+    def.rule_type = 55;
+    CHECK(!ValidateBuffDef(def, &why));
+    def = GoodDef();
+    def.source = -1;
+    CHECK(!ValidateBuffDef(def, &why));
+    def = GoodDef();
+    def.duration_type = 11;
+    CHECK(!ValidateBuffDef(def, &why));
+    def = GoodDef();
+    def.amount = std::numeric_limits<float>::quiet_NaN();
+    CHECK(!ValidateBuffDef(def, &why));
+
+    DDBuffAddOptions options{};
+    options.size = sizeof(options);
+    CHECK(ValidateAddOptions(options, &why));
+    options.duration = 0;  // 没有 DD_BUFF_ADD_DURATION 时不检查
+    CHECK(ValidateAddOptions(options, &why));
+    options.flags = DD_BUFF_ADD_DURATION;
+    CHECK(!ValidateAddOptions(options, &why));
+    options.duration = 2;
+    CHECK(ValidateAddOptions(options, &why));
+    options.flags |= DD_BUFF_ADD_SOURCE;
+    options.source = 34;
+    CHECK(!ValidateAddOptions(options, &why));
+    options.source = 6;
+    options.flags |= DD_BUFF_ADD_DURATION_TYPE | DD_BUFF_ADD_NO_REFRESH | DD_BUFF_ADD_SOURCEDATA;
+    options.duration_type = 10;
+    CHECK(ValidateAddOptions(options, &why));
+    options.flags |= 0x100;
+    CHECK(!ValidateAddOptions(options, &why));
+
+    DDBuffRemoveSpec spec{};
+    spec.size = sizeof(spec);
+    CHECK(ValidateRemoveSpec(spec, &why));
+    spec.match = DD_BUFF_BY_SOURCE;
+    spec.source = 40;
+    CHECK(!ValidateRemoveSpec(spec, &why));
+    spec.source = 13;
+    CHECK(ValidateRemoveSpec(spec, &why));
+    spec.match = 7;
+    CHECK(!ValidateRemoveSpec(spec, &why));
+
+    CHECK(ValidText("abc", false) && !ValidText("", false) && ValidText("", true));
+    CHECK(!ValidText(std::string(64, 'a'), false) && ValidText(std::string(63, 'a'), false));
+    CHECK(!ValidText("a\nb", false));
+}
+
+static void TestTiming()
+{
+    TimingState s;
+    s.mainThread = true;
+    s.campaignActive = true;
+    s.inFrameBody = true;
+    auto d = DecideTiming(s, true);
+    CHECK(d.timing == Timing::Execute && d.code == DD_COMBAT_OK && IsSafePoint(s));
+    // 事件派发中、DDCore 自己的游戏调用里、帧边界之外（游戏代码在栈上）：排队
+    s.dispatchDepth = 1;
+    d = DecideTiming(s, true);
+    CHECK(d.timing == Timing::Queue && d.code == DD_COMBAT_QUEUED && !IsSafePoint(s));
+    s.dispatchDepth = 0;
+    s.gameCallDepth = 1;
+    CHECK(DecideTiming(s, true).timing == Timing::Queue);
+    s.gameCallDepth = 0;
+    s.inFrameBody = false;
+    CHECK(DecideTiming(s, true).timing == Timing::Queue);
+    s.inFrameBody = true;
+    // 拒绝的情况，规则回调优先于一切（不排队）
+    TimingState r = s;
+    r.inRule = true;
+    r.dispatchDepth = 3;
+    d = DecideTiming(r, true);
+    CHECK(d.timing == Timing::Reject && d.code == DD_COMBAT_E_IN_RULE);
+    r = s;
+    r.mainThread = false;
+    CHECK(DecideTiming(r, true).code == DD_COMBAT_E_THREAD);
+    r = s;
+    r.campaignActive = false;
+    CHECK(DecideTiming(r, true).code == DD_COMBAT_E_NO_CAMPAIGN);
+    CHECK(DecideTiming(r, false).timing == Timing::Execute);
+    r = s;
+    r.loading = true;
+    r.dispatchDepth = 1;  // 加载中即使在事件回调里也拒绝，不排队
+    CHECK(DecideTiming(r, true).code == DD_COMBAT_E_LOADING);
+    r = s;
+    r.pvp = true;
+    CHECK(DecideTiming(r, true).code == DD_COMBAT_E_PVP);
+}
+
+static void TestQueue()
+{
+    OpQueue queue(3);
+    QueuedOp op;
+    op.owner = 1;
+    op.text = "a";
+    const auto id1 = queue.Push(op);
+    op.text = "b";
+    const auto id2 = queue.Push(op);
+    op.text = "c";
+    const auto id3 = queue.Push(op);
+    CHECK(id1 == 1 && id2 == 2 && id3 == 3);
+    op.text = "d";
+    CHECK(queue.Push(op) == 0);  // 插件 1 超过上限
+    QueuedOp other;
+    other.owner = 2;
+    other.kind = OpKind::EffectApply;
+    CHECK(queue.Push(other) == 4);  // 别的插件不受影响
+    CHECK(queue.Size() == 4 && queue.OwnerCount(1) == 3 && queue.OwnerCount(2) == 1);
+    auto taken = queue.TakeAll();
+    CHECK(taken.size() == 4 && taken[0].text == "a" && taken[1].text == "b" && taken[2].text == "c" && taken[3].owner == 2);
+    CHECK(taken[3].kind == OpKind::EffectApply && taken[0].id == 1 && taken[3].id == 4);
+    CHECK(queue.Size() == 0 && queue.OwnerCount(1) == 0);
+    CHECK(queue.Push(op) == 5);  // 取走以后计数清零，操作号继续增长
+    queue.Push(other);
+    CHECK(queue.DropOwner(1) == 1 && queue.Size() == 1 && queue.OwnerCount(1) == 0);
+}
+
+static void TestTags()
+{
+    TagTable tags;
+    const DDActorRef h1 = Hero(7);
+    const DDActorRef h2 = Hero(8);
+    tags.Set(h1, 10, 1, "shield");
+    tags.Set(h1, 11, 1, "shield");
+    tags.Set(h1, 12, 2, "shield");
+    tags.Set(h1, 13, 1, "");
+    tags.Set(h2, 10, 1, "shield");
+    CHECK(tags.Size() == 5);
+    const TagEntry* e = tags.Get(h1, 12);
+    CHECK(e && e->owner == 2 && e->tag == "shield");
+    CHECK(tags.Get(h1, 99) == nullptr);
+    auto found = tags.Find(h1, 1, "shield");
+    CHECK(found.size() == 2 && found[0] == 10 && found[1] == 11);  // 只要本插件的，别的 actor 不算
+    CHECK(tags.Find(h1, 2, "shield").size() == 1 && tags.Find(h1, 1, "none").empty());
+    // 句柄的存档序号不同就是另一个 actor
+    CHECK(tags.Find(Hero(7, 2), 1, "shield").empty());
+    // 条目不在了的 guid 删掉
+    CHECK(tags.PruneActor(h1, { 11, 13 }) == 2);
+    CHECK(tags.Get(h1, 10) == nullptr && tags.Get(h1, 11) && tags.Get(h1, 13) && tags.Get(h2, 10));
+    // 怪物：战斗序号变了，旧句柄的记录在战斗结束时清掉
+    tags.Set(Monster(4500, 1), 1, 1, "x");
+    tags.Set(Monster(4500, 2), 1, 1, "y");
+    const std::size_t removed = tags.PruneIf([](const DDActorRef& ref) { return ref.kind == DD_ACTOR_MONSTER && ref.battle_serial != 2; });
+    CHECK(removed == 1 && tags.Get(Monster(4500, 2), 1) && !tags.Get(Monster(4500, 1), 1));
+    CHECK(tags.Erase(h1, 13) && !tags.Erase(h1, 13));
+    CHECK(tags.DropOwner(1) == 3 && tags.Size() == 0);
+}
+
+// 标签表随存档保存（P4c1）：导出只留还能解析、条目还在的；导入按当前存档重新取句柄，对不上的丢弃
+static void TestTagPersist()
+{
+    // 假的游戏：英雄 7 在名册里，条目 10（lua_shield）、11（SPD5）；英雄 8 解雇了；怪物 4500 在当前战斗（序号 2）里，条目 3
+    std::map<std::pair<std::uint32_t, std::uint32_t>, std::string> entries = { { { 7, 10 }, "lua_shield" }, { { 7, 11 }, "SPD5" }, { { 4500, 3 }, "bleed" } };
+    TagLookup lookup;
+    lookup.findActor = [](std::uint32_t kind, std::uint32_t id, DDActorRef* out) {
+        if ((kind == DD_ACTOR_HERO && id == 7) || (kind == DD_ACTOR_MONSTER && id == 4500)) {
+            *out = kind == DD_ACTOR_HERO ? Hero(id, 3) : Monster(id, 2);  // 读档后：存档序号 3，战斗序号 2
+            return true;
+        }
+        return false;
+    };
+    lookup.entry = [&](const DDActorRef& ref, std::uint32_t guid, std::string* id) {
+        if ((ref.kind == DD_ACTOR_HERO && ref.id == 8) || (ref.kind == DD_ACTOR_MONSTER && ref.battle_serial != 2)) {
+            return false;  // 解析不了
+        }
+        const auto it = entries.find({ ref.id, guid });
+        if (it == entries.end()) {
+            return false;
+        }
+        *id = it->second;
+        return true;
+    };
+    lookup.pluginName = [](std::uint32_t owner) { return owner == 1 ? std::string("DDLua") : std::string("test_combat"); };
+    lookup.ownerOf = [](const std::string& name, bool* found) -> std::uint32_t {
+        *found = name == "DDLua" || name == "test_combat";
+        return name == "DDLua" ? 1u : 2u;
+    };
+    TagTable live;
+    live.Set(Hero(7), 10, 1, "p4c_persist:s1");
+    live.Set(Hero(7), 12, 1, "gone");        // 条目已经删了
+    live.Set(Hero(8), 1, 2, "fired");        // 英雄解雇了
+    live.Set(Monster(4500, 2), 3, 2, "m");
+    live.Set(Monster(4500, 1), 3, 2, "old");  // 上一场战斗
+    const auto records = CollectTags(live, lookup);
+    CHECK(records.size() == 2);
+    CHECK(records[0].kind == DD_ACTOR_HERO && records[0].id == 7 && records[0].guid == 10 && records[0].buffId == "lua_shield" &&
+        records[0].plugin == "DDLua" && records[0].tag == "p4c_persist:s1");
+    CHECK(records[1].kind == DD_ACTOR_MONSTER && records[1].id == 4500 && records[1].plugin == "test_combat" && records[1].buffId == "bleed");
+
+    // 读档：再加几条对不上的
+    std::vector<TagRecord> saved = records;
+    saved.push_back({ DD_ACTOR_HERO, 7, 0, 11, "lua_shield", "DDLua", "wrong_id" });   // guid 在，id 变了
+    saved.push_back({ DD_ACTOR_HERO, 7, 0, 99, "lua_shield", "DDLua", "missing" });    // 条目不在
+    saved.push_back({ DD_ACTOR_HERO, 9, 0, 1, "x", "DDLua", "no_hero" });              // 英雄不在
+    saved.push_back({ DD_ACTOR_HERO, 7, 1, 10, "lua_shield", "DDLua", "alt" });        // 备用名册
+    saved.push_back({ DD_ACTOR_HERO, 7, 0, 10, "lua_shield", "gone_plugin", "p" });    // 插件没加载
+    TagTable restored;
+    std::vector<std::string> notes;
+    CHECK(RestoreTags(restored, saved, 1u << DD_ACTOR_HERO, lookup, &notes) == 1);  // 只恢复英雄
+    CHECK(restored.Size() == 1 && restored.Get(Hero(7, 3), 10) && restored.Get(Hero(7, 3), 10)->tag == "p4c_persist:s1" && restored.Get(Hero(7, 3), 10)->owner == 1);
+    CHECK(notes.size() == 5);
+    std::string all;
+    for (const auto& n : notes) {
+        all += n + "\n";
+    }
+    CHECK(all.find("id 对不上（现在是 SPD5）") != std::string::npos && all.find("条目不在") != std::string::npos && all.find("actor 找不到") != std::string::npos);
+    CHECK(all.find("备用名册") != std::string::npos && all.find("插件没有加载") != std::string::npos);
+    // 怪物：raid 核对通过以后按当前战斗的句柄恢复
+    notes.clear();
+    CHECK(RestoreTags(restored, saved, 1u << DD_ACTOR_MONSTER, lookup, &notes) == 1 && notes.empty());
+    CHECK(restored.Get(Monster(4500, 2), 3) && restored.Get(Monster(4500, 2), 3)->owner == 2);
+    CHECK(RestoreTags(restored, saved, 0, lookup, nullptr) == 0);
+}
+
+static int g_ruleCalls = 0;
+static uint32_t DD_CALL RuleTrue(const DDRuleContext*, void*)
+{
+    ++g_ruleCalls;
+    return DD_RULE_TRUE;
+}
+
+static void TestRules()
+{
+    RuleRegistry rules;
+    const RuleSnapshot* empty = rules.Snapshot();
+    CHECK(empty && empty->entries.empty() && empty->Find(GameHash("x")) == nullptr);
+    std::string why;
+    const DDRuleId a = rules.Register(1, "lua_shielded", &RuleTrue, nullptr, &why);
+    const DDRuleId b = rules.Register(2, "Ab", &RuleTrue, nullptr, &why);
+    CHECK(a != 0 && b != 0 && a != b && rules.Count() == 2);
+    CHECK(rules.Register(3, "lua_shielded", &RuleTrue, nullptr, &why) == 0 && why.find("已经注册") != std::string::npos);
+    CHECK(rules.Register(3, "B-", &RuleTrue, nullptr, &why) == 0 && why.find("哈希相同") != std::string::npos);
+    // A-N3：游戏内置的状态名（479F41 起比较的全局哈希，静态初始化写入的值）不能注册
+    CHECK(GameHash("stunned") == 0xF9DA5CF5u && GameHash("tagged") == 0x7A03648Cu && GameHash("poisoned") == 0x3D3CFC95u &&
+        GameHash("bleeding") == 0x3830C076u && GameHash("burning") == 0x56AFD351u && GameHash("virtued") == 0x619A4DE3u &&
+        GameHash("afflicted") == 0x77CDD742u && GameHash("dazed") == 0x2FE99588u);
+    for (const char* builtin : { "stunned", "tagged", "poisoned", "bleeding", "burning", "virtued", "afflicted", "dazed" }) {
+        CHECK(rules.Register(3, builtin, &RuleTrue, nullptr, &why) == 0 && why.find("内置") != std::string::npos);
+    }
+    CHECK(rules.Register(3, "", &RuleTrue, nullptr, &why) == 0);
+    CHECK(rules.Register(3, "no_fn", nullptr, nullptr, &why) == 0);
+    const RuleSnapshot* snap = rules.Snapshot();
+    CHECK(snap != empty && snap->entries.size() == 2);
+    const RuleEntry* hit = snap->Find(GameHash("lua_shielded"));
+    CHECK(hit && hit->owner == 1 && hit->name == "lua_shielded" && hit->fn(nullptr, nullptr) == DD_RULE_TRUE && g_ruleCalls == 1);
+    CHECK(snap->Find(GameHash("lua_other")) == nullptr);
+    // 撤销：只能撤销自己的；旧快照仍然可读，条目被标成停用
+    CHECK(!rules.Unregister(2, a));
+    CHECK(rules.Unregister(1, a) && rules.Count() == 1);
+    CHECK(hit->disabled.load() && snap->entries.size() == 2);
+    CHECK(rules.Snapshot()->Find(GameHash("lua_shielded")) == nullptr);
+    CHECK(rules.Register(3, "lua_shielded", &RuleTrue, nullptr, &why) != 0);  // 撤销后可以重新注册
+    CHECK(rules.DropOwner(2) == 1 && rules.DropOwner(3) == 1 && rules.Count() == 0 && rules.Snapshot()->entries.empty());
+
+    // 回调的三种结果（P4c1 遗留修正）：成立 / 不成立按 is_false_rule 取反，交还原函数和不认识的值都交给游戏
+    bool result = false;
+    CHECK(InterpretRule(DD_RULE_TRUE, false, &result) && result);
+    CHECK(InterpretRule(DD_RULE_TRUE, true, &result) && !result);
+    CHECK(InterpretRule(DD_RULE_FALSE, false, &result) && !result);
+    CHECK(InterpretRule(DD_RULE_FALSE, true, &result) && result);
+    result = true;
+    CHECK(!InterpretRule(DD_RULE_ORIGINAL, false, &result) && result);  // 不写 result
+    CHECK(!InterpretRule(DD_RULE_ORIGINAL, true, &result) && !InterpretRule(7, false, &result));
+
+    RuleStatsAccum stats;
+    stats.Add(10.0);
+    stats.Add(30.0);
+    stats.EndFrame();
+    stats.Add(5.0);
+    CHECK(stats.hits == 3 && stats.maxCallUs == 30.0 && stats.maxFrameUs == 40.0 && stats.maxFrameHits == 2 && stats.frameHits == 1);
+    stats.EndFrame();
+    CHECK(stats.maxFrameUs == 40.0 && stats.frameUs == 0.0);
+}
+
+static void TestEffectText()
+{
+    std::vector<std::string> names;
+    std::string why;
+    CHECK(ExtractEffectNames("effect: .name \"lua_fx_a\" .target \"performer\" .chance 100%\r\n", &names, &why));
+    CHECK(names.size() == 1 && names[0] == "lua_fx_a");
+    CHECK(ExtractEffectNames("effect: .name \"a\" .target \"performer\" .chance 100%\neffect: .name b .target target .stress 5\n  effect: .name \"c\" .target \"global\"\n", &names, &why));
+    CHECK(names.size() == 3 && names[0] == "a" && names[1] == "b" && names[2] == "c");
+    // 值里的冒号让游戏从那里开始一个新块（引号开头的块是解析错误）
+    CHECK(!ExtractEffectNames("effect: .name_suffix \"x\" .name \"real\" .keyStatus \"effect: no\"\n", &names, &why));
+    CHECK(!ExtractEffectNames("effect: .name \"a\" .set_mode x:y .chance 100%\n", &names, &why) && why.find("不是 effect") != std::string::npos);
+    CHECK(!ExtractEffectNames("effect: .target \"performer\"\n", &names, &why) && why.find(".name") != std::string::npos);
+    CHECK(!ExtractEffectNames("effect: .name \"a\"\neffect: .name \"a\"\n", &names, &why) && why.find("重复") != std::string::npos);
+    CHECK(!ExtractEffectNames("effect: .name \"Ab\"\neffect: .name \"B-\"\n", &names, &why) && why.find("哈希") != std::string::npos);
+    CHECK(!ExtractEffectNames("effect: .name \"unterminated\n", &names, &why));
+    CHECK(!ExtractEffectNames("no blocks here", &names, &why));
+    CHECK(!ExtractEffectNames(("effect: .name \"" + std::string(64, 'x') + "\"\n").c_str(), &names, &why));
+
+    // A-S1：游戏的 36F020 取最后一次出现的 .name，键后面不要求空白，# 注释里的也算，\v 也是空白
+    CHECK(ExtractEffectNames("effect: .name \"a\" .name \"b\" .target \"performer\"\n", &names, &why) && names.size() == 1 && names[0] == "b");
+    CHECK(ExtractEffectNames("effect: .name \"myfx\" .target \"performer\" .name\"rakebuff_5\"\r\n", &names, &why) &&
+        names.size() == 1 && names[0] == "rakebuff_5");
+    CHECK(ExtractEffectNames("effect: .name \"myfx\" .target \"performer\" .name2 x\r\n", &names, &why) && names.size() == 1 && names[0] == "2");
+    CHECK(ExtractEffectNames("effect: .name \"mine\" .target \"performer\"\n# .name rakebuff_5\n", &names, &why) && names.size() == 1 && names[0] == "rakebuff_5");
+    CHECK(ExtractEffectNames("effect: .name \"a\" .target \"performer\" .name\x0brakebuff_5\n", &names, &why) && names.size() == 1 && names[0] == "rakebuff_5");
+    // 2901B0 先去掉 // 和 /* */ 注释（引号里的也算）
+    CHECK(ExtractEffectNames("/* effect: .name \"x\" */ effect: .name \"y\" .target \"performer\" // .name \"z\"\n", &names, &why) && names.size() == 1 &&
+        names[0] == "y");
+    CHECK(ExtractEffectNames("effect: .name \"a\" .target \"performer\"\neffect: .name b .target target\n", &names, &why) && names.size() == 2);
+
+    // A-B1：块（到下一个标识符之前，# 注释和空白都算）达到 1024 字节时游戏进程会被终止
+    const auto block = [](std::size_t length) {
+        std::string t = "effect: .name \"long\" .target \"performer\"";
+        t += std::string(length - t.size(), ' ');
+        return t;
+    };
+    std::vector<EffectBlock> blocks;
+    CHECK(ParseEffectText(block(1023), &blocks, &why) && blocks.size() == 1 && blocks[0].length == 1023);
+    CHECK(!ParseEffectText(block(1024), &blocks, &why) && why.find("1023") != std::string::npos);
+    CHECK(ExtractEffectNames(block(1023) + "\neffect: .name b .target target", &names, &why) && names.size() == 2);
+    CHECK(!ExtractEffectNames(block(1023) + " \neffect: .name b", &names, &why));  // 换行前的空格也在第一块里
+    std::string fields = "effect: .name \"longfx\" .target \"performer\" .chance 100%";
+    while (fields.size() < 1100) {
+        fields += " .stress 1";
+    }
+    CHECK(!ExtractEffectNames(fields + "\r\n", &names, &why) && why.find("超过") != std::string::npos);
+    CHECK(!ExtractEffectNames("effect: .name \"cfx\" .target \"performer\"\r\n# " + std::string(1100, 'x') + "\r\n", &names, &why));
+    CHECK(!ExtractEffectNames("other: " + std::string(1100, 'x') + "\neffect: .name a\n", &names, &why) && why.find("第 1 块") != std::string::npos);
+    CHECK(ExtractEffectNames("effect: .name \"cfx\" .target \"performer\"\r\n// " + std::string(1100, 'x') + "\r\n", &names, &why) && names.size() == 1);
+    CHECK(ExtractEffectNames("# " + std::string(2000, 'x') + "\neffect: .name a .target target\n", &names, &why) && names.size() == 1);  // 块前面的注释不算
+
+    // 列表字段的某一项以块末尾的引号开头：游戏算出 0 的缓冲大小，进程被终止
+    CHECK(!ExtractEffectNames("effect: .name a .buff_ids \"x\" \"", &names, &why) && why.find(".buff_ids") != std::string::npos);
+    CHECK(!ExtractEffectNames("effect: .name a .kill_enemy_types \"\neffect: .name b", &names, &why));
+    CHECK(ExtractEffectNames("effect: .name a .target target .buff_ids \"x\"\neffect: .name b .target target .buff_ids \"y\" \"z\"", &names, &why) && names.size() == 2);
+    CHECK(ExtractEffectNames("effect: .name a .target target .summon_monsters \"x\r\n", &names, &why));  // 没闭合但不是最后一个字符
+    CHECK(ExtractEffectNames("effect: .name a .target target .buff_ids \"x\" # \xE4\xB8\xAD\n", &names, &why));  // 列表后面的中文注释：块不以引号结尾
+    CHECK(!ExtractEffectNames("effect: .name a .buff_ids \xE4\xB8\xAD\"", &names, &why) && why.find("区域设置") != std::string::npos);
+
+    // 其他会让解析器出问题的文本
+    CHECK(!ExtractEffectNames("::effect: .name a", &names, &why) && why.find("死循环") != std::string::npos);
+    CHECK(!ExtractEffectNames(std::string("effect: .name a\0 effect: .name b", 32), &names, &why));
+    CHECK(!ExtractEffectNames("\xEF\xBB\xBF" "effect: .name a", &names, &why));  // BOM
+    CHECK(!ExtractEffectNames("effect: .name \xE4\xB8\xAD\n", &names, &why) && why.find("区域设置") != std::string::npos);
+    CHECK(ExtractEffectNames("effect: .name \"\xE4\xB8\xAD\" .target \"performer\" # \xE4\xB8\xAD\xE6\x96\x87\n", &names, &why) && names.size() == 1);
+    // .target 缺少或认不出：游戏弹 assert（EffectTarget: Invalid type）
+    CHECK(!ExtractEffectNames("effect: .name a\n", &names, &why) && why.find("缺少 .target") != std::string::npos);
+    CHECK(!ExtractEffectNames("effect: .name a .target \"self\"\n", &names, &why) && why.find("self") != std::string::npos);
+    CHECK(ExtractEffectNames("effect: .name a .target \"other_trinket\"\n", &names, &why));
+
+    OwnerTable owners;
+    CHECK(owners.OwnerOf(GameHash("a")) == 0);
+    owners.Set(GameHash("a"), 3, "a");
+    CHECK(owners.OwnerOf(GameHash("a")) == 3 && owners.NameOf(GameHash("a")) && *owners.NameOf(GameHash("a")) == "a");
+    owners.Clear();
+    CHECK(owners.Size() == 0);
+}
+
+static void Run()
+{
+    TestHashAndEnums();
+    TestValidation();
+    TestTiming();
+    TestQueue();
+    TestTags();
+    TestTagPersist();
+    TestRules();
+    TestEffectText();
+}
+
+}  // namespace combattest
+
+// ---------------------------------------------------------------- persist 旁路（P4c1）
+namespace persisttest {
+
+using namespace ddc::persist;
+
+std::wstring g_root;
+
+void RemoveTree(const std::wstring& dir)
+{
+    WIN32_FIND_DATAW data{};
+    HANDLE find = FindFirstFileW((dir + L"\\*").c_str(), &data);
+    if (find != INVALID_HANDLE_VALUE) {
+        do {
+            const std::wstring name = data.cFileName;
+            if (name == L"." || name == L"..") {
+                continue;
+            }
+            const std::wstring path = dir + L"\\" + name;
+            if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                RemoveTree(path);
+            } else {
+                DeleteFileW(path.c_str());
+            }
+        } while (FindNextFileW(find, &data));
+        FindClose(find);
+    }
+    RemoveDirectoryW(dir.c_str());
+}
+
+std::string ReadText(const std::wstring& path)
+{
+    std::string out;
+    bool exists = false;
+    ReadWhole(path, &out, &exists, nullptr);
+    return exists ? out : std::string("<missing>");
+}
+
+void WriteRaw(const std::wstring& path, std::string_view bytes)
+{
+    const std::size_t slash = path.find_last_of(L'\\');
+    EnsureDir(path.substr(0, slash));
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    DWORD wrote = 0;
+    WriteFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &wrote, nullptr);
+    CloseHandle(file);
+}
+
+Header MakeHeader(std::uint64_t roster, bool inRaid = false, std::uint64_t raid = 0)
+{
+    Header h;
+    h.plugin = "DDLua";
+    h.key = "p4c_persist";
+    h.version = "1.2.3";
+    h.device = "steam_profile_4";
+    h.account = "12345678";
+    h.writtenMs = 1763100000123ull;
+    h.inRaid = inRaid;
+    h.files.push_back({ kRosterFile, roster, 7948 });
+    if (inRaid) {
+        h.files.push_back({ kRaidFile, raid, 5120 });
+    }
+    return h;
+}
+
+Observed MakeObserved(std::uint64_t roster, int inRaid = 0)
+{
+    Observed o;
+    o.device = "steam_profile_4";
+    o.rosterKnown = true;
+    o.roster = { kRosterFile, roster, 7948 };
+    o.inRaid = inRaid;
+    return o;
+}
+
+Candidate MakeCandidate(const Header& h, std::string payload)
+{
+    Candidate c;
+    c.exists = true;
+    c.decoded = true;
+    c.header = h;
+    c.payload = std::move(payload);
+    return c;
+}
+
+void TestHashAndKeys()
+{
+    CHECK(Fnv1a64("", 0) == 0xCBF29CE484222325ull);
+    CHECK(Fnv1a64("a", 1) == 0xAF63DC4C8601EC8Cull);
+    CHECK(Fnv1a64("foobar", 6) == 0x85944171F73967E8ull);
+    CHECK(ValidKey("p4c_persist") && ValidKey("tags") && ValidKey("a.b-c_1") && ValidKey(std::string(63, 'k')));
+    CHECK(!ValidKey("") && !ValidKey(".hidden") && !ValidKey("a/b") && !ValidKey("a\\b") && !ValidKey("a b") && !ValidKey(std::string(64, 'k')));
+    CHECK(!ValidKey("..") && !ValidKey("中文"));
+    CHECK(ValidDevice("steam_profile_4") && ValidDevice("profile_0") && !ValidDevice("") && !ValidDevice("a:b") && !ValidDevice("..\\x"));
+}
+
+void TestFormat()
+{
+    Header h = MakeHeader(0x3F6923FB884EEBCAull, true, 0x1122334455667788ull);
+    h.inBattle = true;
+    h.version = "1.0\n注入";  // 换行变成空格
+    std::string payload("store\n{\"n\":1}\0bin\xff", 18);
+    const std::string bytes = EncodeFile(h, payload);
+    CHECK(bytes.rfind("DDSAVE 1\nplugin DDLua\nkey p4c_persist\n", 0) == 0);
+    CHECK(bytes.find("file persist.roster.json 3F6923FB884EEBCA 7948\n") != std::string::npos);
+    Header back;
+    std::string data, why;
+    CHECK(DecodeFile(bytes, &back, &data, &why));
+    CHECK(data == payload && back.plugin == "DDLua" && back.key == "p4c_persist" && back.version == "1.0 注入");
+    CHECK(back.device == "steam_profile_4" && back.account == "12345678" && back.writtenMs == 1763100000123ull && back.inRaid && back.inBattle);
+    CHECK(back.files.size() == 2 && back.Find(kRaidFile) && back.Find(kRaidFile)->hash == 0x1122334455667788ull && back.Find(kRaidFile)->size == 5120);
+    // 空数据
+    CHECK(DecodeFile(EncodeFile(MakeHeader(1), ""), &back, &data, &why) && data.empty() && !back.inRaid && back.files.size() == 1);
+    // 写到一半：数据被截断
+    CHECK(!DecodeFile(bytes.substr(0, bytes.size() - 3), &back, &data, &why) && why.find("截断") != std::string::npos);
+    // 头也没写完
+    CHECK(!DecodeFile(bytes.substr(0, 40), &back, &data, &why) && why.find("截断") != std::string::npos);
+    // 数据被改
+    std::string flipped = bytes;
+    flipped[flipped.size() - 1] ^= 0x01;
+    CHECK(!DecodeFile(flipped, &back, &data, &why) && why.find("校验和") != std::string::npos);
+    CHECK(!DecodeFile(bytes + "x", &back, &data, &why) && why.find("长") != std::string::npos);
+    CHECK(!DecodeFile("hello\n\n", &back, &data, &why) && why.find("DDSAVE") != std::string::npos);
+    CHECK(!DecodeFile("DDSAVE 2\n\n", &back, &data, &why) && why.find("格式版本") != std::string::npos);
+    CHECK(!DecodeFile("DDSAVE 1\nplugin x\n\n", &back, &data, &why) && why.find("缺少") != std::string::npos);
+    CHECK(!DecodeFile("", &back, &data, &why));
+}
+
+void TestDecide()
+{
+    const std::uint64_t r1 = 0x1111, r2 = 0x2222, r3 = 0x3333;
+    const Candidate none;
+    std::string why;
+    // 当前一代一致
+    Decision d = Decide(MakeCandidate(MakeHeader(r1), "cur"), MakeCandidate(MakeHeader(r2), "prev"), MakeObserved(r1));
+    CHECK(d.status == DD_PERSIST_LOADED && d.which == 0 && d.reason.empty());
+    // 只有上一代一致（旁路比游戏多写了一次：游戏的写盘没落地就退出）
+    d = Decide(MakeCandidate(MakeHeader(r2), "cur"), MakeCandidate(MakeHeader(r1), "prev"), MakeObserved(r1));
+    CHECK(d.status == DD_PERSIST_PREV && d.which == 1 && d.reason.find("名册的哈希不同") != std::string::npos);
+    // 都不一致：不给数据，两代的原因都写出来
+    d = Decide(MakeCandidate(MakeHeader(r2), "cur"), MakeCandidate(MakeHeader(r3), "prev"), MakeObserved(r1));
+    CHECK(d.status == DD_PERSIST_MISMATCH && d.which == -1 && d.reason.find("当前一代") != std::string::npos &&
+        d.reason.find("上一代") != std::string::npos);
+    // 没有上一代
+    d = Decide(MakeCandidate(MakeHeader(r2), "cur"), none, MakeObserved(r1));
+    CHECK(d.status == DD_PERSIST_MISMATCH && d.reason.find("没有文件") != std::string::npos);
+    // 无数据（新战役、从没写过）
+    d = Decide(none, none, MakeObserved(r1));
+    CHECK(d.status == DD_PERSIST_EMPTY && d.which == -1);
+    // 没观察到名册的读取：不能判断
+    Observed unknown = MakeObserved(r1);
+    unknown.rosterKnown = false;
+    d = Decide(MakeCandidate(MakeHeader(r1), "cur"), none, unknown);
+    CHECK(d.status == DD_PERSIST_UNAVAILABLE && d.reason.find("名册") != std::string::npos);
+    // 当前一代损坏（写到一半），上一代一致
+    Candidate broken;
+    broken.exists = true;
+    broken.decoded = false;
+    broken.error = "数据只有 3 字节（文件被截断，写到一半？）";
+    d = Decide(broken, MakeCandidate(MakeHeader(r1), "prev"), MakeObserved(r1));
+    CHECK(d.status == DD_PERSIST_PREV && d.reason.find("损坏") != std::string::npos);
+    // 只有 .prev（当前一代丢了）
+    d = Decide(none, MakeCandidate(MakeHeader(r1), "prev"), MakeObserved(r1));
+    CHECK(d.status == DD_PERSIST_PREV);
+    // 城镇和地牢对不上
+    d = Decide(MakeCandidate(MakeHeader(r1, true, 9), "cur"), none, MakeObserved(r1, 0));
+    CHECK(d.status == DD_PERSIST_MISMATCH && d.reason.find("地牢") != std::string::npos);
+    d = Decide(MakeCandidate(MakeHeader(r1), "cur"), none, MakeObserved(r1, 1));
+    CHECK(d.status == DD_PERSIST_MISMATCH && d.reason.find("城镇") != std::string::npos);
+    d = Decide(MakeCandidate(MakeHeader(r1, true, 9), "cur"), none, MakeObserved(r1, 1));
+    CHECK(d.status == DD_PERSIST_LOADED);
+    // 设备、大小
+    Header other = MakeHeader(r1);
+    other.device = "steam_profile_9";
+    CHECK(!Matches(other, MakeObserved(r1), &why) && why.find("设备名") != std::string::npos);
+    Observed sized = MakeObserved(r1);
+    sized.roster.size = 1;
+    CHECK(!Matches(MakeHeader(r1), sized, &why));
+    // raid 的核对
+    const Header inRaid = MakeHeader(r1, true, 0xABCD);
+    CHECK(RaidMatches(inRaid, { kRaidFile, 0xABCD, 5120 }, &why));
+    CHECK(!RaidMatches(inRaid, { kRaidFile, 0xABCE, 5120 }, &why) && why.find("persist.raid.json") != std::string::npos);
+    CHECK(!RaidMatches(MakeHeader(r1), { kRaidFile, 0xABCD, 5120 }, &why));
+    // 不一致时要归档原来的两代（F2，审核 S3）
+    d = Decide(MakeCandidate(MakeHeader(r2), "cur"), MakeCandidate(MakeHeader(r3), "prev"), MakeObserved(r1));
+    CHECK(d.archive == "mismatch");
+    CHECK(Decide(MakeCandidate(MakeHeader(r1), "cur"), none, MakeObserved(r1)).archive.empty() && Decide(none, none, MakeObserved(r1)).archive.empty());
+
+    // 地牢里的存档，读档前已经读到 raid（F2，审核 S1）：当前一代名册一致、raid 不一致，上一代都一致 → PREV
+    Observed raidSeen = MakeObserved(r1, 1);
+    raidSeen.raidKnown = true;
+    raidSeen.raid = { kRaidFile, 0xAAAA, 5120 };
+    d = Decide(MakeCandidate(MakeHeader(r1, true, 0xBBBB), "cur"), MakeCandidate(MakeHeader(r1, true, 0xAAAA), "prev"), raidSeen);
+    CHECK(d.status == DD_PERSIST_PREV && d.which == 1 && d.reason.find("persist.raid.json") != std::string::npos);
+    // 两代的 raid 都不一致：MISMATCH，不给数据
+    d = Decide(MakeCandidate(MakeHeader(r1, true, 0xBBBB), "cur"), MakeCandidate(MakeHeader(r1, true, 0xCCCC), "prev"), raidSeen);
+    CHECK(d.status == DD_PERSIST_MISMATCH && d.which == -1 && d.archive == "mismatch");
+    CHECK(Decide(MakeCandidate(MakeHeader(r1, true, 0xAAAA), "cur"), none, raidSeen).status == DD_PERSIST_LOADED);
+    // 读档前没读到 raid：只按名册判断，raid 留给探索存档读完后的核对
+    CHECK(Decide(MakeCandidate(MakeHeader(r1, true, 0xBBBB), "cur"), none, MakeObserved(r1, 1)).status == DD_PERSIST_LOADED);
+    // 城镇存档不看 raid（即使知道）
+    Observed townSeen = MakeObserved(r1, 0);
+    townSeen.raidKnown = true;
+    townSeen.raid = { kRaidFile, 0xAAAA, 5120 };
+    CHECK(Decide(MakeCandidate(MakeHeader(r1), "cur"), none, townSeen).status == DD_PERSIST_LOADED);
+
+    // 文件头的插件名、key 要和请求的完全相同（F2，审核 S5：只差大小写的另一个 key 落到同一个文件）
+    Observed named = MakeObserved(r1);
+    named.plugin = "DDLua";
+    named.key = "p4c_persist";
+    CHECK(Decide(MakeCandidate(MakeHeader(r1), "cur"), none, named).status == DD_PERSIST_LOADED);
+    named.key = "P4c_persist";
+    d = Decide(MakeCandidate(MakeHeader(r1), "cur"), none, named);
+    CHECK(d.status == DD_PERSIST_MISMATCH && d.reason.find("大小写") != std::string::npos && d.reason.find("p4c_persist") != std::string::npos);
+    named.key = "p4c_persist";
+    named.plugin = "ddlua";
+    CHECK(Decide(MakeCandidate(MakeHeader(r1), "cur"), none, named).status == DD_PERSIST_MISMATCH);
+
+    // 新战役复用以前跑过的存档位（F2，审核 S6）：两代都不一致时是 EMPTY，归档成 oldcampaign
+    Observed fresh = MakeObserved(r1);
+    fresh.newCampaign = true;
+    d = Decide(MakeCandidate(MakeHeader(r2), "cur"), MakeCandidate(MakeHeader(r3), "prev"), fresh);
+    CHECK(d.status == DD_PERSIST_EMPTY && d.which == -1 && d.archive == "oldcampaign" && d.reason.find("新战役") != std::string::npos);
+    CHECK(Decide(none, none, fresh).status == DD_PERSIST_EMPTY && Decide(none, none, fresh).archive.empty());
+    CHECK(Decide(MakeCandidate(MakeHeader(r1), "cur"), none, fresh).status == DD_PERSIST_LOADED);  // 一致的照样用
+}
+
+void TestAtomicWrite()
+{
+    const std::wstring dir = g_root + L"\\atomic";
+    const std::wstring path = dir + L"\\DDLua\\m.ddsave";
+    std::string why;
+    // 第一次：父目录逐级创建，没有 .prev
+    CHECK(WriteAtomic(path, "gen1", &why));
+    CHECK(ReadText(path) == "gen1" && !FileExists(path + L".prev") && !FileExists(path + L".tmp"));
+    // 之后每次保留上一代
+    CHECK(WriteAtomic(path, "gen2", &why) && ReadText(path) == "gen2" && ReadText(path + L".prev") == "gen1");
+    CHECK(WriteAtomic(path, "gen3", &why) && ReadText(path) == "gen3" && ReadText(path + L".prev") == "gen2");
+    // 写到一半失败、刷盘失败、创建失败、替换和退回的第一次改名都失败：原来的文件和 .prev 都不动，不留临时文件
+    for (const std::vector<std::string>& stages : std::vector<std::vector<std::string>>{ { "tmp_write" }, { "flush" }, { "create" }, { "replace", "move_prev" } }) {
+        const bool ok = WriteAtomic(path, std::string(4096, 'x'), &why, [&](const char* s) { return std::find(stages.begin(), stages.end(), s) != stages.end(); });
+        CHECK(!ok && !why.empty());
+        CHECK(ReadText(path) == "gen3" && ReadText(path + L".prev") == "gen2" && !FileExists(path + L".tmp"));
+    }
+    // 写到一半的文件（崩溃在写游戏文件的途中、别的程序截断）读回时能认出来
+    const std::string full = EncodeFile(MakeHeader(7), std::string(1000, 'p'));
+    WriteRaw(path, full.substr(0, full.size() / 2));
+    const Candidate torn = ReadCandidate(path);
+    CHECK(torn.exists && !torn.decoded && torn.error.find("截断") != std::string::npos);
+    const Candidate missing = ReadCandidate(dir + L"\\nope.ddsave");
+    CHECK(!missing.exists && !missing.decoded);
+    // 大文件（2 MB，分块写）
+    const std::string big(2 * 1024 * 1024 + 17, 'b');
+    CHECK(WriteAtomic(path, big, &why) && ReadText(path) == big);
+}
+
+void TestWriter()
+{
+    const std::wstring dir = g_root + L"\\writer";
+    std::vector<std::string> logs;
+    std::mutex logMutex;
+    {
+        Writer writer([&](int level, const std::string& text) {
+            std::lock_guard lock(logMutex);
+            logs.push_back(std::to_string(level) + " " + text);
+        });
+        // 合并：暂停时同一个文件提交 3 次，只写最后一次
+        writer.SetPaused(true);
+        writer.Submit(dir + L"\\a.ddsave", "a1");
+        writer.Submit(dir + L"\\b.ddsave", "b1");
+        writer.Submit(dir + L"\\a.ddsave", "a2");
+        writer.Submit(dir + L"\\a.ddsave", "a3");
+        CHECK(writer.Pending() == 2);
+        CHECK(!writer.Flush(50));  // 暂停中写不完
+        writer.SetPaused(false);
+        CHECK(writer.Flush(5000));
+        CHECK(ReadText(dir + L"\\a.ddsave") == "a3" && ReadText(dir + L"\\b.ddsave") == "b1" && !FileExists(dir + L"\\a.ddsave.prev"));
+        Writer::Stats st = writer.GetStats();
+        CHECK(st.submitted == 4 && st.merged == 2 && st.written == 2 && st.failed == 0 && st.retries == 0 && writer.Failures().empty());
+        // 一直失败（F2，审核 S2）：按退避重试（测试里间隔 10 毫秒），用完才放弃；第一次失败 WARN、放弃 ERROR，原文件不动，
+        // Flush 返回时队列空了，Failures() 如实列出没写进去的路径
+        const std::wstring a = dir + L"\\a.ddsave";
+        writer.SetRetryDelays({ 10, 10 });
+        writer.SetFailHook([](const char* stage) { return std::strcmp(stage, "create") == 0; });
+        writer.Submit(a, "a4");
+        CHECK(writer.Flush(5000));
+        st = writer.GetStats();
+        CHECK(st.failed == 1 && st.retries == 2 && ReadText(a) == "a3");
+        CHECK(writer.Failures() == std::vector<std::wstring>{ a });
+        {
+            std::lock_guard lock(logMutex);
+            CHECK(logs.size() == 2 && logs[0].rfind("3 旁路写盘失败，10 毫秒后重试（最多再试 2 次）", 0) == 0 &&
+                logs[1].rfind("4 旁路写盘失败，重试 2 次后放弃（这个文件连续放弃 1 次", 0) == 0);
+        }
+        // 再放弃一次：ERROR 不再写（每 20 次一行），只有第一次失败的 WARN
+        writer.Submit(a, "a5");
+        CHECK(writer.Flush(5000));
+        {
+            std::lock_guard lock(logMutex);
+            CHECK(logs.size() == 3 && logs[2].rfind("3 旁路写盘失败", 0) == 0 && writer.GetStats().failed == 2);
+        }
+        // 暂时的失败（杀毒软件扫完就放开）：第一次失败、重试成功，写进去，Failures() 清掉，写一行恢复
+        int calls = 0;
+        writer.SetFailHook([&calls](const char* stage) { return std::strcmp(stage, "create") == 0 && calls++ == 0; });
+        writer.Submit(a, "a6");
+        CHECK(writer.Flush(5000));
+        st = writer.GetStats();
+        CHECK(ReadText(a) == "a6" && ReadText(a + L".prev") == "a3" && st.failed == 2 && st.retries == 5 && writer.Failures().empty());
+        {
+            std::lock_guard lock(logMutex);
+            CHECK(logs.size() == 5 && logs[4].rfind("2 旁路写盘恢复正常", 0) == 0);
+        }
+        // 等重试的时候同一个文件又提交了：合并进那个任务（失败次数和重试时间不变），写的是新的；
+        // 还没到重试时间时 Flush 等不完，返回 false
+        calls = 0;
+        writer.SetRetryDelays({ 300 });
+        writer.Submit(a, "a7");
+        CHECK(!writer.Flush(100));
+        writer.Submit(a, "a8");
+        CHECK(writer.Flush(5000));
+        st = writer.GetStats();
+        CHECK(ReadText(a) == "a8" && st.merged == 3 && st.failed == 2 && writer.Failures().empty());
+        writer.SetFailHook({});
+        // 析构时把队列写完（不再等重试）
+        writer.SetPaused(true);
+        writer.Submit(dir + L"\\c.ddsave", "c1");
+    }
+    CHECK(ReadText(dir + L"\\c.ddsave") == "c1");
+}
+
+// 观察 hook 的参数宽度（F2，审核 B1）：2487E0 的大小（第 6 个参数）调用方只写栈槽的低 32 位，高 32 位是之前 237FC0 调用
+// 2388A0 留下的返回地址 Darkest+0x238023 的高半部分。原来按 64 位读、和 64 MB 比，每次存档写入都被当成太大跳过
+void TestObserveArgs()
+{
+    const std::uint64_t slot = 0x00007FF6'00004F1Cull;  // 栈上残留的高位 + 名册 20252 字节
+    CHECK(slot > kMaxObserved);                          // 原来的比较：这次写入被跳过
+    CHECK(ArgU32(slot) == 0x4F1C && ShouldObserve("persist.roster.json", ArgU32(slot)));
+    CHECK(ShouldObserve("persist.raid.json", 0) && ShouldObserve("persist.game.json", kMaxObserved));
+    CHECK(!ShouldObserve("persist.roster.json", kMaxObserved + 1) && !ShouldObserve("steam_init.json", 100) && !ShouldObserve("xpersist.roster.json", 100));
+    // 248D60：读到的字节数（eax）和容量（第 5 个参数，dword）也只认低 32 位，取两者较小的
+    CHECK((std::min)(ArgU32(0xFFFFFFFF'00001000ull), ArgU32(0x00000001'00002000ull)) == 0x1000);
+}
+
+// 插件名当旁路目录、只差大小写（F2，审核 S5、N3）
+void TestPluginDirs()
+{
+    std::string why;
+    CHECK(ValidPluginDir("DDLua", &why) && ValidPluginDir("test_combat", &why) && ValidPluginDir("a.b-c", &why));
+    for (const char* bad : { "", ".", "..", "...", "a.", "backup", "BackUp", "DDCore", "ddcore", "a/b", "a\\b" }) {
+        why.clear();
+        CHECK(!ValidPluginDir(bad, &why) && !why.empty());
+    }
+    CHECK(SameIgnoreCase("Foo", "foo") && SameIgnoreCase("p4c_PERSIST", "P4C_persist") && !SameIgnoreCase("Foo", "Fooo") && !SameIgnoreCase("a", "b"));
+}
+
+// 写盘的真实失败（F2，审核 S8）：别的程序打开着当前一代或 .prev、只读属性；以及 ReplaceFileW 失败后的退回路径
+void TestAtomicWriteFailures()
+{
+    const std::wstring path = g_root + L"\\real\\DDLua\\m.ddsave";
+    const std::wstring prev = path + L".prev", tmp = path + L".tmp";
+    std::string why;
+    CHECK(WriteAtomic(path, "gen1", &why) && WriteAtomic(path, "gen2", &why));
+    const auto unchanged = [&](const char* cur, const char* old) { return ReadText(path) == cur && ReadText(prev) == old && !FileExists(tmp); };
+    // 当前一代被别的程序打开、不共享删除（杀毒软件、索引器）：ReplaceFileW 和退回的改名都失败，两代不动，不留 .tmp
+    HANDLE held = CreateFileW(LongPath(path).c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+    CHECK(held != INVALID_HANDLE_VALUE);
+    why.clear();
+    CHECK(!WriteAtomic(path, "gen3", &why) && why.find("ReplaceFileW 失败") != std::string::npos && why.find(".prev 也失败") != std::string::npos);
+    CHECK(unchanged("gen2", "gen1"));
+    CloseHandle(held);
+    CHECK(WriteAtomic(path, "gen3", &why) && unchanged("gen3", "gen2"));  // 关掉之后下一次照常
+    // .prev 被打开（不共享删除）：同样失败、两代不动
+    held = CreateFileW(LongPath(prev).c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+    CHECK(held != INVALID_HANDLE_VALUE);
+    CHECK(!WriteAtomic(path, "gen4", &why) && unchanged("gen3", "gen2"));
+    CloseHandle(held);
+    // 当前一代、.prev、残留的 .tmp 都是只读（原来只读的 .prev 会让这个 key 永远写不进去）：写之前清掉只读属性
+    WriteRaw(tmp, "上次留下的");
+    for (const std::wstring& p : { path, prev, tmp }) {
+        SetFileAttributesW(LongPath(p).c_str(), FILE_ATTRIBUTE_READONLY);
+    }
+    why.clear();
+    CHECK(WriteAtomic(path, "gen4", &why) && unchanged("gen4", "gen3"));
+    CHECK(!(GetFileAttributesW(LongPath(prev).c_str()) & FILE_ATTRIBUTE_READONLY));
+    // 退回路径：ReplaceFileW 失败后两次改名成功
+    const auto inject = [](std::initializer_list<const char*> stages) {
+        const std::vector<std::string> list(stages.begin(), stages.end());
+        return [list](const char* s) { return std::find(list.begin(), list.end(), s) != list.end(); };
+    };
+    CHECK(WriteAtomic(path, "gen5", &why, inject({ "replace" })) && unchanged("gen5", "gen4"));
+    // 退回的第一次改名（原文件改名为 .prev）失败：两代不动
+    why.clear();
+    CHECK(!WriteAtomic(path, "gen6", &why, inject({ "replace", "move_prev" })) && unchanged("gen5", "gen4") && why.find(".prev 也失败") != std::string::npos);
+    // 第二次改名失败：原文件已经成了 .prev，这次的数据没写进去，读档时按上一代判断；之后的写入照常（没有可轮换的当前一代）
+    why.clear();
+    CHECK(!WriteAtomic(path, "gen6", &why, inject({ "replace", "move_new" })) && why.find("没写进去") != std::string::npos);
+    CHECK(!FileExists(path) && ReadText(prev) == "gen5" && !FileExists(tmp));
+    CHECK(WriteAtomic(path, "gen7", &why) && unchanged("gen7", "gen5"));
+}
+
+// 归档（F2，审核 S3、S6）：不一致或新战役时，第一次写之前把原来的两代改名移开，同一 tag 留最近 2 份
+void TestArchive()
+{
+    const std::wstring root = g_root + L"\\archive";
+    const std::wstring path = root + L"\\DDLua\\m.ddsave";
+    std::string why;
+    std::vector<std::wstring> moved;
+    CHECK(WriteAtomic(path, "g1", &why) && WriteAtomic(path, "g2", &why));
+    CHECK(ArchiveGenerations(path, "mismatch", "20261114-100000-000", 2, &moved, &why) && moved.size() == 2);
+    CHECK(!FileExists(path) && !FileExists(path + L".prev"));
+    CHECK(ReadText(path + L".mismatch-20261114-100000-000") == "g2" && ReadText(path + L".prev.mismatch-20261114-100000-000") == "g1");
+    // 归档后的第一次写没有可轮换的上一代，下次读档只看新写的
+    CHECK(WriteAtomic(path, "g3", &why) && !FileExists(path + L".prev"));
+    // 归档的文件不是旁路文件：选槽同步 backup 时不复制
+    std::size_t copied = 0;
+    CHECK(MirrorDir(root, root + L"\\backup", &copied, &why) && copied == 1 && !FileExists(root + L"\\backup\\DDLua\\m.ddsave.mismatch-20261114-100000-000"));
+    // 再归档两次：同一 tag 只留最近 2 份（最早那一份连同它的 .prev 删掉）
+    moved.clear();
+    CHECK(ArchiveGenerations(path, "mismatch", "20261114-110000-000", 2, &moved, &why) && moved.size() == 1);
+    CHECK(WriteAtomic(path, "g4", &why) && ArchiveGenerations(path, "mismatch", "20261114-120000-000", 2, &moved, &why));
+    CHECK(!FileExists(path + L".mismatch-20261114-100000-000") && !FileExists(path + L".prev.mismatch-20261114-100000-000"));
+    CHECK(ReadText(path + L".mismatch-20261114-110000-000") == "g3" && ReadText(path + L".mismatch-20261114-120000-000") == "g4");
+    // 别的 tag 各留各的
+    CHECK(WriteAtomic(path, "g5", &why) && ArchiveGenerations(path, "oldcampaign", "20261114-130000-000", 2, &moved, &why));
+    CHECK(ReadText(path + L".oldcampaign-20261114-130000-000") == "g5" && FileExists(path + L".mismatch-20261114-110000-000"));
+    // 两个文件都没有：成功，什么都不动
+    moved.clear();
+    CHECK(ArchiveGenerations(root + L"\\DDLua\\none.ddsave", "mismatch", "x", 2, &moved, &why) && moved.empty());
+    // 改名失败（别的程序占着）：返回 false，原文件不动
+    CHECK(WriteAtomic(path, "g6", &why));
+    HANDLE held = CreateFileW(LongPath(path).c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+    why.clear();
+    CHECK(!ArchiveGenerations(path, "mismatch", "20261114-140000-000", 2, &moved, &why) && !why.empty() && ReadText(path) == "g6");
+    CloseHandle(held);
+}
+
+// 新战役的判断（F2，审核 S6）：名册和 starting_save 里的文件内容相同
+void TestSameContent()
+{
+    const std::wstring file = g_root + L"\\starting_save\\persist.roster.json";
+    const std::string text = "{\n    \"version\": 513,\n    \"data\": {}\n}\n";
+    WriteRaw(file, text);
+    const FileHash same{ kRosterFile, Fnv1a64(text.data(), text.size()), static_cast<std::uint32_t>(text.size()) };
+    CHECK(SameContent(file, same));
+    CHECK(!SameContent(file, { kRosterFile, same.hash ^ 1, same.size }) && !SameContent(file, { kRosterFile, same.hash, same.size + 1 }));
+    CHECK(!SameContent(g_root + L"\\starting_save\\nope.json", same));
+}
+
+void TestBackupMirror()
+{
+    // 选存档槽时游戏把根目录复制到 backup/，旁路同步自己的目录；读 backup 时用 backup 里的两代判断
+    const std::wstring dev = g_root + L"\\save\\12345678\\steam_profile_4";
+    const std::wstring backup = dev + L"\\backup";
+    std::string why;
+    CHECK(WriteAtomic(dev + L"\\DDLua\\m.ddsave", EncodeFile(MakeHeader(0x10), "r1"), &why));   // 名册 r1 时写的
+    CHECK(WriteAtomic(dev + L"\\DDLua\\m.ddsave", EncodeFile(MakeHeader(0x20), "r2"), &why));   // 名册 r2 时写的（r1 成了 .prev）
+    CHECK(WriteAtomic(dev + L"\\DDCore\\tags.ddsave", EncodeFile(MakeHeader(0x20), "t2"), &why));
+    WriteRaw(dev + L"\\DDLua\\junk.txt", "不是旁路文件");
+    WriteRaw(backup + L"\\DDLua\\old.ddsave", "上一次选槽留下的");
+    WriteRaw(backup + L"\\Gone\\x.ddsave", "插件已经没有旁路了");
+    std::size_t copied = 0;
+    CHECK(MirrorDir(dev, backup, &copied, &why));
+    CHECK(copied == 3);
+    CHECK(FileExists(backup + L"\\DDLua\\m.ddsave") && FileExists(backup + L"\\DDLua\\m.ddsave.prev") && FileExists(backup + L"\\DDCore\\tags.ddsave"));
+    CHECK(!FileExists(backup + L"\\DDLua\\junk.txt") && !FileExists(backup + L"\\DDLua\\old.ddsave") && !FileExists(backup + L"\\Gone\\x.ddsave"));
+    CHECK(!FileExists(backup + L"\\backup\\DDLua\\m.ddsave"));  // backup 自己不再嵌套
+    // 选槽之后又写了一次（名册 r3）：根目录是 r3/r2，backup 还是 r2/r1
+    CHECK(WriteAtomic(dev + L"\\DDLua\\m.ddsave", EncodeFile(MakeHeader(0x30), "r3"), &why));
+    // 游戏读 backup（名册 r2）：backup 的当前一代一致
+    Decision d = Decide(ReadCandidate(backup + L"\\DDLua\\m.ddsave"), ReadCandidate(backup + L"\\DDLua\\m.ddsave.prev"), MakeObserved(0x20));
+    CHECK(d.status == DD_PERSIST_LOADED);
+    // 读 backup 却按根目录判断就不一致（根目录是 r3、r2）……这里根目录的上一代正好是 r2，说明为什么 backup 要单独一套
+    d = Decide(ReadCandidate(dev + L"\\DDLua\\m.ddsave"), ReadCandidate(dev + L"\\DDLua\\m.ddsave.prev"), MakeObserved(0x10));
+    CHECK(d.status == DD_PERSIST_MISMATCH);
+    d = Decide(ReadCandidate(backup + L"\\DDLua\\m.ddsave"), ReadCandidate(backup + L"\\DDLua\\m.ddsave.prev"), MakeObserved(0x10));
+    CHECK(d.status == DD_PERSIST_PREV);
+    // 源目录不存在：什么都不复制
+    CHECK(MirrorDir(g_root + L"\\nope", g_root + L"\\nope\\backup", &copied, &why) && copied == 0);
+}
+
+void TestTags()
+{
+    std::vector<TagLine> tags = {
+        { DD_ACTOR_HERO, 12, 0, 85, "lua_shield", "DDLua", "p4c_persist:s1" },
+        { DD_ACTOR_MONSTER, 4500, 0, 3, "", "test_combat", "tab\there%25\nnew\rline" },
+        { DD_ACTOR_HERO, 13, 1, 1, "SPD5", "x", "" },
+    };
+    const std::string text = EncodeTags(tags);
+    CHECK(text.rfind("DDCORE-TAGS 1\n", 0) == 0 && text.find("tab%09here%2525%0Anew%0Dline") != std::string::npos);
+    std::vector<TagLine> back;
+    std::string why;
+    CHECK(DecodeTags(text, &back, &why) && back.size() == 3);
+    CHECK(back[0].kind == DD_ACTOR_HERO && back[0].id == 12 && back[0].guid == 85 && back[0].buffId == "lua_shield" && back[0].tag == "p4c_persist:s1");
+    CHECK(back[1].tag == "tab\there%25\nnew\rline" && back[1].buffId.empty() && back[2].roster == 1 && back[2].tag.empty());
+    CHECK(DecodeTags(EncodeTags({}), &back, &why) && back.empty());
+    CHECK(!DecodeTags(text.substr(0, text.size() - 1), &back, &why) && why.find("截断") != std::string::npos);
+    CHECK(!DecodeTags("DDCORE-TAGS 1\n1\t2\t3\n", &back, &why) && why.find("列数") != std::string::npos);
+    CHECK(!DecodeTags("DDCORE-TAGS 1\nx\t2\t3\t4\ta\tb\tc\n", &back, &why));
+    CHECK(!DecodeTags("DDCORE-TAGS 1\n1\t2\t3\t4\ta\tb\t%G1\n", &back, &why));
+    CHECK(!DecodeTags("other\n", &back, &why) && !DecodeTags("", &back, &why));
+}
+
+void Run()
+{
+    wchar_t temp[MAX_PATH] = {};
+    GetTempPathW(MAX_PATH, temp);
+    g_root = std::wstring(temp) + L"dd_persist_test_" + std::to_wstring(GetCurrentProcessId());
+    RemoveTree(g_root);
+    CreateDirectoryW(g_root.c_str(), nullptr);
+    TestHashAndKeys();
+    TestFormat();
+    TestDecide();
+    TestAtomicWrite();
+    TestWriter();
+    TestObserveArgs();
+    TestPluginDirs();
+    TestAtomicWriteFailures();
+    TestArchive();
+    TestSameContent();
+    TestBackupMirror();
+    TestTags();
+    RemoveTree(g_root);
+}
+
+}  // namespace persisttest
+
 int main(int argc, char** argv)
 {
     SetConsoleOutputCP(CP_UTF8);
@@ -1806,6 +2861,10 @@ int main(int argc, char** argv)
     eventstest::Run();
     std::printf("== 装卸日志限速\n");
     TestChurnLog();
+    std::printf("== combat 逻辑\n");
+    combattest::Run();
+    std::printf("== persist 旁路\n");
+    persisttest::Run();
 
     std::printf("\n%d 项检查，失败 %d\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

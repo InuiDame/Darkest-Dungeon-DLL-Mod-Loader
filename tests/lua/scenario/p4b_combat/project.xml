@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<project>
+	<PreviewIconFile/>
+	<ItemDescriptionShort/>
+	<ModDataPath/>
+	<Title>DDLua Test P4b Combat</Title>
+	<Language>english</Language>
+	<UpdateDetails/>
+	<Visibility>private</Visibility>
+	<UploadMode>dont_submit</UploadMode>
+	<VersionMajor>1</VersionMajor>
+	<VersionMinor>0</VersionMinor>
+	<TargetBuild>0</TargetBuild>
+	<Tags/>
+	<ItemDescription>DD.ModLoader P4b scenario test: Lua buff/effect API. Adds test buffs to one hero for about 1.5 seconds per round (town, corridor, battle) and removes them.</ItemDescription>
+	<PublishedFileId/>
+</project>

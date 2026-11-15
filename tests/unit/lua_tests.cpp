@@ -6,15 +6,21 @@
 // 跨存档和跨探索失效、事件指针字段转句柄、按句柄过滤、actor 作用域、wait_event 快照里的句柄。
 // P3d：Lua Mod 模板和示例的加载运行、LuaLS 声明和实际 API 的对照、场景 Mod 的离线预演（经过真实的 plugin.cpp，
 // 主题表用 sdk/lua/topics.json，日志按 DDLua.log 的格式写到 build/p3d_rehearsal/，给 tools/p3_scenario_check.py 用）。
+// P4b：假的 combat 服务（立即执行、排队、操作回调、拒绝、buff.* 事件、规则判定），dd.buff / dd.effect / actor 的 buff 方法、
+// 脚本 Effect、脚本 Buff 的状态、规则的只读和停用、dd.fs 的写入、嵌套入口（同一个 VM、跨 VM、嵌套里的原生异常），
+// 场景 Mod p4b_combat 的离线预演。
+// P4c2：场景 Mod shield_lite、p4c_shield、p4c_persist 的离线预演（日志写到 build/p4c_rehearsal/，给 tools/p4_scenario_check.py 自测用）。
 // 编译 lua/src 下的全部源码（P3d 起含 plugin.cpp），用假的 log 服务当宿主；P3b 的 events 服务直接包装 DDCore 的
 // 事件中枢（hub.cpp、access.h）。Mod 夹具在 tests/lua/mods。
 // 运行：xmake build dd_lua_tests && xmake run dd_lua_tests [-v]
 
+#include "combat/logic.h"
 #include "config.h"
 #include "events/access.h"
 #include "manifest.h"
 #include "modfs.h"
 #include "session.h"
+#include "state_json.h"
 #include "vm.h"
 
 #include <lauxlib.h>
@@ -256,6 +262,10 @@ void TestManifest()
     order = ddlua::ResolveLoadOrder({ M("x"), M("dup"), M("dup"), M("needs", { D("dup") }) });
     CHECK(order.order == std::vector<std::size_t>({ 0 }));
     CHECK(Rejected(order, 1, "重复") && Rejected(order, 2, "重复") && Rejected(order, 3, "id 重复"));
+    // 只差大小写的 id 也算重复（数据目录、存档旁路在 NTFS 上是同一个文件），依赖其中一个的也拒绝（F2，审核 B-S5、C-Y2）
+    order = ddlua::ResolveLoadOrder({ M("Foo"), M("other"), M("foo"), M("needs", { D("foo") }) });
+    CHECK(order.order == std::vector<std::size_t>({ 1 }));
+    CHECK(Rejected(order, 0, "只差大小写") && Rejected(order, 2, "和启用列表里的 Foo 只差大小写") && Rejected(order, 3, "依赖 foo 不加载"));
     // api 不符、缺依赖、版本不够、依赖被拒绝、依赖自己
     order = ddlua::ResolveLoadOrder({ M("api", {}, "1.0.0", 2), M("miss", { D("nope") }), M("base", {}, "1.5.0"),
         M("low", { D("base", "1.6") }), M("ok", { D("base", "1.5") }), M("chain", { D("low") }), M("self", { D("self") }) });
@@ -1830,7 +1840,14 @@ struct FakeWorld {
     std::uint32_t battle = 1;
     std::map<std::uintptr_t, FakeActor> heroes;
     std::map<std::uintptr_t, FakeActor> monsters;
+    // F5 的枚举：队伍（Raid+8，只在有 Raid 时）、战斗状态（Battle+0x288，0 是没有战斗）
+    std::vector<std::uintptr_t> party;
+    std::int32_t battleState = 0;
 } g_world;
+
+// 在 g_fc（假的 combat 服务的状态，后面定义）里：有没有 Raid、加载线程在不在跑
+bool FakeRaidNow();
+bool FakeLoadingNow();
 
 void* P(std::uintptr_t value)
 {
@@ -1955,8 +1972,64 @@ bool DD_CALL FakeInfo(const DDActorRef* ref, DDActorInfo* out)
 
 uint32_t DD_CALL FakeBattleSerial() { return g_world.battle; }
 
+// 枚举（F5）：和 DDCore 一样，加载中、存档外返回 false；没有 Raid 时队伍、怪物都是 0 个
+bool FakeList(const std::vector<std::uintptr_t>& pointers, DDActorRef* out, uint32_t capacity, uint32_t* outCount)
+{
+    if (outCount) {
+        *outCount = 0;
+    }
+    if (!g_world.active || FakeLoadingNow()) {
+        return false;
+    }
+    std::uint32_t n = 0;
+    for (const auto p : FakeRaidNow() ? pointers : std::vector<std::uintptr_t>{}) {
+        DDActorRef ref{};
+        ref.size = sizeof(ref);
+        if (!FakeFromPointer(P(p), &ref)) {
+            continue;
+        }
+        if (out && n < capacity) {
+            out[n] = ref;
+        }
+        ++n;
+    }
+    if (outCount) {
+        *outCount = n;
+    }
+    return true;
+}
+
+bool DD_CALL FakePartyHeroes(DDActorRef* out, uint32_t capacity, uint32_t* outCount)
+{
+    std::vector<std::uintptr_t> heroes;
+    for (const auto p : g_world.party) {
+        if (g_world.heroes.count(p)) {
+            heroes.push_back(p);
+        }
+    }
+    return FakeList(heroes, out, capacity, outCount);
+}
+
+bool DD_CALL FakeBattleMonsters(DDActorRef* out, uint32_t capacity, uint32_t* outCount)
+{
+    std::vector<std::uintptr_t> monsters;
+    for (const auto& [p, actor] : g_world.monsters) {
+        monsters.push_back(p);
+    }
+    return FakeList(monsters, out, capacity, outCount);  // 预演在战斗之外清空 g_world.monsters（同游戏：战斗销毁时清空怪物表）
+}
+
+int32_t DD_CALL FakeBattleState()
+{
+    if (!g_world.active || FakeLoadingNow()) {
+        return -1;
+    }
+    return FakeRaidNow() ? g_world.battleState : 0;
+}
+
 const DDGameService kFakeGame = { { sizeof(DDGameService), DD_SERVICE_GAME_VERSION }, &FakeModsAvailable, &FakeModCount, &FakeModAt,
-    &FakeActorKinds, &FakeRaidSerial, &FakeFromPointer, &FakeFind, &FakeResolve, &FakeInfo, &FakeBattleSerial };
+    &FakeActorKinds, &FakeRaidSerial, &FakeFromPointer, &FakeFind, &FakeResolve, &FakeInfo, &FakeBattleSerial, &FakePartyHeroes,
+    &FakeBattleMonsters, &FakeBattleState };
 
 void ResetWorld()
 {
@@ -2387,6 +2460,10 @@ void TestTemplateAndExample()
     CHECK(CoreCount() == 0 && session.memory().residual == 0);
 }
 
+// P4b 的假 combat 服务（定义在文件后面）
+void ResetCombat();
+ddlua::Host MakeCombatHost();
+
 // LuaLS 声明（sdk/lua/dd.lua、dd_topics.lua、sandbox.lua）和实际 API 对照
 struct Declared {
     std::map<std::string, std::vector<std::string>> sets;  // 表名 -> 名字
@@ -2428,7 +2505,8 @@ void ParseDeclarations(const std::string& text, Declared& decl)
         };
         if (line.rfind("---@class ", 0) == 0) {
             const std::string name = line.substr(10, line.find(' ', 10) == std::string::npos ? std::string::npos : line.find(' ', 10) - 10);
-            cls = name == "dd" ? "dd" : name == "dd.Actor" ? "Actor" : name == "dd.Event" ? "Event" : name == "dd.Subscription" ? "Subscription" : "";
+            cls = name == "dd" ? "dd" : name == "dd.Actor" ? "Actor" : name == "dd.Event" ? "Event" : name == "dd.Subscription" ? "Subscription"
+                : name == "dd.Effect" ? "Effect" : name == "dd.Skill" ? "Skill" : name == "dd.Rule" ? "Rule" : "";
             continue;
         }
         if (line.rfind("---@field ", 0) == 0) {
@@ -2443,7 +2521,9 @@ void ParseDeclarations(const std::string& text, Declared& decl)
         cls.clear();
         static const std::pair<const char*, const char*> kFunctions[] = { { "function dd.", "dd" }, { "function loglib.", "log" },
             { "function fslib.", "fs" }, { "function actorlib.", "actor" }, { "function Subscription:", "Subscription" },
-            { "function Timer:", "Timer" }, { "function Task:", "Task" }, { "function Actor:", "Actor" }, { "function Event:", "Event" } };
+            { "function Timer:", "Timer" }, { "function Task:", "Task" }, { "function Actor:", "Actor" }, { "function Event:", "Event" },
+            { "function bufflib.", "buff" }, { "function effectlib.", "effect" }, { "function Effect:", "Effect" }, { "function Skill:", "Skill" },
+            { "function Rule:", "Rule" } };
         for (const auto& [prefix, set] : kFunctions) {
             if (line.rfind(prefix, 0) == 0) {
                 decl.Add(set, word(line, std::strlen(prefix)));
@@ -2479,12 +2559,13 @@ void TestApiDeclarations()
     }
     std::printf("  主题表 %u 个，dd_topics.lua 缺 %zu 个\n", g_hub->TopicCount(), missing);
     CHECK(missing == 0);
-    for (const char* set : { "dd", "log", "fs", "actor", "Subscription", "Timer", "Task", "Actor", "Event" }) {
+    for (const char* set : { "dd", "log", "fs", "actor", "Subscription", "Timer", "Task", "Actor", "Event", "buff", "effect", "Effect", "Skill", "Rule" }) {
         std::printf("  声明 %s：%zu 项\n", set, decl.sets[set].size());
         CHECK(!decl.sets[set].empty());
     }
 
-    const auto host = MakeActorHost();
+    ResetCombat();
+    const auto host = MakeCombatHost();
     ddlua::Session session(host, TestConfig(), "声明对照");
     session.SetClock([] { return g_now; });
     g_now = 0;
@@ -2498,6 +2579,24 @@ void TestApiDeclarations()
         same("dd.log", dd.log, DECL.log)
         same("dd.fs", dd.fs, DECL.fs)
         same("dd.actor", dd.actor, DECL.actor)
+        same("dd.buff", dd.buff, DECL.buff)
+        same("dd.effect", dd.effect, DECL.effect)
+        -- P4b 的句柄：声明的字段和方法都能读；effect 句柄报错时列出的字段都有声明
+        local e = assert(dd.effect.get("rakebuff_5"))
+        for k in pairs(DECL.Effect) do assert(pcall(function() return e[k] end), "dd.Effect." .. k) end
+        local _, fxerr = pcall(function() return e.nope end)
+        local fxlist = assert(fxerr:match("可用：(.-)）"), fxerr)
+        for name in fxlist:gmatch("[^、]+") do assert(DECL.Effect[name], "effect 句柄的字段 " .. name .. " 没有声明") end
+        local r = assert(dd.buff.rule("decl_rule", function() return true end))
+        for k in pairs(DECL.Rule) do assert(r[k] ~= nil, "dd.Rule." .. k) end
+        r:off()
+        dd.once("skill.pre", function(ev)
+            local sk = ev.skill
+            for k in pairs(DECL.Skill) do assert(pcall(function() return sk[k] end), "dd.Skill." .. k) end
+            local _, skerr = pcall(function() return sk.nope end)
+            for name in assert(skerr:match("可用：(.-)）"), skerr):gmatch("[^、]+") do assert(DECL.Skill[name], "技能句柄的字段 " .. name) end
+            SKILL_OK = true
+        end)
         local sub = dd.on("app.tick", function() end)
         for k in pairs(DECL.Subscription) do assert(sub[k] ~= nil, "dd.Subscription." .. k) end
         sub:off()
@@ -2523,7 +2622,10 @@ void TestApiDeclarations()
     Fire pre("damage.pre");
     pre.P("target", P(0x10000)).Fl("damage", 1);
     pre.Go();
-    CHECK(Lua(session, "ev_a", "assert(EV_OK, '负载的元信息和方法')"));
+    Fire skill("skill.pre");
+    skill.P("performer", P(0x10000)).P("skill", P(0x80000));
+    skill.Go();
+    CHECK(Lua(session, "ev_a", "assert(EV_OK, '负载的元信息和方法') assert(SKILL_OK, '技能句柄')"));
     session.Teardown();
     CHECK(CoreCount() == 0);
 }
@@ -2575,6 +2677,106 @@ uint64_t DD_CALL FakeImageSize() { return 0; }
 const DDGameInfoService kFakeInfo = { { sizeof(DDGameInfoService), DD_SERVICE_GAME_INFO_VERSION }, &FakeCoreVersion, &FakeText,
     &FakeText, &FakeText, &FakeRoot, &FakeRoot, &FakeRoot, &FakeRoot, &FakePluginPath, &FakeImageBase, &FakeImageSize };
 
+// P4c1：假的 persist 服务。load 按 key 返回预先设好的结果，save 只在模拟的 campaign.save 里接受（同 DDCore）
+struct FakePersistKey {
+    std::uint32_t result = DD_PERSIST_OK;
+    std::uint32_t status = DD_PERSIST_EMPTY;
+    std::string reason;
+    std::string data;
+    std::string version;
+    bool raidPending = false;
+    bool fromBackup = false;
+};
+
+struct FakePersistState {
+    DDPersistSaveFn onSave = nullptr;  // plugin.cpp 的 DDPlugin_Load 声明时设
+    DDPersistVerifyFn onVerify = nullptr;
+    void* user = nullptr;
+    int declares = 0;
+    std::map<std::string, FakePersistKey> loads;
+    std::map<std::string, std::string> saved;
+    std::map<std::string, std::string> prevSaved;  // 上一代（save 时原来的当前一代轮换过去，同 DDCore 的 .prev）
+    std::map<std::string, std::string> savedVersion;
+    std::vector<std::string> blocked;  // 像 DDCore：raid 核对不一致之后这次进存档不再写（DD_PERSIST_E_INCONSISTENT）
+    int loadCalls = 0;
+    bool saving = false;
+} g_fp;
+
+// 每个测试前清掉读写记录（保留 plugin.cpp 声明的回调）
+void ResetPersistFakes()
+{
+    g_fp.loads.clear();
+    g_fp.saved.clear();
+    g_fp.prevSaved.clear();
+    g_fp.savedVersion.clear();
+    g_fp.blocked.clear();
+    g_fp.loadCalls = 0;
+    g_fp.saving = false;
+}
+
+const char* DD_CALL FakePersistStatusText(uint32_t)
+{
+    return "?";
+}
+
+uint32_t DD_CALL FakePersistDeclare(DDPluginHandle plugin, DDPersistSaveFn onSave, DDPersistVerifyFn onVerify, void* user)
+{
+    if (plugin != kPlugin || !onSave) {
+        return DD_PERSIST_E_INVALID;
+    }
+    g_fp.onSave = onSave;
+    g_fp.onVerify = onVerify;
+    g_fp.user = user;
+    ++g_fp.declares;
+    return DD_PERSIST_OK;
+}
+
+uint32_t DD_CALL FakePersistLoad(DDPluginHandle, const char* key, DDPersistData* out)
+{
+    ++g_fp.loadCalls;
+    static const FakePersistKey kEmpty;
+    const auto it = g_fp.loads.find(key ? key : "");
+    const FakePersistKey& k = it == g_fp.loads.end() ? kEmpty : it->second;
+    if (k.result != DD_PERSIST_OK) {
+        return k.result;
+    }
+    const bool data = k.status == DD_PERSIST_LOADED || k.status == DD_PERSIST_PREV;
+    out->status = k.status;
+    out->reason = k.reason.c_str();
+    out->data = data ? k.data.data() : nullptr;
+    out->data_size = data ? static_cast<std::uint32_t>(k.data.size()) : 0;
+    out->version = k.version.c_str();
+    out->written_ms = data ? 1763100000123ull : 0;
+    out->in_raid = data && k.raidPending;
+    out->raid_pending = data && k.raidPending;
+    out->from_backup = k.fromBackup;
+    return DD_PERSIST_OK;
+}
+
+uint32_t DD_CALL FakePersistSave(DDPluginHandle, const char* key, const void* data, uint32_t size, const char* version)
+{
+    if (!g_fp.saving) {
+        return DD_PERSIST_E_TIMING;
+    }
+    if (std::find(g_fp.blocked.begin(), g_fp.blocked.end(), key) != g_fp.blocked.end()) {
+        return DD_PERSIST_E_INCONSISTENT;
+    }
+    if (const auto it = g_fp.saved.find(key); it != g_fp.saved.end()) {
+        g_fp.prevSaved[key] = it->second;
+    }
+    g_fp.saved[key].assign(static_cast<const char*>(data), size);
+    g_fp.savedVersion[key] = version ? version : "";
+    return DD_PERSIST_OK;
+}
+
+bool DD_CALL FakePersistInfo(DDPersistInfo*)
+{
+    return false;
+}
+
+const DDPersistService kFakePersist = { { sizeof(DDPersistService), DD_SERVICE_PERSIST_VERSION }, &FakePersistStatusText,
+    &FakePersistDeclare, &FakePersistLoad, &FakePersistSave, &FakePersistInfo };
+
 const void* DD_CALL FakeQuery(const char* name, uint32_t)
 {
     const std::string_view service(name ? name : "");
@@ -2592,6 +2794,9 @@ const void* DD_CALL FakeQuery(const char* name, uint32_t)
     }
     if (service == DD_SERVICE_EVENTS) {
         return &kFakeEvents;
+    }
+    if (service == DD_SERVICE_PERSIST) {
+        return &kFakePersist;
     }
     return nullptr;
 }
@@ -4472,6 +4677,3344 @@ void TestGcPauseCredit()
     }
 }
 
+// ================================================================ P4b：Effect 与 Buff
+
+// ---------------------------------------------------------------- 假的 combat 服务
+// 语义照 core/src/combat/combat.cpp：时机用同一份 DecideTiming（帧边界、派发深度、DDCore 自己的游戏调用层数），
+// 立即执行时同步派发 buff.add / buff.remove（hook 已装上时），排队的在 FakeDrain（帧边界）执行后通知操作回调。
+// buff 表按 actor 的假指针存，guid 每个 actor 只增不减。插件名：DDLua（kPlugin）和 other_native。
+namespace fc = ddc::combat;
+
+struct FakeBuff {
+    std::uint32_t guid = 0;
+    DDBuffDef def{};
+    std::string plugin;  // 经 buff_add 加的插件名；游戏加的为空
+    std::string tag;
+};
+
+struct FakeEffect {
+    DDEffectInfo info{};
+    std::vector<std::string> buffs;  // 施加时给目标加的 buff id
+    DDPluginHandle owner = nullptr;  // 运行时定义的插件
+};
+
+struct FakeOp {
+    std::uint64_t id = 0;
+    DDPluginHandle plugin = nullptr;
+    std::uint32_t kind = 0;
+    DDActorRef actor{}, actor2{};
+    bool hasTarget = false;
+    std::string text, tag;
+    DDBuffAddOptions add{};
+    DDBuffRemoveSpec remove{};
+    DDBuffDef def{};
+};
+
+struct FakeRuleReg {
+    DDRuleId id = 0;
+    DDPluginHandle plugin = nullptr;
+    std::string name;
+    DDRuleFn fn = nullptr;
+    void* user = nullptr;
+    bool disabled = false;
+};
+
+struct FakeCombatState {
+    bool frame = true;   // 在帧边界的回调里（RunChunk、Tick 模拟 lifecycle）
+    bool raid = true;    // 有 Raid::Current（走廊、战斗）
+    bool hooks = true;   // buff.* 的 hook 已装上（DDCore 在订阅后的下一帧装）
+    bool loading = false;
+    bool pvp = false;
+    int gameCall = 0;    // DDCore 自己调用游戏函数的层数
+    int inRule = 0;
+    int sleepMs = 0;     // buff_add 派发 buff.add 之前睡这么久（模拟游戏函数的耗时，不经过 Lua）
+    std::map<std::uintptr_t, std::vector<FakeBuff>> tables;
+    std::map<std::uintptr_t, std::uint32_t> nextGuid;
+    std::map<std::string, DDBuffDef> library;
+    std::map<std::string, DDPluginHandle> libOwner;
+    std::map<std::string, FakeEffect> effects;
+    std::vector<std::string> smiteEffects = { "Stun 1", "rakebuff_5" };  // 假技能 smite 的 .effect（P4c2 换成数据层圣骑士 Smite 的）
+    std::vector<FakeOp> queue;
+    std::uint64_t nextOp = 1;
+    DDCombatOpFn handler = nullptr;
+    void* handlerUser = nullptr;
+    std::vector<FakeRuleReg> rules;
+    DDRuleId nextRule = 1;
+    std::uint64_t ruleCalls = 0;
+    std::uint64_t ruleOriginal = 0;  // 回调交还原函数（DD_RULE_ORIGINAL）的次数
+    std::string message;
+    std::uint64_t adds = 0, removes = 0;
+} g_fc;
+
+bool FakeRaidNow()
+{
+    return g_fc.raid;
+}
+
+bool FakeLoadingNow()
+{
+    return g_fc.loading;
+}
+
+const DDPluginHandle kOtherPlugin = reinterpret_cast<DDPluginHandle>(static_cast<std::uintptr_t>(0x5678));
+
+std::string FakePluginName(DDPluginHandle plugin)
+{
+    return plugin == kPlugin ? "DDLua" : "other_native";
+}
+
+fc::TimingDecision FakeTiming()
+{
+    fc::TimingState s;
+    s.mainThread = true;
+    s.inRule = g_fc.inRule > 0;
+    s.campaignActive = g_world.active;
+    s.loading = g_fc.loading;
+    s.pvp = g_fc.pvp;
+    s.inFrameBody = g_fc.frame;
+    s.dispatchDepth = g_hub ? g_hub->Depth() : 0;
+    s.gameCallDepth = g_fc.gameCall;
+    return fc::DecideTiming(s, true);
+}
+
+const char* DD_CALL FakeResultText(uint32_t code)
+{
+    switch (code) {
+    case DD_COMBAT_OK:
+        return "成功";
+    case DD_COMBAT_QUEUED:
+        return "已排队";
+    case DD_COMBAT_E_INVALID:
+        return "参数无效";
+    case DD_COMBAT_E_NO_CAMPAIGN:
+        return "不在存档里";
+    case DD_COMBAT_E_LOADING:
+        return "加载线程正在运行";
+    case DD_COMBAT_E_PVP:
+        return "PvP 对局中";
+    case DD_COMBAT_E_IN_RULE:
+        return "规则回调里不能写";
+    case DD_COMBAT_E_QUEUE_FULL:
+        return "排队的操作太多";
+    case DD_COMBAT_E_ACTOR:
+        return "actor 句柄解析失败";
+    case DD_COMBAT_E_NOT_FOUND:
+        return "不存在";
+    case DD_COMBAT_E_NO_RAID:
+        return "需要 Raid::Current（城镇里没有）";
+    case DD_COMBAT_E_EXISTS:
+        return "已经存在";
+    case DD_COMBAT_E_CANCELLED:
+        return "排队的操作被丢弃";
+    default:
+        return "未知";
+    }
+}
+
+uint32_t FakeOut(DDCombatOpResult* out, std::uint32_t kind, std::uint32_t code, std::string message, std::uint64_t op = 0,
+    std::uint32_t guid = 0, std::uint32_t count = 0)
+{
+    g_fc.message = std::move(message);
+    if (out && out->size >= sizeof(DDCombatOpResult)) {
+        out->kind = kind;
+        out->op = op;
+        out->result = code;
+        out->guid = guid;
+        out->count = count;
+        out->message = g_fc.message.c_str();
+    }
+    return code;
+}
+
+// 一条 buff 事件（hook 已装上、在存档里时）。deferred：加载线程上发生，复制后排到主线程
+void FakeBuffEvent(const char* topicName, std::uintptr_t actor, FakeBuff b, const char* reason = nullptr, int before = 0, int after = 0,
+    bool deferred = false)
+{
+    if (!g_fc.hooks || !g_world.active || !g_hub->Find(topicName)) {
+        return;
+    }
+    const bool hero = g_world.heroes.count(actor) != 0;
+    const std::uint32_t id = hero ? g_world.heroes[actor].id : g_world.monsters[actor].id;
+    Fire f(topicName);
+    f.P("actor", deferred ? nullptr : P(actor)).I("actor_kind", hero ? DD_ACTOR_HERO : DD_ACTOR_MONSTER).I("actor_id", id).I("guid", b.guid)
+        .S("id", b.def.id).I("stat_type", b.def.stat_type).Fl("amount", b.def.amount).I("duration", b.def.duration)
+        .I("duration_type", b.def.duration_type).I("source", b.def.source).I("sourcedata", b.def.sourcedata).I("rule_type", b.def.rule_type)
+        .S("plugin", b.plugin.c_str()).S("tag", b.tag.c_str());
+    if (reason) {
+        f.S("reason", reason);
+    }
+    if (std::strcmp(topicName, "buff.tick") == 0) {
+        f.I("duration_before", before).I("duration_after", after);
+    }
+    if (deferred) {
+        f.Deferred();
+    } else {
+        f.Go();
+    }
+}
+
+std::uintptr_t FakeActorPtr(const DDActorRef& ref)
+{
+    return reinterpret_cast<std::uintptr_t>(FakeResolve(&ref));
+}
+
+// 游戏自己加一条（技能、effect……）：plugin、tag 为空
+std::uint32_t FakeGameAdd(std::uintptr_t actor, const char* id, bool event = true)
+{
+    FakeBuff b;
+    b.guid = ++g_fc.nextGuid[actor];
+    b.def = g_fc.library.at(id);
+    g_fc.tables[actor].push_back(b);
+    if (event) {
+        ++g_fc.gameCall;
+        FakeBuffEvent("buff.add", actor, b);
+        --g_fc.gameCall;
+    }
+    return b.guid;
+}
+
+// 游戏删一条（到期、回城清理……）：先派发 buff.remove 再删
+bool FakeGameRemove(std::uintptr_t actor, std::uint32_t guid, const char* reason, bool deferred = false)
+{
+    auto& table = g_fc.tables[actor];
+    for (std::size_t i = 0; i < table.size(); ++i) {
+        if (table[i].guid == guid) {
+            ++g_fc.gameCall;
+            FakeBuffEvent("buff.remove", actor, table[i], reason, 0, 0, deferred);
+            --g_fc.gameCall;
+            table.erase(table.begin() + static_cast<std::ptrdiff_t>(i));
+            return true;
+        }
+    }
+    return false;
+}
+
+// 持续时间递减一次：还在表里的派发 buff.tick，减到 0 的删掉（buff.remove expired）
+void FakeTickBuff(std::uintptr_t actor, std::uint32_t guid)
+{
+    for (auto& b : g_fc.tables[actor]) {
+        if (b.guid == guid && b.def.duration > 0) {
+            const int before = b.def.duration--;
+            if (b.def.duration == 0) {
+                FakeGameRemove(actor, guid, "expired");
+            } else {
+                ++g_fc.gameCall;
+                FakeBuffEvent("buff.tick", actor, b, nullptr, before, b.def.duration);
+                --g_fc.gameCall;
+            }
+            return;
+        }
+    }
+}
+
+struct FakeOutcome {
+    std::uint32_t code = DD_COMBAT_OK;
+    std::uint32_t guid = 0;
+    std::uint32_t count = 0;
+    std::string message;
+};
+
+void FakeRefresh(std::uintptr_t actor);
+
+FakeOutcome FakeAddNow(DDPluginHandle plugin, const DDActorRef& ref, const std::string& id, const DDBuffAddOptions& o, const std::string& tag)
+{
+    const std::uintptr_t actor = FakeActorPtr(ref);
+    if (!actor) {
+        return { DD_COMBAT_E_ACTOR, 0, 0, "actor 句柄解析失败" };
+    }
+    const auto it = g_fc.library.find(id);
+    if (it == g_fc.library.end()) {
+        return { DD_COMBAT_E_NOT_FOUND, 0, 0, "Buff 库里没有 " + id };
+    }
+    FakeBuff b;
+    b.guid = ++g_fc.nextGuid[actor];
+    b.def = it->second;
+    if (o.flags & DD_BUFF_ADD_DURATION) {
+        b.def.duration = o.duration;
+    }
+    if (o.flags & DD_BUFF_ADD_DURATION_TYPE) {
+        b.def.duration_type = o.duration_type;
+    }
+    if (o.flags & DD_BUFF_ADD_SOURCE) {
+        b.def.source = o.source;
+    }
+    if (o.flags & DD_BUFF_ADD_SOURCEDATA) {
+        b.def.sourcedata = o.sourcedata;
+    }
+    b.plugin = FakePluginName(plugin);
+    b.tag = tag;
+    g_fc.tables[actor].push_back(b);
+    ++g_fc.adds;
+    ++g_fc.gameCall;
+    if (g_fc.sleepMs) {
+        Sleep(static_cast<DWORD>(g_fc.sleepMs));
+    }
+    // 槽位 13 带 refresh 时游戏在加完之后刷新属性（可能当场删掉 remove_if_not_active、规则不成立的这一条）；
+    // DDCore 在原函数返回后按 guid 找条目派发 buff.add，找不到就不派发
+    if (!(o.flags & DD_BUFF_ADD_NO_REFRESH)) {
+        FakeRefresh(actor);
+    }
+    const auto& table = g_fc.tables[actor];
+    if (std::any_of(table.begin(), table.end(), [&](const FakeBuff& x) { return x.guid == b.guid; })) {
+        FakeBuffEvent("buff.add", actor, b);
+    }
+    --g_fc.gameCall;
+    return { DD_COMBAT_OK, b.guid, 0, "" };
+}
+
+FakeOutcome FakeRemoveNow(DDPluginHandle plugin, const DDActorRef& ref, const DDBuffRemoveSpec& spec, const std::string& text)
+{
+    const std::uintptr_t actor = FakeActorPtr(ref);
+    if (!actor) {
+        return { DD_COMBAT_E_ACTOR, 0, 0, "actor 句柄解析失败" };
+    }
+    std::vector<std::uint32_t> hits;
+    for (const auto& b : g_fc.tables[actor]) {
+        const bool match = (spec.match == DD_BUFF_BY_GUID && b.guid == spec.guid) ||
+            (spec.match == DD_BUFF_BY_TAG && b.plugin == FakePluginName(plugin) && b.tag == text) ||
+            (spec.match == DD_BUFF_BY_ID && text == b.def.id) || (spec.match == DD_BUFF_BY_SOURCE && b.def.source == spec.source);
+        if (match) {
+            hits.push_back(b.guid);
+        }
+    }
+    for (const auto guid : hits) {
+        FakeGameRemove(actor, guid, "plugin");
+        ++g_fc.removes;
+    }
+    if (!hits.empty()) {
+        ++g_fc.gameCall;
+        FakeRefresh(actor);  // 槽位 14 删到东西时刷新属性
+        --g_fc.gameCall;
+    }
+    return { DD_COMBAT_OK, 0, static_cast<std::uint32_t>(hits.size()), "" };
+}
+
+FakeOutcome FakeApplyNow(const std::string& name, const DDActorRef& performer, const DDActorRef& target)
+{
+    if (!g_fc.raid) {
+        return { DD_COMBAT_E_NO_RAID, 0, 0, "没有 Raid::Current（城镇里不能施加 effect）" };
+    }
+    const auto it = g_fc.effects.find(name);
+    if (it == g_fc.effects.end()) {
+        return { DD_COMBAT_E_NOT_FOUND, 0, 0, "没有 effect " + name };
+    }
+    const std::uintptr_t p = FakeActorPtr(performer);
+    const std::uintptr_t t = FakeActorPtr(target);
+    if (!p || !t) {
+        return { DD_COMBAT_E_ACTOR, 0, 0, "performer 或 target 的句柄解析失败" };
+    }
+    // effect.pre 照常派发（脚本 Effect 建在它上面）
+    Fire pre("effect.pre");
+    pre.P("performer", P(p)).P("target", P(t)).P("effect", P(0x81000)).S("effect_name", name.c_str());
+    ++g_fc.gameCall;
+    const Payload payload = pre.Go();
+    std::uint32_t count = 0;
+    if (!payload.cancelled) {
+        for (const auto& id : it->second.buffs) {
+            FakeGameAdd(t, id.c_str());
+            ++count;
+        }
+    }
+    --g_fc.gameCall;
+    return { DD_COMBAT_OK, 0, count, "" };
+}
+
+FakeOutcome FakeDefineNow(DDPluginHandle plugin, const DDBuffDef& def)
+{
+    const std::string id(def.id);
+    const auto owner = g_fc.libOwner.find(id);
+    if (g_fc.library.count(id) && (owner == g_fc.libOwner.end() || owner->second != plugin)) {
+        return { DD_COMBAT_E_EXISTS, 0, 0, owner == g_fc.libOwner.end() ? "id " + id + " 是游戏数据，不能覆盖" : "id " + id + " 已经由别的插件注册" };
+    }
+    g_fc.library[id] = def;
+    g_fc.libOwner[id] = plugin;
+    return {};
+}
+
+DDBuffDef FakeDef(const char* id, const char* stat, const char* sub, float amount, int duration, const char* dtype, const char* source);
+
+FakeOutcome FakeDefineEffectsNow(DDPluginHandle plugin, const std::string& text)
+{
+    std::vector<std::string> names;
+    std::string why;
+    if (!fc::ExtractEffectNames(text, &names, &why)) {
+        return { DD_COMBAT_E_INVALID, 0, 0, why };
+    }
+    for (const auto& name : names) {
+        const auto it = g_fc.effects.find(name);
+        if (it != g_fc.effects.end() && it->second.owner != plugin) {
+            return { DD_COMBAT_E_EXISTS, 0, 0, "effect " + name + (it->second.owner ? " 已经由别的插件定义" : " 是游戏数据，不能重新定义") };
+        }
+    }
+    for (const auto& name : names) {
+        FakeEffect e;
+        e.info.size = sizeof(e.info);
+        strcpy_s(e.info.name, name.c_str());
+        e.info.runtime = true;
+        e.owner = plugin;
+        // 这个块里的 .buff_ids <id>（施加时加这个 buff）或 .combat_stat_buff 1（加一条生成的 buff fx_stat）
+        const std::size_t at = text.find("\"" + name + "\"");
+        const std::size_t next = text.find("effect:", at);
+        const std::string block = text.substr(at, next == std::string::npos ? std::string::npos : next - at);
+        if (const std::size_t ids = block.find(".buff_ids "); ids != std::string::npos) {
+            const std::size_t from = ids + 10;
+            e.buffs.push_back(block.substr(from, block.find_first_of(" \r\n", from) - from));
+            e.info.buff_id_count = 1;
+        } else if (block.find(".combat_stat_buff 1") != std::string::npos) {
+            if (!g_fc.library.count("fx_stat")) {
+                g_fc.library["fx_stat"] = FakeDef("fx_stat", "combat_stat_add", "speed_rating", 1, 1, "after_turn", "skill");
+            }
+            e.buffs.push_back("fx_stat");
+        }
+        g_fc.effects[name] = e;
+    }
+    return { DD_COMBAT_OK, 0, static_cast<std::uint32_t>(names.size()), "" };
+}
+
+FakeOutcome FakeExecute(const FakeOp& op)
+{
+    switch (op.kind) {
+    case DD_COMBAT_OP_BUFF_ADD:
+        return FakeAddNow(op.plugin, op.actor, op.text, op.add, op.tag);
+    case DD_COMBAT_OP_BUFF_REMOVE:
+        return FakeRemoveNow(op.plugin, op.actor, op.remove, op.text);
+    case DD_COMBAT_OP_EFFECT_APPLY:
+        return FakeApplyNow(op.text, op.actor, op.hasTarget ? op.actor2 : op.actor);
+    case DD_COMBAT_OP_BUFF_DEFINE:
+        return FakeDefineNow(op.plugin, op.def);
+    default:
+        return FakeDefineEffectsNow(op.plugin, op.text);
+    }
+}
+
+// 立即执行或排队（和 DDCore 的 Submit 一样）
+uint32_t FakeSubmit(FakeOp op, DDCombatOpResult* out)
+{
+    const fc::TimingDecision d = FakeTiming();
+    if (d.timing == fc::Timing::Reject) {
+        return FakeOut(out, op.kind, d.code, std::string("拒绝：") + FakeResultText(d.code));
+    }
+    if (d.timing == fc::Timing::Queue) {
+        std::size_t mine = 0;
+        for (const auto& q : g_fc.queue) {
+            mine += q.plugin == op.plugin ? 1 : 0;
+        }
+        if (mine >= 256) {
+            return FakeOut(out, op.kind, DD_COMBAT_E_QUEUE_FULL, "本插件排队的操作超过 256 个");
+        }
+        op.id = g_fc.nextOp++;
+        const auto kind = op.kind;
+        const auto id = op.id;
+        g_fc.queue.push_back(std::move(op));
+        return FakeOut(out, kind, DD_COMBAT_QUEUED, "", id);
+    }
+    const FakeOutcome o = FakeExecute(op);
+    return FakeOut(out, op.kind, o.code, o.message, 0, o.guid, o.count);
+}
+
+void CallOpHandler(void* raw)
+{
+    auto* r = static_cast<DDCombatOpResult*>(raw);
+    g_fc.handler(r, g_fc.handlerUser);
+}
+
+// 帧边界：执行排队的操作并通知（操作回调在安全点，里面的写操作立即执行）
+std::size_t FakeDrain()
+{
+    std::vector<FakeOp> ops;
+    ops.swap(g_fc.queue);
+    const bool frame = g_fc.frame;
+    g_fc.frame = true;
+    for (const auto& op : ops) {
+        const fc::TimingDecision d = FakeTiming();
+        FakeOutcome o = d.timing == fc::Timing::Execute ? FakeExecute(op) : FakeOutcome{ DD_COMBAT_E_CANCELLED, 0, 0, "排队的操作没有执行" };
+        DDCombatOpResult r{};
+        r.size = sizeof(r);
+        r.kind = op.kind;
+        r.op = op.id;
+        r.result = o.code;
+        r.guid = o.guid;
+        r.count = o.count;
+        r.message = o.message.c_str();
+        if (g_fc.handler && op.plugin == kPlugin) {
+            SehCall(&CallOpHandler, &r);  // DDCore 在 SEH 隔离下调用，崩溃只写日志
+        }
+    }
+    g_fc.frame = frame;
+    return ops.size();
+}
+
+bool DD_CALL FakeSetOpHandler(DDPluginHandle plugin, DDCombatOpFn fn, void* user)
+{
+    if (plugin == kPlugin) {
+        g_fc.handler = fn;
+        g_fc.handlerUser = user;
+    }
+    return true;
+}
+
+bool DD_CALL FakeSafePoint()
+{
+    return FakeTiming().timing == fc::Timing::Execute;
+}
+
+// 同 DDCore 的 ReadSafe：加载线程在跑时读接口一律失败（A-S3），read_ready 为假（R2A-S1）
+bool DD_CALL FakeReadReady()
+{
+    return !g_fc.loading;
+}
+
+uint32_t DD_CALL FakeEnumCount(uint32_t table)
+{
+    return fc::EnumCount(table);
+}
+const char* DD_CALL FakeEnumName(uint32_t table, int32_t value)
+{
+    return fc::EnumName(table, value);
+}
+int32_t DD_CALL FakeEnumValue(uint32_t table, const char* name)
+{
+    return name ? fc::EnumValue(table, name) : -1;
+}
+uint32_t DD_CALL FakeSourceFlags(int32_t source)
+{
+    return fc::SourceFlags(source);
+}
+
+bool DD_CALL FakeBuffList(const DDActorRef* ref, uint32_t* guids, uint32_t capacity, uint32_t* count)
+{
+    const std::uintptr_t actor = ref && !g_fc.loading ? FakeActorPtr(*ref) : 0;
+    if (!actor) {
+        return false;
+    }
+    const auto& table = g_fc.tables[actor];
+    for (std::uint32_t i = 0; guids && i < capacity && i < table.size(); ++i) {
+        guids[i] = table[i].guid;
+    }
+    if (count) {
+        *count = static_cast<uint32_t>(table.size());
+    }
+    return true;
+}
+
+bool DD_CALL FakeBuffGet(const DDActorRef* ref, uint32_t guid, DDBuffInfo* out)
+{
+    const std::uintptr_t actor = ref && !g_fc.loading ? FakeActorPtr(*ref) : 0;
+    if (!actor || !out || out->size < sizeof(DDBuffInfo)) {
+        return false;
+    }
+    for (const auto& b : g_fc.tables[actor]) {
+        if (b.guid != guid) {
+            continue;
+        }
+        const std::uint32_t size = out->size;
+        *out = {};
+        out->size = size;
+        out->guid = guid;
+        strcpy_s(out->id, b.def.id);
+        out->stat_type = b.def.stat_type;
+        strcpy_s(out->stat_sub_type, b.def.stat_sub_type);
+        out->amount = b.def.amount;
+        out->duration = b.def.duration;
+        out->duration_type = b.def.duration_type;
+        out->source = b.def.source;
+        out->source_flags = fc::SourceFlags(b.def.source);
+        out->sourcedata = b.def.sourcedata;
+        out->rule_type = b.def.rule_type;
+        out->is_false_rule = b.def.is_false_rule;
+        out->rule_float = b.def.rule_float;
+        strcpy_s(out->rule_string, b.def.rule_string);
+        out->by_plugin = !b.plugin.empty();
+        strcpy_s(out->plugin, b.plugin.c_str());
+        strcpy_s(out->tag, b.tag.c_str());
+        return true;
+    }
+    return false;
+}
+
+bool DD_CALL FakeBuffDefGet(const char* id, DDBuffDef* out)
+{
+    if (!g_world.active || g_fc.loading || !id || !out) {
+        return false;
+    }
+    const auto it = g_fc.library.find(id);
+    if (it == g_fc.library.end()) {
+        return false;
+    }
+    *out = it->second;
+    return true;
+}
+
+uint32_t DD_CALL FakeBuffAdd(DDPluginHandle plugin, const DDActorRef* actor, const char* id, const DDBuffAddOptions* options, DDCombatOpResult* out)
+{
+    DDBuffAddOptions o = options ? *options : DDBuffAddOptions{};
+    const std::string tag = options && options->tag ? options->tag : "";
+    std::string why;
+    if (!actor || !id || !fc::ValidText(id, false) || !fc::ValidText(tag, true) || !fc::ValidateAddOptions(o, &why)) {
+        return FakeOut(out, DD_COMBAT_OP_BUFF_ADD, DD_COMBAT_E_INVALID, why.empty() ? "id 或 tag 无效" : why);
+    }
+    FakeOp op;
+    op.plugin = plugin;
+    op.kind = DD_COMBAT_OP_BUFF_ADD;
+    op.actor = *actor;
+    op.text = id;
+    op.tag = tag;
+    o.tag = nullptr;
+    op.add = o;
+    return FakeSubmit(std::move(op), out);
+}
+
+uint32_t DD_CALL FakeBuffRemove(DDPluginHandle plugin, const DDActorRef* actor, const DDBuffRemoveSpec* spec, DDCombatOpResult* out)
+{
+    std::string why;
+    if (!actor || !spec || !fc::ValidateRemoveSpec(*spec, &why)) {
+        return FakeOut(out, DD_COMBAT_OP_BUFF_REMOVE, DD_COMBAT_E_INVALID, why);
+    }
+    FakeOp op;
+    op.plugin = plugin;
+    op.kind = DD_COMBAT_OP_BUFF_REMOVE;
+    op.actor = *actor;
+    op.remove = *spec;
+    op.text = spec->text ? spec->text : "";
+    op.remove.text = nullptr;
+    return FakeSubmit(std::move(op), out);
+}
+
+uint32_t DD_CALL FakeBuffDefine(DDPluginHandle plugin, const DDBuffDef* def, DDCombatOpResult* out)
+{
+    std::string why;
+    if (!def || !fc::ValidateBuffDef(*def, &why)) {
+        return FakeOut(out, DD_COMBAT_OP_BUFF_DEFINE, DD_COMBAT_E_INVALID, why);
+    }
+    FakeOp op;
+    op.plugin = plugin;
+    op.kind = DD_COMBAT_OP_BUFF_DEFINE;
+    op.def = *def;
+    return FakeSubmit(std::move(op), out);
+}
+
+bool DD_CALL FakeEffectGet(const char* name, DDEffectInfo* out)
+{
+    if (!g_world.active || g_fc.loading || !name || !out) {
+        return false;
+    }
+    const auto it = g_fc.effects.find(name);
+    if (it == g_fc.effects.end()) {
+        return false;
+    }
+    *out = it->second.info;
+    return true;
+}
+
+uint32_t DD_CALL FakeEffectApply(DDPluginHandle plugin, const char* name, const DDActorRef* performer, const DDActorRef* target, DDCombatOpResult* out)
+{
+    if (!name || !performer || !fc::ValidText(name, false)) {
+        return FakeOut(out, DD_COMBAT_OP_EFFECT_APPLY, DD_COMBAT_E_INVALID, "effect 名字无效");
+    }
+    FakeOp op;
+    op.plugin = plugin;
+    op.kind = DD_COMBAT_OP_EFFECT_APPLY;
+    op.actor = *performer;
+    op.hasTarget = target != nullptr;
+    op.actor2 = target ? *target : *performer;
+    op.text = name;
+    return FakeSubmit(std::move(op), out);
+}
+
+uint32_t DD_CALL FakeEffectDefine(DDPluginHandle plugin, const char* text, DDCombatOpResult* out)
+{
+    std::vector<std::string> names;
+    std::string why;
+    if (!text || !fc::ExtractEffectNames(text, &names, &why)) {
+        return FakeOut(out, DD_COMBAT_OP_EFFECT_DEFINE, DD_COMBAT_E_INVALID, why);
+    }
+    FakeOp op;
+    op.plugin = plugin;
+    op.kind = DD_COMBAT_OP_EFFECT_DEFINE;
+    op.text = text;
+    return FakeSubmit(std::move(op), out);
+}
+
+DDRuleId DD_CALL FakeRuleRegister(DDPluginHandle plugin, const char* name, DDRuleFn fn, void* user)
+{
+    if (g_fc.inRule || !name || !fn) {
+        return 0;
+    }
+    for (const auto& r : g_fc.rules) {
+        if (r.name == name || fc::GameHash(r.name) == fc::GameHash(name)) {
+            return 0;
+        }
+    }
+    g_fc.rules.push_back({ g_fc.nextRule, plugin, name, fn, user });
+    return g_fc.nextRule++;
+}
+
+bool DD_CALL FakeRuleUnregister(DDPluginHandle plugin, DDRuleId id)
+{
+    if (g_fc.inRule) {
+        return false;
+    }
+    const auto it = std::find_if(g_fc.rules.begin(), g_fc.rules.end(), [&](const FakeRuleReg& r) { return r.id == id && r.plugin == plugin; });
+    if (it == g_fc.rules.end()) {
+        return false;
+    }
+    g_fc.rules.erase(it);
+    return true;
+}
+
+bool DD_CALL FakeRuleStats(DDRuleStats* out)
+{
+    if (!out) {
+        return false;
+    }
+    out->rules = static_cast<uint32_t>(g_fc.rules.size());
+    out->hits = g_fc.ruleCalls;
+    return true;
+}
+
+bool DD_CALL FakeSkillFromPointer(const void* performer, const void* skill, DDSkillRef* out)
+{
+    DDActorRef ref{};
+    ref.size = sizeof(ref);
+    if (!out || skill != P(0x80000) || !FakeFromPointer(performer, &ref)) {
+        return false;
+    }
+    *out = {};
+    out->size = sizeof(DDSkillRef);
+    out->actor = ref;
+    strcpy_s(out->id, "smite");
+    out->level = ref.kind == DD_ACTOR_HERO ? 2 : 0;
+    return true;
+}
+
+bool DD_CALL FakeSkillInfo(const DDSkillRef* ref, DDSkillInfo* out)
+{
+    if (!ref || !out || !FakeResolve(&ref->actor) || std::strcmp(ref->id, "smite") != 0) {
+        return false;
+    }
+    const std::uint32_t size = out->size;
+    *out = {};
+    out->size = size;
+    strcpy_s(out->id, "smite");
+    out->level = ref->level;
+    strcpy_s(out->type, "melee");
+    out->friendly = false;
+    for (const auto& name : g_fc.smiteEffects) {
+        if (out->effect_count < DD_SKILL_MAX_EFFECTS) {
+            strcpy_s(out->effects[out->effect_count++], name.c_str());
+        }
+    }
+    return true;
+}
+
+const DDCombatService kFakeCombat = { { sizeof(DDCombatService), DD_SERVICE_COMBAT_VERSION }, &FakeResultText, &FakeSetOpHandler, &FakeSafePoint,
+    &FakeReadReady, &FakeEnumCount, &FakeEnumName, &FakeEnumValue, &FakeSourceFlags, &FakeBuffList, &FakeBuffGet, &FakeBuffDefGet, &FakeBuffAdd,
+    &FakeBuffRemove, &FakeBuffDefine, &FakeEffectGet, &FakeEffectApply, &FakeEffectDefine, &FakeRuleRegister, &FakeRuleUnregister,
+    &FakeRuleStats, &FakeSkillFromPointer, &FakeSkillInfo };
+
+struct RuleCall {
+    const FakeRuleReg* reg;
+    const DDRuleContext* ctx;
+    std::uint32_t raw;
+};
+
+void CallRule(void* raw)
+{
+    auto* call = static_cast<RuleCall*>(raw);
+    call->raw = call->reg->fn(call->ctx, call->reg->user);
+}
+
+// 游戏判定一条带脚本规则的 buff（DDCore 的 RuleDetour）：命中注册表时调用回调（SEH 隔离，崩溃后停用），按 is_false_rule 取反。
+// 返回 false 表示交给游戏（没有注册、停用、回调返回 DD_RULE_ORIGINAL）
+bool FakeRuleEval(const char* name, std::uintptr_t self, std::uintptr_t target, int ruleType, bool falseRule, bool* result, const char* buffId = "lua_rule_buff")
+{
+    for (auto& reg : g_fc.rules) {
+        if (reg.name != name || reg.disabled) {
+            continue;
+        }
+        DDRuleContext ctx{};
+        ctx.size = sizeof(ctx);
+        ctx.rule = reg.name.c_str();
+        ctx.actor = P(self);
+        ctx.target = target ? P(target) : nullptr;
+        ctx.subject = ruleType == 42 ? P(self) : ctx.target;
+        ctx.rule_type = ruleType;
+        ctx.is_false_rule = falseRule;
+        ctx.rule_float = 0.5f;
+        ctx.buff_id = buffId;
+        RuleCall call{ &reg, &ctx, DD_RULE_ORIGINAL };
+        ++g_fc.inRule;
+        ++g_fc.ruleCalls;
+        const bool ok = SehCall(&CallRule, &call);
+        --g_fc.inRule;
+        if (!ok) {
+            reg.disabled = true;
+            return false;
+        }
+        if (call.raw != DD_RULE_TRUE && call.raw != DD_RULE_FALSE) {
+            ++g_fc.ruleOriginal;
+            return false;  // 交还原函数
+        }
+        const bool holds = call.raw == DD_RULE_TRUE;
+        *result = falseRule ? !holds : holds;
+        return true;
+    }
+    return false;
+}
+
+// 游戏刷新属性（UpdateBuffsInternal 的第 2 步）：remove_if_not_active 为真、规则不成立的条目直接删掉（reason refresh）。
+// 脚本规则按 FakeRuleEval；没有注册或交还原函数时按游戏原来的判定：认不出的状态字符串为假，地牢里再按 is_false_rule 取反，
+// 城镇里（没有 Raid）规则 42 的前置检查直接返回假、不取反
+void FakeRefresh(std::uintptr_t actor)
+{
+    std::vector<std::uint32_t> drop;
+    for (const auto& b : g_fc.tables[actor]) {
+        if (!b.def.remove_if_not_active || (b.def.rule_type != 42 && b.def.rule_type != 13)) {
+            continue;
+        }
+        bool holds = false;
+        if (!FakeRuleEval(b.def.rule_string, actor, 0, b.def.rule_type, b.def.is_false_rule, &holds, b.def.id)) {
+            holds = g_fc.raid && b.def.rule_type == 42 ? b.def.is_false_rule : false;
+        }
+        if (!holds) {
+            drop.push_back(b.guid);
+        }
+    }
+    for (const auto guid : drop) {
+        FakeGameRemove(actor, guid, "refresh");
+    }
+}
+
+DDBuffDef FakeDef(const char* id, const char* stat, const char* sub, float amount, int duration, const char* dtype, const char* source)
+{
+    DDBuffDef def{};
+    def.size = sizeof(def);
+    strcpy_s(def.id, id);
+    def.stat_type = fc::EnumValue(DD_ENUM_STAT, stat);
+    strcpy_s(def.stat_sub_type, sub);
+    def.amount = amount;
+    def.duration = duration;
+    def.duration_type = fc::EnumValue(DD_ENUM_DURATION, dtype);
+    def.source = fc::EnumValue(DD_ENUM_SOURCE, source);
+    return def;
+}
+
+void ResetCombat()
+{
+    g_fc = {};
+    g_fc.library["SPD5"] = FakeDef("SPD5", "combat_stat_add", "speed_rating", 5, 3, "after_turn", "skill");
+    g_fc.library["rakebuff_5"] = FakeDef("rakebuff_5", "combat_stat_add", "damage_low", 0.1f, 2, "combat_end", "skill");
+    g_fc.library["QUIRK_X"] = FakeDef("QUIRK_X", "combat_stat_multiply", "protection_rating", 0.1f, -1, "till_removed", "quirk");
+    for (const char* name : { "rakebuff_5", "Stun 1" }) {
+        FakeEffect e;
+        e.info.size = sizeof(e.info);
+        strcpy_s(e.info.name, name);
+        e.info.target = 1;
+        e.info.chance = 1;
+        e.info.on_hit = true;
+        if (std::strcmp(name, "rakebuff_5") == 0) {
+            e.buffs.push_back("rakebuff_5");
+            e.info.buff_id_count = 1;
+            e.info.buff_duration_type = fc::EnumValue(DD_ENUM_DURATION, "combat_end");
+        } else {
+            e.info.stun = 1;
+        }
+        g_fc.effects[name] = e;
+    }
+}
+
+ddlua::Host MakeCombatHost()
+{
+    ddlua::Host host = MakeActorHost();
+    host.combat = &kFakeCombat;
+    host.info = &kFakeInfo;  // dd.fs 的数据目录在 g_fakeRoot\DDModLoader\data
+    return host;
+}
+
+// 数据目录的根（测试前清空）
+std::string P4bRoot()
+{
+    return ProjectFile("build/p4b_offline/game");
+}
+
+void RemoveTree(const std::wstring& dir)
+{
+    WIN32_FIND_DATAW data{};
+    HANDLE find = FindFirstFileExW((dir + L"\\*").c_str(), FindExInfoBasic, &data, FindExSearchNameMatch, nullptr, 0);
+    if (find != INVALID_HANDLE_VALUE) {
+        do {
+            const std::wstring name = data.cFileName;
+            if (name == L"." || name == L"..") {
+                continue;
+            }
+            const std::wstring path = dir + L"\\" + name;
+            if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && !(data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
+                RemoveTree(path);
+            } else if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                RemoveDirectoryW(path.c_str());  // 联接：只删联接本身
+            } else {
+                DeleteFileW(path.c_str());
+            }
+        } while (FindNextFileW(find, &data));
+        FindClose(find);
+    }
+    RemoveDirectoryW(dir.c_str());
+}
+
+void ResetP4bRoot()
+{
+    const std::wstring root = ddlua::Utf8ToWide(P4bRoot());
+    RemoveTree(root);
+    CreateDirectoryW(ddlua::Utf8ToWide(ProjectFile("build")).c_str(), nullptr);
+    CreateDirectoryW(ddlua::Utf8ToWide(ProjectFile("build/p4b_offline")).c_str(), nullptr);
+    CreateDirectoryW(root.c_str(), nullptr);
+    CreateDirectoryW((root + L"\\DDModLoader").c_str(), nullptr);
+    g_fakeRoot = P4bRoot();
+}
+
+// 一个 P4b 测试的公共准备：主题表来自游戏（buff.*、damage.final、effect_name 都在），假世界、假 combat 服务
+struct P4bSession {
+    ddlua::Host host;
+    std::unique_ptr<ddlua::Session> session;
+    explicit P4bSession(std::initializer_list<const char*> mods, ddlua::Config config = TestConfig(), const char* name = "存档#P4b")
+    {
+        g_log.clear();
+        CHECK(ResetHubFromDump());
+        ResetWorld();
+        ResetCombat();
+        ResetP4bRoot();
+        host = MakeCombatHost();
+        session = std::make_unique<ddlua::Session>(host, config, name);
+        g_now = 0;
+        session->SetClock([] { return g_now; });
+        session->Load(Sources(mods));
+    }
+    ddlua::Session& operator*() { return *session; }
+    ddlua::Session* operator->() { return session.get(); }
+};
+
+// ---------------------------------------------------------------- F5：队伍、怪物、战斗状态的只读枚举
+// dd.actor.party()、dd.actor.monsters() 是句柄数组（顺序同游戏的表），dd.actor.in_battle() 是布尔和战斗状态；
+// 加载线程在跑时都返回 nil 和「加载中」开头的原因，城镇里（没有 Raid）是空表和 false
+void TestActorEnum()
+{
+    P4bSession s({ "ev_a" });
+    CHECK(s->LoadedCount() == 1);
+    g_world.party = { 0x10100, 0x99999, 0x10000 };  // 0x99999 不是 actor：跳过（DDCore 按名册核对成员关系）
+    CHECK(Lua(*s, "ev_a", R"lua(
+        local p = dd.actor.party()
+        assert(type(p) == "table" and #p == 2, tostring(p and #p))
+        assert(rawequal(p[1], dd.actor.hero(13)) and rawequal(p[2], dd.actor.hero(12)), "顺序同队伍表，句柄驻留")
+        local ms = dd.actor.monsters()
+        assert(#ms == 2 and ms[1].id == 4500 and ms[2].id == 4501 and ms[1].is_monster and ms[1]:valid())
+        local ib, st = dd.actor.in_battle()
+        assert(ib == false and st == 0, tostring(ib))
+        local function err(f) local ok, e = pcall(f) assert(not ok) return e end
+        assert(type(dd.actor.party) == "function" and type(dd.actor.monsters) == "function")
+    )lua"));
+    g_world.battleState = 46;  // 读进战斗中的存档：游戏不派发 battle.start，状态已经非零
+    CHECK(Lua(*s, "ev_a", "local ib, st = dd.actor.in_battle() assert(ib == true and st == 46)"));
+    g_fc.loading = true;
+    CHECK(Lua(*s, "ev_a", R"lua(
+        local p, why = dd.actor.party()
+        assert(p == nil and why:find("^加载中"), tostring(why))
+        local ms, why2 = dd.actor.monsters()
+        assert(ms == nil and why2:find("^加载中"))
+        local ib, why3 = dd.actor.in_battle()
+        assert(ib == nil and why3:find("^加载中"))
+    )lua"));
+    g_fc.loading = false;
+    g_fc.raid = false;  // 城镇：没有 Raid
+    g_world.battleState = 0;
+    CHECK(Lua(*s, "ev_a", R"lua(
+        local p = dd.actor.party()
+        assert(type(p) == "table" and #p == 0)
+        assert(#dd.actor.monsters() == 0 and dd.actor.in_battle() == false)
+    )lua"));
+    g_fc.raid = true;
+    g_world.party.assign(80, 0x10000);  // 超过 64 个：只给前 64 个（DDCore 的上限是 16，这里只核对 DDLua 不越界）
+    CHECK(Lua(*s, "ev_a", "assert(#dd.actor.party() == 64)"));
+    g_world.active = false;  // 存档外（DDCore 返回 false）
+    CHECK(Lua(*s, "ev_a", R"lua(
+        local p, why = dd.actor.party()
+        assert(p == nil and not why:find("^加载中") and why:find("读不到"), tostring(why))
+        local ib, why2 = dd.actor.in_battle()
+        assert(ib == nil and why2:find("读不到"))
+    )lua"));
+    g_world.active = true;
+    s->Teardown();
+}
+
+// ---------------------------------------------------------------- 读：枚举、定义、快照、effect 句柄
+void TestCombatReads()
+{
+    P4bSession s({ "ev_a", "ev_b" });
+    CHECK(s->LoadedCount() == 2);
+    CHECK(Lua(*s, "ev_a", R"lua(
+        -- 枚举表
+        assert(dd.buff.enum("stat", "combat_stat_add") == 2 and dd.buff.enum("stat", 2) == "combat_stat_add")
+        assert(dd.buff.enum("source", "bsrc_trinket") == 6 and dd.buff.enum("source", "trinket") == 6 and dd.buff.enum("source", 1) == "skill")
+        assert(#dd.buff.enum("rule") == 55 and dd.buff.enum("rule")[43] == "is_actor_status" and dd.buff.enum("duration", "after_turn") == 9)
+        assert(dd.buff.enum("duration_type", 999) == nil and dd.buff.enum("stat", "nope") == nil)
+        assert(not pcall(dd.buff.enum, "nope") and not pcall(dd.buff.enum, "stat", 1.5))
+        -- 定义
+        local def = assert(dd.buff.def("SPD5"))
+        assert(def.stat == "combat_stat_add" and def.sub_stat == "speed_rating" and def.amount == 5 and def.duration == 3)
+        assert(def.duration_type == "after_turn" and def.source == "skill" and def.rule == "always" and def.script == false and def.mod == nil)
+        local none, why = dd.buff.def("nope")
+        assert(none == nil and why:find("没有 nope"), why)
+        -- effect 句柄
+        local e = assert(dd.effect.get("rakebuff_5"))
+        assert(e.name == "rakebuff_5" and e.target == 1 and e.chance == 1 and e.on_hit == true and e.buff_id_count == 1 and e.runtime == false)
+        assert(e.buff_duration_type == "combat_end" and e:valid() and dd.effect.get("rakebuff_5") == e and rawequal(dd.effect.get("rakebuff_5"), e))
+        assert(tostring(e) == "dd.effect(rakebuff_5)" and not pcall(function() e.chance = 2 end) and not pcall(function() return e.nope end))
+        local missing, reason = dd.effect.get("nope")
+        assert(missing == nil and reason:find("不存在"), reason)
+        -- 快照：一开始没有 buff
+        local h = dd.actor.hero(12)
+        assert(#h:buffs() == 0 and h:buff(1) == nil)
+    )lua"));
+    // 游戏自己加的一条（读档恢复的这类条目不派发 buff.add）
+    const std::uint32_t quirk = FakeGameAdd(0x10000, "QUIRK_X", false);
+    CHECK(Lua(*s, "ev_a", ("QUIRK = " + std::to_string(quirk)).c_str()));
+    CHECK(Lua(*s, "ev_a", R"lua(
+        local h = dd.actor.hero(12)
+        local list = h:buffs()
+        assert(#list == 1)
+        local b = list[1]
+        assert(b.guid == QUIRK and b.id == "QUIRK_X" and b.stat == "combat_stat_multiply" and b.sub_stat == "protection_rating")
+        assert(b.duration == -1 and b.duration_type == "till_removed" and b.source == "quirk" and b.rule == "always")
+        assert(b.source_flags.saved == false and b.source_flags.town_clear == false and b.source_flags.tray == false)
+        assert(b.plugin == nil and b.mod == nil and b.tag == nil and b.mine == false and b.script == false and b.actor == h)
+        assert(h:buff(QUIRK).id == "QUIRK_X")
+        assert(#h:buffs{ id = "QUIRK_X" } == 1 and #h:buffs{ id = "SPD5" } == 0 and #h:buffs{ source = "quirk" } == 1 and #h:buffs{ source = 5 } == 1)
+        assert(#h:buffs{ stat = "combat_stat_multiply" } == 1 and #h:buffs{ mine = true } == 0 and #h:buffs{ mine = false } == 1)
+        assert(not pcall(h.buffs, h, { nope = 1 }) and not pcall(h.buffs, h, { source = "nope" }) and not pcall(h.buffs, h, { id = 1 }))
+        M = dd.actor.monster(4500)
+        assert(M and #M:buffs() == 0)
+    )lua"));
+    // 失效的句柄：nil 和原因
+    g_world.monsters.clear();
+    CHECK(Lua(*s, "ev_a", R"lua(
+        local list, why = M:buffs()
+        assert(list == nil and why:find("解析失败"), tostring(why))
+        assert(M:buff(1) == nil)
+    )lua"));
+    // 存档外：定义、effect 读不到
+    g_world.active = false;
+    CHECK(Lua(*s, "ev_a", R"lua(
+        assert(dd.buff.def("SPD5") == nil and dd.effect.get("rakebuff_5") == nil)
+    )lua"));
+    g_world.active = true;
+    s->Teardown();
+    CHECK(CoreCount() == 0 && s->memory().residual == 0);
+}
+
+// ---------------------------------------------------------------- 写：定义、添加、删除、标签、拒绝、排队和 done
+void TestCombatWrites()
+{
+    P4bSession s({ "ev_a", "ev_b" });
+    CHECK(Lua(*s, "ev_a", R"lua(
+        -- 定义：立即执行返回 true 和 id
+        local ok, id = dd.buff.define{ id = "lua_spd", stat = "combat_stat_add", sub_stat = "speed_rating", amount = 2, duration = 3,
+            duration_type = "after_turn" }
+        assert(ok == true and id == "lua_spd", tostring(id))
+        local def = dd.buff.def("lua_spd")
+        assert(def.amount == 2 and def.source == "skill" and def.mod == "ev_a" and def.script == false)
+        -- 同一个 Mod 重复定义：更新
+        assert(dd.buff.define{ id = "lua_spd", stat = 2, sub_stat = "speed_rating", amount = 3, duration = 3, duration_type = 9 })
+        assert(dd.buff.def("lua_spd").amount == 3)
+        -- 游戏数据：拒绝
+        local no, why = dd.buff.define{ id = "SPD5", stat = "combat_stat_add", sub_stat = "speed_rating" }
+        assert(no == nil and why:find("游戏数据"), why)
+        -- 参数写错：报错
+        for _, bad in ipairs({ { stat = "combat_stat_add" }, { id = "x" }, { id = "x", stat = "nope" }, { id = "x", stat = 2, duration = 0 },
+                { id = "x", stat = 2, nope = 1 }, { id = "x", stat = 2, amount = "1" }, { id = ("x"):rep(64), stat = 2 }, { id = "a\"b", stat = 2 },
+                { id = "x", stat = 2, on_apply = 1 }, { id = "x", stat = 2, source = 99 } }) do
+            assert(not pcall(dd.buff.define, bad))
+        end
+        -- C-Y3：sub_stat 按 stat 校验（DDCore 的 ValidateBuffDef），认不出返回 nil 和原因
+        local no2, why2 = dd.buff.define{ id = "lua_typo", stat = "combat_stat_add", sub_stat = "speed" }
+        assert(no2 == nil and why2:find("speed_rating"), tostring(why2))
+        no2, why2 = dd.buff.define{ id = "lua_typo", stat = "resistance", sub_stat = "deathblow" }
+        assert(no2 == nil and why2:find("death_blow"), tostring(why2))
+        assert(dd.buff.define{ id = "lua_resist", stat = "resistance", sub_stat = "death_blow", amount = 0.1 })
+        assert(dd.buff.define{ id = "Ab", stat = "tag" })
+    )lua"));
+    // 别的 Mod 定义同一个 id、哈希相同的 id：拒绝
+    CHECK(Lua(*s, "ev_b", R"lua(
+        local no, why = dd.buff.define{ id = "lua_spd", stat = "combat_stat_add", sub_stat = "speed_rating" }
+        assert(no == nil and why:find("Lua Mod ev_a"), why)
+        no, why = dd.buff.define{ id = "B-", stat = "tag" }
+        assert(no == nil and why:find("哈希相同"), why)
+    )lua"));
+    CHECK(Lua(*s, "ev_a", R"lua(
+        local h = dd.actor.hero(12)
+        -- 添加：立即执行返回 guid
+        local ok, g1 = h:add_buff("lua_spd", { tag = "round" })
+        assert(ok == true and math.type(g1) == "integer", tostring(g1))
+        local ok2, g2 = h:add_buff("lua_spd")
+        local ok3, g3 = h:add_buff("SPD5", { duration = 7, source = "trinket", sourcedata = 4, tag = "round", refresh = false })
+        assert(ok2 and ok3 and g2 > g1 and g3 > g2)
+        local b = h:buff(g1)
+        assert(b.id == "lua_spd" and b.mod == "ev_a" and b.tag == "round" and b.mine == true and b.plugin == "DDLua")
+        assert(h:buff(g2).tag == nil and h:buff(g2).mine == true)
+        local b3 = h:buff(g3)
+        assert(b3.duration == 7 and b3.source == "trinket" and b3.sourcedata == 4)
+        assert(#h:buffs{ tag = "round" } == 2 and #h:buffs{ mine = true } == 3 and #h:buffs{ id = "lua_spd" } == 2)
+        G1, G2, G3 = g1, g2, g3
+        -- 被拒绝：nil 和原因
+        local no, why = h:add_buff("nope")
+        assert(no == nil and why:find("没有 nope"), why)
+        -- 参数写错：报错
+        assert(not pcall(h.add_buff, h, "lua_spd", { nope = 1 }) and not pcall(h.add_buff, h, "lua_spd", { duration = 0 }))
+        assert(not pcall(h.add_buff, h, "lua_spd", { state = {} }))  -- 不是脚本 Buff
+        assert(not pcall(h.add_buff, h, "lua_spd", { tag = ("t"):rep(61) }))  -- "ev_a:" 加 tag 超过 63 字节
+        assert(h:add_buff("lua_spd", { tag = ("t"):rep(58) }) and h:remove_buffs{ tag = ("t"):rep(58) })  -- 正好 63 字节
+        assert(not pcall(h.add_buff, h, 1) and not pcall(h.add_buff, h, "lua_spd", { source = "nope" }))
+        assert(not pcall(function() h.hp = 1 end))
+    )lua"));
+    // ev_b 用同样的标签：看不到、删不到 ev_a 的
+    CHECK(Lua(*s, "ev_b", R"lua(
+        local h = dd.actor.hero(12)
+        assert(#h:buffs{ tag = "round" } == 0 and #h:buffs{ mine = true } == 0 and h:buff(G1 or 1).mine == false)
+        local ok, n = h:remove_buffs{ tag = "round" }
+        assert(ok == true and n == 0)
+    )lua"));
+    CHECK(Lua(*s, "ev_a", R"lua(
+        local h = dd.actor.hero(12)
+        local ok, n = h:remove_buffs{ tag = "round" }
+        assert(ok and n == 2, n)
+        ok, n = h:remove_buffs{ guid = G2 }
+        assert(ok and n == 1)
+        ok, n = h:remove_buffs{ guid = G2 }
+        assert(ok and n == 0)
+        assert(h:add_buff("SPD5") and h:add_buff("SPD5"))
+        ok, n = h:remove_buffs{ id = "SPD5" }
+        assert(ok and n == 2)
+        assert(h:add_buff("SPD5", { source = "curio" }))
+        ok, n = h:remove_buffs{ source = "curio" }
+        assert(ok and n == 1 and #h:buffs() == 0)
+        assert(not pcall(h.remove_buffs, h, {}) and not pcall(h.remove_buffs, h, { guid = 1, id = "x" }) and not pcall(h.remove_buffs, h, { nope = 1 }))
+        assert(not pcall(h.remove_buffs, h))
+    )lua"));
+    // 存档外、加载中、PvP：拒绝
+    g_fc.loading = true;
+    CHECK(Lua(*s, "ev_a", R"lua(
+        local no, why = dd.actor.hero(12):add_buff("SPD5")
+        assert(no == nil and why:find("加载"), why)
+        -- 读接口在加载中给出「加载中」开头的原因，和「没有」分开（审核 R2A-S1）
+        local h = dd.actor.hero(12)
+        local list, lwhy = h:buffs()
+        assert(list == nil and lwhy:find("^加载中"), tostring(lwhy))
+        local b, bwhy = h:buff(1)
+        assert(b == nil and bwhy:find("^加载中"), tostring(bwhy))
+        local d, dwhy = dd.buff.def("SPD5")
+        assert(d == nil and dwhy:find("^加载中"), tostring(dwhy))
+        local e, ewhy = dd.effect.get("rakebuff_5")
+        assert(e == nil and ewhy:find("^加载中"), tostring(ewhy))
+        local st, swhy = dd.buff.state(h, 424242)
+        assert(st == nil and swhy:find("^加载中"), tostring(swhy))
+    )lua"));
+    g_fc.loading = false;
+    CHECK(Lua(*s, "ev_a", R"lua(
+        -- 加载结束：照常读；条目不在时只返回 nil（没有第二个返回值）
+        local h = dd.actor.hero(12)
+        assert(type(h:buffs()) == "table" and dd.buff.def("SPD5") ~= nil)
+        assert(select("#", h:buff(424242)) == 1 and h:buff(424242) == nil)
+        local d, dwhy = dd.buff.def("nope_def")
+        assert(d == nil and not dwhy:find("加载中"), dwhy)
+        assert(select("#", dd.buff.state(h, 424242)) == 1)
+    )lua"));
+    g_fc.pvp = true;
+    CHECK(Lua(*s, "ev_a", R"lua(
+        local no, why = dd.buff.define{ id = "lua_pvp", stat = 2, sub_stat = "speed_rating" }
+        assert(no == nil and why:find("PvP"), why)
+    )lua"));
+    g_fc.pvp = false;
+    g_world.active = false;
+    CHECK(Lua(*s, "ev_a", R"lua(
+        local no, why = dd.buff.define{ id = "lua_out", stat = 2, sub_stat = "speed_rating" }
+        assert(no == nil and why:find("不在存档里"), why)
+        local n2, w2 = dd.effect.define('effect: .name "lua_out_fx" .target "performer"\n')
+        assert(n2 == nil and w2:find("不在存档里"), w2)
+    )lua"));
+    g_world.active = true;
+
+    // 事件回调里：排队，结果经 done 在下一个帧边界送达；回调里写的 done 计入订阅
+    CHECK(Lua(*s, "ev_a", R"lua(
+        DONE = {}
+        SUB = dd.on("damage.pre", function(ev)
+            local h = dd.actor.hero(12)
+            local ok, r = h:add_buff("lua_spd", { tag = "queued", done = function(ok, g) DONE.add = { ok, g } end })
+            assert(ok == true and r == nil)
+            ok, r = h:remove_buffs{ tag = "queued", done = function(ok, n) DONE.remove = { ok, n } end }
+            assert(ok == true and r == nil)
+            ok, r = dd.buff.define{ id = "lua_q", stat = 2, sub_stat = "speed_rating", done = function(ok, id) DONE.define = { ok, id } end }
+            assert(ok == true and r == nil)
+            ok, r = h:add_buff("nope", { done = function(ok, why) DONE.fail = { ok, why } end })
+            assert(ok == true and r == nil)
+            local e = dd.effect.get("rakebuff_5")
+            ok, r = e:apply(h, nil, { done = function(ok, res) DONE.apply = { ok, res } end })
+            assert(ok == true and r == nil)
+            ok, r = dd.effect.define('effect: .name "lua_qfx" .target "performer"\n', { done = function(ok, n) DONE.fx = { ok, n } end })
+            assert(ok == true and r == nil)
+            assert(dd.stats().pending == 6, dd.stats().pending)
+        end, { filter = { is_hero = true } })
+    )lua"));
+    Fire dmg("damage.pre");
+    dmg.P("target", P(0x10000)).Fl("damage", 3).B("is_hero", true);
+    dmg.Go();
+    CHECK(g_fc.queue.size() == 6 && s->combat().PendingFor(nullptr) == 6);
+    CHECK(Lua(*s, "ev_a", "assert(next(DONE) == nil) SUB:off()"));
+    CHECK(FakeDrain() == 6);
+    CHECK(Lua(*s, "ev_a", R"lua(
+        assert(DONE.add[1] == true and math.type(DONE.add[2]) == "integer", tostring(DONE.add[2]))
+        assert(DONE.remove[1] == true and DONE.remove[2] == 1)
+        assert(DONE.define[1] == true and DONE.define[2] == "lua_q" and dd.buff.def("lua_q").mod == "ev_a")
+        assert(DONE.fail[1] == nil and DONE.fail[2]:find("没有 nope"), DONE.fail[2])
+        assert(DONE.apply[1] == true and DONE.apply[2].count == 1)
+        assert(DONE.fx[1] == true and DONE.fx[2] == 1 and dd.effect.get("lua_qfx").runtime == true)
+        assert(dd.stats().pending == 0)
+    )lua"));
+    CHECK(s->combat().PendingFor(nullptr) == 0);
+    // 排队的定义失败（别的插件先注册了）：撤销登记
+    g_fc.library["lua_race"] = FakeDef("lua_race", "combat_stat_add", "speed_rating", 1, 1, "after_turn", "skill");
+    g_fc.libOwner["lua_race"] = kOtherPlugin;
+    CHECK(Lua(*s, "ev_a", R"lua(
+        RACE = {}
+        dd.once("damage.pre", function()
+            dd.buff.define{ id = "lua_race", stat = 2, sub_stat = "speed_rating", on_apply = function() end, done = function(ok, why) RACE = { ok, why } end }
+        end)
+    )lua"));
+    dmg.Go();
+    FakeDrain();
+    CHECK(Lua(*s, "ev_a", R"lua(
+        assert(RACE[1] == nil and RACE[2]:find("别的插件"), tostring(RACE[2]))
+        assert(dd.buff.def("lua_race").mod == nil and dd.buff.def("lua_race").script == false)
+    )lua"));
+    // C-N5：排队的「更新已有定义」失败时，原来登记的回调保留（DDCore 里原来的定义还在）
+    CHECK(Lua(*s, "ev_a", R"lua(
+        assert(dd.buff.define{ id = "lua_keep", stat = 2, sub_stat = "speed_rating", on_apply = function() end })
+        assert(dd.buff.def("lua_keep").script == true)
+        KEEP = {}
+        dd.once("damage.pre", function()
+            dd.buff.define{ id = "lua_keep", stat = 2, sub_stat = "speed_rating", on_apply = function() end,
+                done = function(ok, why) KEEP = { ok, why } end }
+        end)
+    )lua"));
+    g_fc.libOwner["lua_keep"] = kOtherPlugin;  // 执行时 DDCore 拒绝（模拟失败）
+    dmg.Go();
+    FakeDrain();
+    CHECK(Lua(*s, "ev_a", R"lua(
+        assert(KEEP[1] == nil and KEEP[2], tostring(KEEP[2]))
+        assert(dd.buff.def("lua_keep").mod == "ev_a" and dd.buff.def("lua_keep").script == true)
+    )lua"));
+    // R2A-N6：同一个新 id 排队定义两次、两次都失败：第一次把「新建」交给第二次，第二次撤销登记，
+    // 不留下 DDCore 里没有对应定义的槽（别的 Mod 之后还能定义这个 id）
+    g_fc.library["lua_twice"] = FakeDef("lua_twice", "combat_stat_add", "speed_rating", 1, 1, "after_turn", "skill");
+    g_fc.libOwner["lua_twice"] = kOtherPlugin;
+    CHECK(Lua(*s, "ev_a", R"lua(
+        TWICE = {}
+        dd.once("damage.pre", function()
+            for i = 1, 2 do
+                local ok, r = dd.buff.define{ id = "lua_twice", stat = 2, sub_stat = "speed_rating", on_apply = function() end,
+                    done = function(okd, why) TWICE[#TWICE + 1] = { okd, why } end }
+                assert(ok == true and r == nil)
+            end
+        end)
+    )lua"));
+    dmg.Go();
+    FakeDrain();
+    CHECK(Lua(*s, "ev_a", R"lua(
+        assert(#TWICE == 2 and TWICE[1][1] == nil and TWICE[2][1] == nil, #TWICE)
+        local d = dd.buff.def("lua_twice")
+        assert(d.mod == nil and d.script == false, tostring(d.mod))
+    )lua"));
+    g_fc.library.erase("lua_twice");
+    g_fc.libOwner.erase("lua_twice");
+    CHECK(Lua(*s, "ev_b", R"lua(
+        local ok, r = dd.buff.define{ id = "lua_twice", stat = 2, sub_stat = "speed_rating", on_apply = function() end }
+        assert(ok == true and r == "lua_twice", tostring(r))
+    )lua"));
+    // 每个 Mod 最多排 128 个
+    CHECK(Lua(*s, "ev_b", R"lua(
+        dd.once("damage.pre", function()
+            local h = dd.actor.hero(13)
+            local accepted, refused = 0, nil
+            for i = 1, 140 do
+                local ok, why = h:add_buff("SPD5")
+                if ok then accepted = accepted + 1 else refused = refused or why end
+            end
+            QFULL = { accepted, refused }
+        end)
+    )lua"));
+    dmg.Go();
+    CHECK(Lua(*s, "ev_b", "assert(QFULL[1] == 128 and QFULL[2]:find('超过 128'), tostring(QFULL[2]))"));
+    FakeDrain();
+    CHECK(g_fc.tables[0x10100].size() == 128);
+    // 退出存档前没执行的：丢弃（会话拆除后操作结果不再送达）
+    CHECK(Lua(*s, "ev_b", R"lua(
+        dd.once("damage.pre", function() dd.actor.hero(13):add_buff("SPD5", { done = function() LATE = true end }) end)
+    )lua"));
+    dmg.Go();
+    s->Teardown();
+    FakeDrain();
+    CHECK(CoreCount() == 0 && s->memory().residual == 0 && !LogHas("出错"));
+}
+
+// ---------------------------------------------------------------- effect：施加、文本定义、脚本 Effect、技能句柄
+void TestCombatEffects()
+{
+    P4bSession s({ "ev_a", "ev_b" });
+    CHECK(Lua(*s, "ev_a", R"lua(
+        local h, h2 = dd.actor.hero(12), dd.actor.hero(13)
+        -- 立即执行：结果是表，count 是新增的条数，数组是 performer、target 身上新增的条目
+        local ok, r = dd.effect.get("rakebuff_5"):apply(h, h2)
+        assert(ok == true and r.count == 1 and #r == 1 and r[1].actor == h2 and r[1].id == "rakebuff_5" and h2:buff(r[1].guid))
+        ok, r = dd.effect.get("Stun 1"):apply(h)
+        assert(ok and r.count == 0 and #r == 0)
+        assert(not pcall(dd.effect.get("Stun 1").apply, dd.effect.get("Stun 1"), "x"))
+        -- 文本定义
+        ok, r = dd.effect.define('effect: .name "lua_fx_a" .target "performer" .buff_ids SPD5\r\neffect: .name "lua_fx_b" .target "target"\r\n')
+        assert(ok and r == 2, tostring(r))
+        assert(dd.effect.get("lua_fx_a").runtime and dd.effect.get("lua_fx_b"))
+        ok, r = dd.effect.get("lua_fx_a"):apply(h)
+        assert(ok and r.count == 1 and r[1].id == "SPD5")
+        assert(dd.effect.define('effect: .name "lua_fx_a" .target "performer"\n'))  -- 重新定义自己的
+        local no, why = dd.effect.define('effect: .name "rakebuff_5" .target "performer"\n')
+        assert(no == nil and why:find("游戏数据"), why)
+        assert(not pcall(dd.effect.define, "no blocks here") and not pcall(dd.effect.define, 'effect: .target "performer"\n'))
+        assert(not pcall(dd.effect.define, 'effect: .name "a"\neffect: .name "a"\n') and not pcall(dd.effect.define, ""))
+        assert(not pcall(dd.effect.define, 'effect: .name "a"\n', { nope = 1 }))
+        -- A-S1：按游戏的规则取 .name（最后一次出现，紧跟引号也算），改写游戏数据的企图被认出来
+        no, why = dd.effect.define('effect: .name "lua_mine" .target "performer" .name"rakebuff_5"')
+        assert(no == nil and why:find("rakebuff_5"), why)
+        -- A-B1：块达到 1024 字节、值里的冒号开出新块，在交给游戏之前报错
+        local okb, err = pcall(dd.effect.define, 'effect: .name "lua_long" .target "performer"' .. (" "):rep(1000) .. "\n")
+        assert(not okb and err:find("1023"), err)
+        okb, err = pcall(dd.effect.define, 'effect: .name "lua_colon" .set_mode x:y\n')
+        assert(not okb and err:find("不是 effect"), err)
+    )lua"));
+    CHECK(Lua(*s, "ev_b", R"lua(
+        local no, why = dd.effect.define('effect: .name "lua_fx_b" .target "performer"\n')
+        assert(no == nil and why:find("Lua Mod ev_a"), why)
+    )lua"));
+    // 城镇：施加被拒绝
+    g_fc.raid = false;
+    CHECK(Lua(*s, "ev_a", R"lua(
+        local no, why = dd.effect.get("rakebuff_5"):apply(dd.actor.hero(12))
+        assert(no == nil and why:find("城镇"), why)
+    )lua"));
+    g_fc.raid = true;
+
+    // 脚本 Effect：名字匹配在 C++ 里做，不匹配的不进入 Lua
+    CHECK(Lua(*s, "ev_a", R"lua(
+        HITS = { exact = 0, prefix = 0, all = 0 }
+        EXACT = dd.effect.register("shield_gain_37", function(ev)
+            HITS.exact = HITS.exact + 1
+            assert(ev.effect.name == "shield_gain_37" and ev.effect_name == "shield_gain_37" and ev.performer == dd.actor.hero(12))
+        end)
+        PREFIX = dd.effect.register("shield_gain_*", function(ev)
+            HITS.prefix = HITS.prefix + 1
+            LAST = ev.effect_name
+            if ev.effect_name == "shield_gain_99" then ev:cancel() end
+            -- 回调里的写操作排队
+            local ok, r = ev.target:add_buff("SPD5")
+            assert(ok == true and r == nil)
+        end, { priority = 5 })
+        ALL = dd.effect.register("*", function(ev) HITS.all = HITS.all + 1 end)
+        assert(EXACT and PREFIX and ALL and PREFIX.topic == "effect.pre" and dd.subscriptions() == 3)
+        for _, bad in ipairs({ "", "a*b", "**", ("x"):rep(64), 'a"b' }) do assert(not pcall(dd.effect.register, bad, function() end), bad) end
+        assert(not pcall(dd.effect.register, "x", 1) and not pcall(dd.effect.register, "x", function() end, { nope = 1 }))
+    )lua"));
+    const auto fireEffect = [](const char* name) {
+        Fire pre("effect.pre");
+        pre.P("performer", P(0x10000)).P("target", P(0x10100)).P("effect", P(0x81000)).S("effect_name", name);
+        return pre.Go();
+    };
+    fireEffect("shield_gain_37");
+    fireEffect("shield_gain_12");
+    const Payload cancelled = fireEffect("shield_gain_99");
+    fireEffect("rakebuff_5");
+    CHECK(cancelled.cancelled);
+    CHECK(Lua(*s, "ev_a", R"lua(
+        assert(HITS.exact == 1 and HITS.prefix == 3 and HITS.all == 4 and LAST == "shield_gain_99", HITS.prefix)
+        PREFIX:off()
+    )lua"));
+    CHECK(g_fc.queue.size() == 3);
+    FakeDrain();
+    fireEffect("shield_gain_5");
+    CHECK(Lua(*s, "ev_a", "assert(HITS.prefix == 3 and HITS.all == 5)"));
+    // 出错的脚本 Effect 和普通订阅一样连续 3 次停用
+    CHECK(Lua(*s, "ev_b", R"lua(BAD = dd.effect.register("boom_*", function() error("故意") end))lua"));
+    for (int i = 0; i < 4; ++i) {
+        fireEffect("boom_1");
+    }
+    CHECK(CountLog("dd.effect.register(\"boom_*\") 的回调出错") == 3 && LogHas("已停用该订阅"));
+    CHECK(Lua(*s, "ev_b", "assert(not BAD:active())"));
+
+    // 技能句柄（skill.pre 的 skill 字段）
+    CHECK(Lua(*s, "ev_a", R"lua(
+        SKILL = nil
+        dd.once("skill.pre", function(ev)
+            local sk = ev.skill
+            assert(sk and sk.id == "smite" and sk.level == 2 and sk.type == "melee" and sk.friendly == false and sk.performer == dd.actor.hero(12))
+            assert(#sk.effects == 2 and sk.effects[1] == "Stun 1" and sk:valid() and tostring(sk):find("smite"))
+            assert(not pcall(function() sk.level = 3 end) and not pcall(function() return sk.nope end))
+            SKILL = sk
+        end)
+        dd.spawn(function() SNAP = dd.wait_event("skill.post") end)
+    )lua"));
+    for (const char* name : { "skill.pre", "skill.post" }) {
+        Fire f(name);
+        f.P("performer", P(0x10000)).P("skill", P(0x80000)).P("target", P(0x20000)).I("target_count", 1).B("friendly", false);
+        f.Go();
+    }
+    Tick(*s, 0.1);
+    CHECK(Lua(*s, "ev_a", R"lua(
+        assert(SKILL and SKILL.id == "smite")
+        assert(SNAP and SNAP.skill and SNAP.skill.id == "smite" and SNAP.skill == SKILL)
+    )lua"));
+    // 不在职业技能表里的指针：nil
+    CHECK(Lua(*s, "ev_a", R"lua(dd.once("skill.pre", function(ev) NOSKILL = ev.skill == nil end))lua"));
+    Fire other("skill.pre");
+    other.P("performer", P(0x10000)).P("skill", P(0x80100));
+    other.Go();
+    CHECK(Lua(*s, "ev_a", "assert(NOSKILL)"));
+    s->Teardown();
+    CHECK(CoreCount() == 0 && s->memory().residual == 0);
+}
+
+// ---------------------------------------------------------------- 脚本 Buff：状态的绑定、回调、丢弃
+void TestScriptBuff()
+{
+    P4bSession s({ "ev_a", "ev_b" });
+    CHECK(Lua(*s, "ev_a", R"lua(
+        CALLS = {}
+        local function log(kind, b, st, extra) CALLS[#CALLS + 1] = { kind = kind, guid = b.guid, id = b.id, actor = b.actor, state = st, extra = extra } end
+        assert(dd.buff.define{ id = "lua_shield", stat = "combat_stat_add", sub_stat = "protection_rating", amount = 0, duration = 3,
+            duration_type = "after_turn",
+            on_apply = function(b, st) st.applied = (st.applied or 0) + 1 log("apply", b, st) end,
+            on_remove = function(b, st, reason) log("remove", b, st, reason) end,
+            on_tick = function(b, st, before, after) st.ticks = (st.ticks or 0) + 1 log("tick", b, st, { before, after }) end,
+            on_damage = function(b, st, ev)
+                log("damage", b, st, ev.damage)
+                if st.shield and st.shield > 0 then
+                    local absorbed = math.min(st.shield, ev.damage)
+                    st.shield = st.shield - absorbed
+                    ev.damage = ev.damage - absorbed
+                end
+            end })
+        assert(dd.buff.def("lua_shield").script == true)
+        function LAST() return CALLS[#CALLS] end
+    )lua"));
+    CHECK(s->combat().InternalSubscriptions() == 4);
+    // 1. 立即执行的添加（hook 已装上）：同步派发的 buff.add 里绑定初始状态，on_apply 在 add_buff 返回之前
+    CHECK(Lua(*s, "ev_a", R"lua(
+        local h = dd.actor.hero(12)
+        local ok, g = h:add_buff("lua_shield", { state = { shield = 4, tags = { "a", "b" } }, tag = "s1" })
+        assert(ok and #CALLS == 1 and LAST().kind == "apply" and LAST().guid == g and LAST().state.shield == 4 and LAST().state.applied == 1)
+        assert(dd.buff.state(h, g) == LAST().state and h:buff(g).script == true and dd.stats().states == 1)
+        S1 = g
+    )lua"));
+    // 2. hook 还没装上（定义后的第一帧）：buff_add 返回之后绑定、调用 on_apply，只调用一次
+    g_fc.hooks = false;
+    CHECK(Lua(*s, "ev_a", R"lua(
+        local ok, g = dd.actor.hero(12):add_buff("lua_shield", { state = { shield = 1 } })
+        assert(ok and #CALLS == 2 and LAST().guid == g and LAST().state.shield == 1 and LAST().state.applied == 1)
+        S2 = g
+    )lua"));
+    g_fc.hooks = true;
+    // 3. 排队的添加：结果送达时绑定初始状态（buff.add 里先看到的那次不当作游戏加的）
+    CHECK(Lua(*s, "ev_a", R"lua(
+        dd.once("damage.post", function()
+            local ok, r = dd.actor.hero(13):add_buff("lua_shield", { state = { shield = 9 }, done = function(ok, g) S3 = g end })
+            assert(ok and r == nil)
+        end)
+    )lua"));
+    Fire post("damage.post");
+    post.P("target", P(0x10100)).Fl("damage", 1);
+    post.Go();
+    CHECK(Lua(*s, "ev_a", "assert(#CALLS == 2 and S3 == nil)"));
+    FakeDrain();
+    CHECK(Lua(*s, "ev_a", R"lua(
+        assert(S3 and #CALLS == 3 and LAST().guid == S3 and LAST().state.shield == 9 and LAST().state.applied == 1, #CALLS)
+        assert(dd.buff.state(dd.actor.hero(13), S3).shield == 9)
+    )lua"));
+    // 4. 游戏自己加的同 id 载体（数据层的 effect 引用了这个 id）：buff.add 里绑定空表
+    const std::uint32_t game = FakeGameAdd(0x10100, "lua_shield");
+    CHECK(Lua(*s, "ev_a", ("GAME = " + std::to_string(game)).c_str()));
+    CHECK(Lua(*s, "ev_a", R"lua(
+        assert(#CALLS == 4 and LAST().guid == GAME and LAST().state.applied == 1 and LAST().state.shield == nil)
+    )lua"));
+    // 5. 读档恢复的载体（不派发 buff.add）：第一次用到时绑定空表，不调用 on_apply
+    const std::uint32_t loaded = FakeGameAdd(0x10000, "lua_shield", false);
+    CHECK(Lua(*s, "ev_a", ("LOADED = " + std::to_string(loaded)).c_str()));
+    CHECK(Lua(*s, "ev_a", R"lua(
+        local st = dd.buff.state(dd.actor.hero(12), LOADED)
+        assert(st and next(st) == nil and #CALLS == 4)
+        assert(dd.buff.state(dd.actor.hero(12), 9999) == nil and dd.buff.state(dd.actor.hero(12), S1).shield == 4)
+        assert(not pcall(dd.buff.state, "x", 1) and not pcall(dd.buff.state, dd.actor.hero(12), -1))
+    )lua"));
+    // 6. on_tick
+    FakeTickBuff(0x10000, 1);  // S1 的 guid 是 1
+    CHECK(Lua(*s, "ev_a", R"lua(
+        assert(LAST().kind == "tick" and LAST().guid == S1 and LAST().extra[1] == 3 and LAST().extra[2] == 2 and LAST().state.ticks == 1)
+    )lua"));
+    // 7. on_damage：载体所在的 actor 受到伤害，可写（S1 护盾 4、S2 护盾 1，按表的顺序各吸收一次）
+    Fire pre("damage.pre");
+    pre.P("target", P(0x10000)).Fl("damage", 6).B("is_hero", true);
+    pre.Go();
+    CHECK(pre.At("damage").v.f == 1.0);
+    CHECK(Lua(*s, "ev_a", R"lua(
+        assert(dd.buff.state(dd.actor.hero(12), S1).shield == 0 and dd.buff.state(dd.actor.hero(12), S2).shield == 0)
+        local n = 0 for _, c in ipairs(CALLS) do if c.kind == "damage" then n = n + 1 end end
+        assert(n == 3, n)  -- hero#12 身上 S1、S2、LOADED 三条载体
+    )lua"));
+    // 8. 到期删除：on_remove(expired)，状态丢弃
+    FakeTickBuff(0x10000, 1);
+    FakeTickBuff(0x10000, 1);
+    CHECK(Lua(*s, "ev_a", R"lua(
+        assert(LAST().kind == "remove" and LAST().guid == S1 and LAST().extra == "expired" and LAST().state.shield == 0)
+        assert(dd.buff.state(dd.actor.hero(12), S1) == nil and dd.actor.hero(12):buff(S1) == nil)
+    )lua"));
+    // 9. Lua 删除：on_remove(plugin)
+    CHECK(Lua(*s, "ev_a", R"lua(
+        local ok, n = dd.actor.hero(12):remove_buffs{ guid = S2 }
+        assert(ok and n == 1 and LAST().kind == "remove" and LAST().guid == S2 and LAST().extra == "plugin" and LAST().state.shield == 0)
+    )lua"));
+    // 10. 延迟事件（加载线程上的删除）：actor 按 actor_kind、actor_id 找回句柄
+    CHECK(Lua(*s, "ev_b", R"lua(dd.once("buff.remove", function(ev) DEFERRED = { ev.deferred, ev.actor, ev.id } end))lua"));
+    FakeGameRemove(0x10100, game, "town_visit", true);
+    CHECK(Lua(*s, "ev_a", R"lua(
+        assert(LAST().kind == "remove" and LAST().guid == GAME and LAST().extra == "town_visit" and LAST().actor == dd.actor.hero(13))
+    )lua"));
+    CHECK(Lua(*s, "ev_b", "assert(DEFERRED[1] == true and DEFERRED[2] == dd.actor.hero(13) and DEFERRED[3] == 'lua_shield')"));
+    // 11. 怪物身上的载体：战斗结束、怪物不再能解析后，每秒的清理调用 on_remove(gone)
+    CHECK(Lua(*s, "ev_a", R"lua(
+        local ok, g = dd.actor.monster(4500):add_buff("lua_shield", { state = { shield = 2 } })
+        assert(ok) MON = g
+    )lua"));
+    Tick(*s, 0.5);
+    g_world.monsters.clear();
+    ++g_world.battle;
+    Tick(*s, 1.6);
+    CHECK(Lua(*s, "ev_a", R"lua(
+        assert(LAST().kind == "remove" and LAST().guid == MON and LAST().extra == "gone" and LAST().state.shield == 2)
+        assert(LAST().actor.kind == "monster" and LAST().id == "lua_shield")
+    )lua"));
+    // 12. 状态必须能保存成 JSON：添加时检查，报错说明位置
+    CHECK(Lua(*s, "ev_a", R"lua(
+        local h = dd.actor.hero(12)
+        for _, bad in ipairs({ { f = print }, { a = { b = { 1, 2, nil, 4 } } }, { [1] = 1, x = 2 }, { [1.5] = 1 }, { x = 0/0 }, { x = 1/0 },
+                { s = "\xff" }, { [true] = 1 } }) do
+            local ok, err = pcall(h.add_buff, h, "lua_shield", { state = bad })
+            assert(not ok and err:find("state"), tostring(err))
+        end
+        local ok, err = pcall(h.add_buff, h, "lua_shield", { state = { a = { b = print } } })
+        assert(err:find("state%.a%.b") and err:find("function"), err)
+        local cyc = {} cyc.self = cyc
+        ok, err = pcall(h.add_buff, h, "lua_shield", { state = cyc })
+        assert(not ok and err:find("嵌套"), err)
+    )lua"));
+    // 13. 给 P4c 的导出和导入
+    std::vector<std::string> errors;
+    auto records = s->combat().ExportStates(&errors);
+    CHECK(errors.empty() && records.size() == 2);  // S3（hero#13）和 LOADED（hero#12）
+    std::string exported;
+    for (const auto& r : records) {
+        exported += r.mod + "/" + r.buffId + "/" + std::to_string(r.actor.id) + "/" + std::to_string(r.guid) + "=" + r.json + "\n";
+    }
+    std::printf("  导出的状态：\n%s", exported.c_str());
+    CHECK(exported.find("\"shield\":9") != std::string::npos && exported.find("\"applied\":1") != std::string::npos);
+    CHECK(Lua(*s, "ev_a", R"lua(dd.buff.state(dd.actor.hero(13), S3).nested = { 1, 2.5, "三", { x = true } })lua"));
+    records = s->combat().ExportStates(&errors);
+    ddlua::CombatBinding::StateRecord loadedRecord;
+    for (auto& r : records) {
+        if (r.actor.id == 13) {
+            CHECK(r.json.find("\"nested\":[1,2.5,\"三\",{\"x\":true}]") != std::string::npos);
+        } else {
+            loadedRecord = r;
+        }
+    }
+    loadedRecord.json = R"({"shield":7,"list":[1,2,3],"f":1.0,"i":2})";
+    std::string importError;
+    CHECK(s->combat().ImportState(loadedRecord, &importError));
+    CHECK(Lua(*s, "ev_a", R"lua(
+        local st = dd.buff.state(dd.actor.hero(12), LOADED)
+        assert(st.shield == 7 and #st.list == 3 and math.type(st.f) == "float" and math.type(st.i) == "integer")
+    )lua"));
+    auto badRecord = loadedRecord;
+    badRecord.guid = 9999;
+    CHECK(!s->combat().ImportState(badRecord, &importError) && importError.find("不存在") != std::string::npos);
+    badRecord = loadedRecord;
+    badRecord.mod = "ev_b";
+    CHECK(!s->combat().ImportState(badRecord, &importError));
+    badRecord = loadedRecord;
+    badRecord.json = "not json";
+    CHECK(!s->combat().ImportState(badRecord, &importError) && importError.find("解析") != std::string::npos);
+    // 14. 回调出错：连续 3 次停用这个回调
+    CHECK(Lua(*s, "ev_b", R"lua(
+        assert(dd.buff.define{ id = "lua_bad", stat = 2, sub_stat = "speed_rating", duration = 9, on_apply = function() error("故意") end, on_remove = function() REMOVED = true end })
+        local h = dd.actor.hero(13)
+        for i = 1, 4 do assert(h:add_buff("lua_bad")) end
+        assert(h:remove_buffs{ id = "lua_bad" } and REMOVED)
+    )lua"));
+    CHECK(CountLog("脚本 Buff lua_bad 的 on_apply 出错") == 3 && LogHas("已停用这个回调"));
+    // 15. 会话中解雇英雄：每秒的清理对它身上的载体调用 on_remove(gone)（hero#13 身上 S3 和新加的一条）
+    CHECK(Lua(*s, "ev_a", "assert(dd.actor.hero(13):add_buff('lua_shield')) BEFORE_FIRE = #CALLS"));
+    g_world.heroes.erase(0x10100);  // 解雇 hero#13：句柄失效
+    Tick(*s, 3.0);
+    CHECK(Lua(*s, "ev_a", R"lua(
+        local n = 0
+        for i = BEFORE_FIRE + 1, #CALLS do
+            local c = CALLS[i]
+            assert(c.kind == "remove" and c.extra == "gone" and c.actor.kind == "hero" and c.actor.id == 13, c.kind)
+            n = n + 1
+        end
+        assert(n == 2 and dd.buff.state(dd.actor.hero(12), LOADED) and dd.stats().states == 1, n)
+    )lua"));
+    // 16. 重载拆除 Mod：它的定义和状态直接丢弃，不调用 on_remove
+    CHECK(Lua(*s, "ev_b", R"lua(
+        assert(dd.buff.define{ id = "lua_reload", stat = 2, sub_stat = "speed_rating", duration = 9,
+            on_remove = function(b, st, why) dd.log.info("lua_reload on_remove " .. why) end })
+        assert(dd.actor.hero(12):add_buff("lua_reload") and dd.stats().states == 1)
+    )lua"));
+    std::string reloadError;
+    CHECK(s->Reload("ev_b", &reloadError));
+    CHECK(CountLog("lua_reload on_remove") == 0);
+    CHECK(Lua(*s, "ev_b", "local d = dd.buff.def('lua_reload') assert(dd.stats().states == 0 and not (d and d.script))"));
+    CHECK(Lua(*s, "ev_a", "assert(dd.stats().states == 1)"));
+    // 17. 退出存档：DDCore 先把存档标成不活跃（英雄句柄都解析不了）再派发 CampaignUnload。拆除时不调用 on_remove、不按 gone 清扫，
+    // 状态直接丢弃：英雄身上的、随战斗销毁但还没到每秒清理的怪物身上的都一样（F7）
+    CHECK(Lua(*s, "ev_a", R"lua(
+        assert(dd.buff.define{ id = "lua_exit", stat = 2, sub_stat = "speed_rating", duration = 9,
+            on_remove = function(b, st, why) dd.log.info("lua_exit on_remove " .. why) end })
+        assert(dd.actor.hero(12):add_buff("lua_exit"))
+    )lua"));
+    g_world.monsters[0x20000] = { 4500, 7 };
+    CHECK(Lua(*s, "ev_a", "assert(dd.actor.monster(4500):add_buff('lua_exit') and dd.stats().states == 3)"));
+    g_world.monsters.clear();  // 战斗销毁，还没到每秒的清理
+    ++g_world.battle;
+    g_world.active = false;    // core.cpp：SetCampaignActive(false) 在派发 CampaignUnload 之前
+    const std::size_t goneBefore = CountLog("条载体的 actor 不再能解析");
+    s->Teardown();
+    CHECK(CountLog("lua_exit on_remove") == 0);
+    CHECK(CountLog("条载体的 actor 不再能解析") == goneBefore && LogHas("退出存档，丢弃 3 条载体的状态"));
+    CHECK(CoreCount() == 0 && s->memory().residual == 0 && ddlua::EventBinding::GlobalSdkCount() == 0);
+}
+
+// ---------------------------------------------------------------- 规则：只读、预算、停用、撤销
+void TestRules()
+{
+    ddlua::Config config = TestConfig();
+    config.ruleBudgetMs = 5;
+    P4bSession s({ "ev_a", "ev_b" }, config);
+    CHECK(Lua(*s, "ev_a", R"lua(
+        RULE_ARGS = nil
+        R1 = dd.buff.rule("lua_rule", function(self, target, buff)
+            RULE_ARGS = { self = self, target = target, buff = buff }
+            -- 只读：写操作、注册类函数都报错
+            local h = dd.actor.hero(12)
+            for name, fn in pairs({ add = function() h:add_buff("SPD5") end, remove = function() h:remove_buffs{ id = "SPD5" } end,
+                    on = function() dd.on("app.tick", function() end) end, after = function() dd.after(1, function() end) end,
+                    spawn = function() dd.spawn(function() end) end, write = function() dd.fs.write("x", "y") end,
+                    define = function() dd.buff.define{ id = "x", stat = 2 } end, rule = function() dd.buff.rule("x", function() end) end,
+                    fx = function() dd.effect.get("rakebuff_5"):apply(h) end, efx = function() dd.effect.define('effect: .name "x"\n') end,
+                    off = function() R1:off() end }) do
+                local ok, err = pcall(fn)
+                assert(not ok and err:find("规则回调"), name .. "：" .. tostring(err))
+            end
+            -- 读照常
+            assert(h.hp == 10 and #h:buffs() >= 0 and dd.buff.def("SPD5"))
+            return RULE_RESULT
+        end)
+        assert(R1 and R1.name == "lua_rule" and R1:active() and tostring(R1) == "dd.rule(lua_rule)" and dd.stats().rules == 1)
+        RULE_RESULT = true
+        local no, why = dd.buff.rule("lua_rule", function() return true end)
+        assert(no == nil and why:find("注册失败"), why)
+        assert(not pcall(dd.buff.rule, "", function() end) and not pcall(dd.buff.rule, "x", 1) and not pcall(dd.buff.rule, ("x"):rep(64), print))
+    )lua"));
+    CHECK(g_fc.rules.size() == 1);
+    bool result = false;
+    CHECK(FakeRuleEval("lua_rule", 0x10000, 0x20000, 42, false, &result) && result);
+    CHECK(Lua(*s, "ev_a", R"lua(
+        assert(RULE_ARGS.self == dd.actor.hero(12) and RULE_ARGS.target == dd.actor.monster(4500))
+        local b = RULE_ARGS.buff
+        assert(b.id == "lua_rule_buff" and b.rule == "is_actor_status" and b.rule_string == "lua_rule" and b.is_false_rule == false)
+        assert(b.subject == dd.actor.hero(12) and math.abs(b.rule_float - 0.5) < 1e-6)
+    )lua"));
+    // is_false_rule：DDCore 取反，回调不用管
+    CHECK(FakeRuleEval("lua_rule", 0x10000, 0, 13, true, &result) && !result);
+    CHECK(Lua(*s, "ev_a", "assert(RULE_ARGS.target == nil and RULE_ARGS.buff.rule == 'actorStatus' and RULE_ARGS.buff.subject == nil)"));
+    // 返回值不是布尔、出错：交还原函数（P4c1 起，原来按假处理），连续 3 次停用，下一帧向 DDCore 撤销
+    CHECK(Lua(*s, "ev_a", "RULE_RESULT = 1"));
+    for (int i = 0; i < 3; ++i) {
+        result = true;
+        CHECK(!FakeRuleEval("lua_rule", 0x10000, 0, 42, false, &result) && result);
+    }
+    CHECK(LogHas("规则回调必须返回布尔") && LogHas("已停用：之后交还游戏原来的判定"));
+    CHECK(Lua(*s, "ev_a", "assert(not R1:active())"));
+    result = true;
+    CHECK(!FakeRuleEval("lua_rule", 0x10000, 0, 42, false, &result) && result);  // 停用后、撤销前：交还原函数，不进 Lua
+    CHECK(g_fc.rules.size() == 1);
+    Tick(*s, 0.1);
+    CHECK(g_fc.rules.empty() && LogHas("规则 lua_rule 已向 DDCore 撤销"));
+    CHECK(!FakeRuleEval("lua_rule", 0x10000, 0, 42, false, &result));  // 交给游戏
+    // 超预算：一次就停用；死循环最多卡 rule_budget_ms 左右
+    CHECK(Lua(*s, "ev_b", R"lua(R2 = dd.buff.rule("lua_loop", function() while true do end end))lua"));
+    const auto t0 = std::chrono::steady_clock::now();
+    CHECK(!FakeRuleEval("lua_loop", 0x10100, 0, 42, false, &result));
+    const double loopMs = Ms(t0);
+    std::printf("  规则回调死循环 %.1f ms 后被打断（rule_budget_ms = 5）\n", loopMs);
+    CHECK(loopMs < 100 && LogHas("超出 rule_budget_ms"));
+    Tick(*s, 0.2);
+    CHECK(g_fc.rules.empty());
+    // 规则回调里的原生异常：DDCore 的隔离停用规则，VM 标记损坏
+    CHECK(Lua(*s, "ev_b", R"lua(R3 = dd.buff.rule("lua_crash", function() dd.actor.hero(666) return true end))lua"));
+    // rule:off() 由所属 Mod 撤销
+    CHECK(Lua(*s, "ev_a", R"lua(
+        R4 = dd.buff.rule("lua_off", function() return true end)
+        assert(R4:off() == true and R4:off() == false and not R4:active())
+    )lua"));
+    CHECK(g_fc.rules.size() == 1);
+    g_crashFind = true;
+    CHECK(!FakeRuleEval("lua_crash", 0x10100, 0, 42, false, &result));
+    g_crashFind = false;
+    CHECK(s->Broken() && LogHas("combat 回调里执行 Lua 代码时发生了原生异常") == false);
+    s->Teardown();
+    CHECK(LogHas("Lua VM 已损坏") && g_fc.rules.empty() && CoreCount() == 0);
+}
+
+// ---------------------------------------------------------------- dd.fs 的写入（D10）
+void TestDataFs()
+{
+    ddlua::Config config = TestConfig();
+    config.dataMaxMb = 1;
+    config.dataMaxFiles = 6;  // 条目数：文件和目录都算（C-Y1）
+    P4bSession s({ "ev_a", "ev_b" }, config);
+    CHECK(Lua(*s, "ev_a", R"lua(
+        -- 还没有写过：读不到，列表为空
+        assert(dd.fs.read("a.txt", { root = "data" }) == nil and not dd.fs.exists("a.txt", { root = "data" }))
+        assert(#dd.fs.list{ root = "data" } == 0 and dd.fs.list("sub", { root = "data" }) == nil)
+        local n, why = dd.fs.remove("a.txt")
+        assert(n == nil and why, why)
+        -- 写、读、覆盖、子目录
+        assert(dd.fs.write("a.txt", "one") == true)
+        assert(dd.fs.read("a.txt", { root = "data" }) == "one" and dd.fs.exists("a.txt", { root = "data" }))
+        assert(dd.fs.read("a.txt") == nil)  -- 默认还是 Mod 目录
+        assert(dd.fs.write("a.txt", "two\0bin") and dd.fs.read("a.txt", { root = "data" }) == "two\0bin")
+        assert(dd.fs.write("sub/deep/b.json", "{}") and dd.fs.read("sub\\deep\\b.json", { root = "data" }) == "{}")
+        local list = dd.fs.list{ root = "data" }
+        assert(#list == 2 and list[1] == "a.txt" and list[2] == "sub/", table.concat(list, ","))
+        assert(dd.fs.list("sub", { root = "data" })[1] == "deep/")
+        -- 路径规则（含保留的设备名、超过 8 层）
+        for _, bad in ipairs({ "../x", "..\\x", "/x", "C:/x", "C:x", "a/../b", "", "sub", "a:b", "x*", "con.", "nul.txt", "a/CON/b",
+                "COM1", "lpt9.log", ("d/"):rep(8) .. "x" }) do
+            local ok, err = dd.fs.write(bad, "x")
+            assert(ok == nil and err, bad)
+        end
+        local ok, err = dd.fs.write(("d/"):rep(8) .. "x", "x")
+        assert(err:find("8 层"), err)
+        assert(dd.fs.write("com10.txt", "x") and dd.fs.remove("com10.txt"))  -- COM10 不是设备名
+        assert(not pcall(dd.fs.write, "x") and not pcall(dd.fs.write, {}, "x") and not pcall(dd.fs.read, "x", { root = "nope" }))
+        assert(not pcall(dd.fs.read, "x", { nope = 1 }))
+        -- 上限：条目 6 个（a.txt、sub、deep、b.json 已经 4 个）、总大小 1 MB
+        assert(dd.fs.write("c.txt", "c") and dd.fs.write("d.txt", "d"))
+        ok, err = dd.fs.write("e.txt", "e")
+        assert(ok == nil and err:find("data_max_files"), err)
+        assert(dd.fs.write("c.txt", "cc"))  -- 覆盖已有的不加条目数
+        ok, err = dd.fs.write("a.txt", ("x"):rep(1024 * 1024 + 1))
+        assert(ok == nil and err:find("data_max_mb"), err)
+        assert(dd.fs.write("a.txt", ("x"):rep(1024 * 1024 - 16)))
+        ok, err = dd.fs.write("c.txt", ("y"):rep(100))
+        assert(ok == nil and err:find("data_max_mb"), err)
+        -- 删除后有空间
+        assert(dd.fs.remove("a.txt") and not dd.fs.exists("a.txt", { root = "data" }))
+        assert(dd.fs.write("e.txt", "e") and dd.fs.write("c.txt", ("y"):rep(1000)))
+        -- 新建目录也算条目：差 2 个，什么都不建
+        assert(dd.fs.remove("e.txt"))
+        ok, err = dd.fs.write("n1/n2/x.txt", "x")
+        assert(ok == nil and err:find("data_max_files"), err)
+        assert(not dd.fs.exists("n1", { root = "data" }))
+        -- 目录：不空时拒绝，空的可以删，数据目录本身不能删
+        ok, err = dd.fs.remove("sub")
+        assert(ok == nil and err:find("不是空的"), err)
+        assert(dd.fs.remove("sub/deep/b.json") and dd.fs.remove("sub/deep") and dd.fs.remove("sub"))
+        ok, err = dd.fs.remove("")
+        assert(ok == nil and err:find("数据目录本身"), err)
+        list = dd.fs.list{ root = "data" }
+        assert(#list == 2 and list[1] == "c.txt" and list[2] == "d.txt", table.concat(list, ","))
+        assert(dd.fs.write("n1/x.txt", "x") and dd.fs.write("e.txt", "e"))  -- 删掉的 3 个条目腾出来了
+    )lua"));
+    // 两个 Mod 的数据目录分开
+    CHECK(Lua(*s, "ev_b", R"lua(
+        assert(dd.fs.read("e.txt", { root = "data" }) == nil and dd.fs.write("e.txt", "b") and dd.fs.read("e.txt", { root = "data" }) == "b")
+    )lua"));
+    const std::wstring dataA = ddlua::Utf8ToWide(P4bRoot() + "/DDModLoader/data/ev_a");
+    CHECK(GetFileAttributesW((dataA + L"\\e.txt").c_str()) != INVALID_FILE_ATTRIBUTES);
+    // 联接逃逸：数据目录里的联接指向外面，写入被拒绝
+    const std::wstring outside = ddlua::Utf8ToWide(P4bRoot() + "/outside");
+    CreateDirectoryW(outside.c_str(), nullptr);
+    std::string rootBack = P4bRoot();
+    std::replace(rootBack.begin(), rootBack.end(), '/', '\\');
+    const std::string mkFixed = "cmd /c mklink /J \"" + rootBack + "\\DDModLoader\\data\\ev_a\\jump\" \"" + rootBack + "\\outside\" >nul 2>nul";
+    const auto linked = [&] {
+        const DWORD attr = GetFileAttributesW((dataA + L"\\jump").c_str());
+        return attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_REPARSE_POINT);
+    };
+    for (int attempt = 0; attempt < 5 && !linked(); ++attempt) {
+        std::system(mkFixed.c_str());  // guest 上偶尔启动 cmd 失败，重试
+        if (!linked()) {
+            Sleep(300);
+        }
+    }
+    if (linked()) {
+        CHECK(Lua(*s, "ev_a", R"lua(
+            assert(dd.fs.remove("e.txt"))
+            local ok, err = dd.fs.write("jump/x.txt", "escape")
+            assert(ok == nil and err:find("之外"), err)
+            assert(dd.fs.read("jump/x.txt", { root = "data" }) == nil)
+        )lua"));
+        CHECK(GetFileAttributesW((outside + L"\\x.txt").c_str()) == INVALID_FILE_ATTRIBUTES);
+    } else {
+        std::printf("  （mklink /J 失败，跳过联接逃逸）\n");
+    }
+    // 没有临时文件留下
+    CHECK(Lua(*s, "ev_a", R"lua(
+        for _, name in ipairs(dd.fs.list{ root = "data" }) do assert(not name:find("ddtmp"), name) end
+    )lua"));
+    // 用量按已有文件扫描：新会话里接着算
+    s->Teardown();
+    {
+        ddlua::Session again(s.host, config, "存档#P4b-2");
+        again.Load(Sources({ "ev_a" }));
+        CHECK(Lua(again, "ev_a", R"lua(
+            -- 现有 c.txt、d.txt、n1/、n1/x.txt（e.txt 在联接测试时删了，没删就是 5 个条目；联接本身不算）
+            assert(dd.fs.write("f.txt", "f"))
+            local ok, err = dd.fs.write("g.txt", "g")
+            assert(ok or err:find("data_max_files"), tostring(err))
+        )lua"));
+        again.Teardown();
+    }
+    // C-B2：循环里反复写入在预算到了之后很快被打断（每次调用返回前检查截止时间）
+    {
+        ddlua::Config tight = TestConfig();
+        tight.budgetMs = 50;
+        tight.dataMaxFiles = 1000;
+        ddlua::Session loop(s.host, tight, "存档#P4b-3");
+        loop.Load(Sources({ "ev_a" }));
+        for (const char* chunk : { "while true do dd.fs.write('loop.txt', '') end",
+                 "local p = ('l/'):rep(7) .. 'x.txt' while true do dd.fs.write(p, 'x') end",
+                 "while true do dd.fs.exists('c.txt', { root = 'data' }) end" }) {
+            std::string error;
+            bool budget = false;
+            const auto t0 = std::chrono::steady_clock::now();
+            CHECK(!loop.RunChunk(*loop.FindMod("ev_a"), chunk, "=fsloop", &error, &budget) && budget);
+            const double ms = Ms(t0);
+            std::printf("  dd.fs 循环（%s）：%.0f ms 后被打断（预算 50 ms）\n", chunk, ms);
+            CHECK(ms < 150);
+        }
+        loop.Teardown();
+    }
+    // R2A-N3：数据目录建不出来（DDModLoader\data\ev_b 是个文件）时 dd.fs.write 每次都失败，同样计入预算、返回前检查截止时间
+    {
+        const std::wstring dataB = ddlua::Utf8ToWide(P4bRoot() + "/DDModLoader/data/ev_b");
+        DeleteFileW((dataB + L"\\e.txt").c_str());
+        CHECK(RemoveDirectoryW(dataB.c_str()));
+        HANDLE blocker = CreateFileW(dataB.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        CHECK(blocker != INVALID_HANDLE_VALUE);
+        if (blocker != INVALID_HANDLE_VALUE) {
+            CloseHandle(blocker);
+        }
+        ddlua::Config tight = TestConfig();
+        tight.budgetMs = 50;
+        ddlua::Session loop(s.host, tight, "存档#P4b-4");
+        loop.Load(Sources({ "ev_b" }));
+        CHECK(Lua(loop, "ev_b", R"lua(local ok, why = dd.fs.write("x.txt", "x") assert(ok == nil and why, tostring(why)))lua"));
+        std::string error;
+        bool budget = false;
+        const auto t0 = std::chrono::steady_clock::now();
+        CHECK(!loop.RunChunk(*loop.FindMod("ev_b"), "while true do dd.fs.write('x.txt', '') end", "=fsloop", &error, &budget) && budget);
+        const double ms = Ms(t0);
+        std::printf("  dd.fs 循环（数据目录建不出来）：%.0f ms 后被打断（预算 50 ms）\n", ms);
+        CHECK(ms < 150);
+        loop.Teardown();
+        DeleteFileW(dataB.c_str());
+    }
+    CHECK(CoreCount() == 0);
+}
+
+// ---------------------------------------------------------------- 嵌套入口：预算、补时间、粘滞超时、崩溃隔离、跨 VM
+void TestNestedEntries()
+{
+    ddlua::Config config = TestConfig();
+    config.budgetMs = 50;
+    {
+        P4bSession s({ "ev_a", "ev_b" }, config);
+        // B 的 buff.add 回调：按 SLOW 毫秒忙等
+        CHECK(Lua(*s, "ev_b", R"lua(
+            SLOW, CALLS = 40, 0
+            SUB = dd.on("buff.add", function(ev)
+                CALLS = CALLS + 1
+                local t = os.clock() + SLOW / 1000
+                while os.clock() < t do end
+                if LOOP then while true do end end
+                DEPTH = true
+            end)
+        )lua"));
+        // 1. A 自己用 35 ms，立即执行的 add_buff 里 B 的回调用 40 ms：合计 75 ms 超过一份预算，但两个都不超预算（嵌套的时间补给 A）
+        const std::uint64_t credits0 = s->vm()->NestCredits();
+        std::string error;
+        bool budget = false;
+        const char* outer = R"lua(
+            local t = os.clock() + 0.025
+            while os.clock() < t do end
+            assert(dd.actor.hero(12):add_buff("SPD5"))
+            t = os.clock() + 0.01
+            while os.clock() < t do end
+            OUTER_DONE = true
+        )lua";
+        const auto t0 = std::chrono::steady_clock::now();
+        CHECK(s->RunChunk(*s->FindMod("ev_a"), outer, "=nested1", &error, &budget));
+        std::printf("  同一个 VM 的嵌套：外层 %.0f ms（外层自己约 35 ms，嵌套 40 ms），嵌套入口补时间 %llu 次共 %.1f ms\n", Ms(t0),
+            static_cast<unsigned long long>(s->vm()->NestCredits() - credits0), s->vm()->NestCreditedMs());
+        CHECK(!budget && s->vm()->NestCredits() > credits0);
+        CHECK(Lua(*s, "ev_b", "assert(CALLS == 1 and SUB:active())"));
+        // 2. 嵌套的回调死循环：B 被停用（超预算），A 照常做完
+        CHECK(Lua(*s, "ev_b", "LOOP = true SLOW = 0"));
+        CHECK(s->RunChunk(*s->FindMod("ev_a"), "assert(dd.actor.hero(12):add_buff('SPD5')) local x = 0 for i = 1, 1000 do x = x + i end OK2 = true",
+            "=nested2", &error, &budget));
+        CHECK(!budget && LogHas("buff.add 的回调出错（超出执行预算），已停用该订阅"));
+        CHECK(Lua(*s, "ev_b", "assert(not SUB:active())"));
+        // 3. 外层的截止时间在游戏函数里（没有检查点）过去了：嵌套的回调按自己的预算照常运行，回到外层后外层超预算
+        CHECK(Lua(*s, "ev_b", R"lua(
+            FAST = 0
+            dd.on("buff.add", function() FAST = FAST + 1 local t = os.clock() + 0.005 while os.clock() < t do end end)
+        )lua"));
+        g_fc.sleepMs = 30;
+        const char* late = R"lua(
+            local t = os.clock() + 0.04
+            while os.clock() < t do end
+            assert(dd.actor.hero(12):add_buff("SPD5"))  -- 游戏函数里睡 30 ms（不补时间），嵌套 5 ms（补）
+            local x = 0 for i = 1, 100000 do x = x + i end
+            NOT_REACHED = true
+        )lua";
+        CHECK(!s->RunChunk(*s->FindMod("ev_a"), late, "=nested3", &error, &budget) && budget);
+        g_fc.sleepMs = 0;
+        CHECK(Lua(*s, "ev_b", "assert(FAST == 1)"));
+        CHECK(Lua(*s, "ev_a", "assert(NOT_REACHED == nil)"));
+        CHECK(CountLog("已停用该订阅") == 1);  // 只有第 2 步的死循环；B 没有因为 A 过了截止时间被连累
+        // 4. 外层反复触发嵌套回调：补的时间有上限（max(预算, 最长的一次)），外层照样超时，总时间有界
+        CHECK(Lua(*s, "ev_b", R"lua(dd.on("buff.add", function() local t = os.clock() + 0.02 while os.clock() < t do end end))lua"));
+        const auto t1 = std::chrono::steady_clock::now();
+        CHECK(!s->RunChunk(*s->FindMod("ev_a"), "for i = 1, 100 do dd.actor.hero(12):add_buff('SPD5') end", "=nested4", &error, &budget) && budget);
+        const double total = Ms(t1);
+        std::printf("  外层循环 add_buff、每次嵌套 25 ms：%.0f ms 后外层超预算，嵌套补时间被截断 %llu 次\n", total,
+            static_cast<unsigned long long>(s->vm()->NestCapped()));
+        CHECK(total < 250 && s->vm()->NestCapped() > 0);
+        s->Teardown();
+        CHECK(CoreCount() == 0 && s->memory().residual == 0);
+    }
+    {
+        // 5. 嵌套回调里的原生异常（同一个 VM）：假中枢接住异常、撤销订阅，回到外层的 add_buff 时 VM 已损坏，
+        //    AfterReentry 抛 SEH 异常把外层也交给它自己的隔离（这里是测试的 SehCall，游戏里是 RunMarked / DDCore 的事件隔离）
+        P4bSession s({ "ev_a", "ev_b" }, config);
+        CHECK(Lua(*s, "ev_b", R"lua(dd.on("buff.add", function() dd.actor.hero(666) end))lua"));
+        struct Run {
+            ddlua::Session* session;
+            bool ok;
+        } run{ &*s, false };
+        g_crashFind = true;
+        const bool returned = SehCall(
+            [](void* raw) {
+                auto* r = static_cast<Run*>(raw);
+                std::string error;
+                r->ok = r->session->RunChunk(*r->session->FindMod("ev_a"), "dd.actor.hero(12):add_buff('SPD5') AFTER = true", "=crash", &error);
+            },
+            &run);
+        g_crashFind = false;
+        std::printf("  嵌套回调里的原生异常：外层%s\n", returned ? "正常返回（不应该）" : "被 AfterReentry 展开");
+        CHECK(!returned && s->Broken());
+        CHECK(LogHas("Lua VM 已损坏"));
+        s->Teardown();
+        CHECK(CoreCount() == 0 && ddlua::EventBinding::GlobalSdkCount() == 0);
+    }
+    {
+        // 6. 跨 VM：开发会话的 Mod 立即执行 add_buff，存档会话的 Mod 在 buff.add 里用 40 ms，补到开发会话的入口上；
+        //    存档会话的回调崩溃时只有它的 VM 损坏，开发会话照常，之后的预算检查也照常
+        g_log.clear();
+        CHECK(ResetHubFromDump());
+        ResetWorld();
+        ResetCombat();
+        const auto host = MakeCombatHost();
+        ddlua::Config big = config;
+        big.memoryLimitMb = 512;
+        ddlua::Session dev(host, big, "开发");
+        ddlua::Session campaign(host, config, "存档#1");
+        dev.Load(Sources({ "ev_a" }));
+        campaign.Load(Sources({ "ev_b" }));
+        CHECK(Lua(campaign, "ev_b", R"lua(
+            CALLS = 0
+            dd.on("buff.add", function() CALLS = CALLS + 1 local t = os.clock() + 0.04 while os.clock() < t do end if CRASH then dd.actor.hero(666) end end)
+        )lua"));
+        std::string error;
+        bool budget = false;
+        const std::uint64_t credits0 = dev.vm()->NestCredits();
+        CHECK(dev.RunChunk(*dev.FindMod("ev_a"), "local t = os.clock() + 0.025 while os.clock() < t do end assert(dd.actor.hero(12):add_buff('SPD5')) "
+                                                 "t = os.clock() + 0.01 while os.clock() < t do end",
+            "=cross", &error, &budget));
+        CHECK(!budget && dev.vm()->NestCredits() > credits0);
+        CHECK(Lua(campaign, "ev_b", "assert(CALLS == 1) CRASH = true"));
+        // 存档会话的回调崩溃之后，开发会话的同一个入口接着做长串比较：长串比较没有 lua_State，靠入口栈的栈顶找 VM，
+        // 崩溃的 VM 没出栈的入口不能还占着栈顶（占着的话要等 1000 条指令的计数 hook，这里一次比较 32 MB，约 250 次要 1 秒以上）
+        CHECK(dev.RunChunk(*dev.FindMod("ev_a"), "BIG_T = ('x'):rep(32 * 1024 * 1024) .. 'a' BIG_U = ('x'):rep(32 * 1024 * 1024) .. 'b'", "=big",
+            &error, &budget, 5000));
+        g_crashFind = true;
+        const auto t2 = std::chrono::steady_clock::now();
+        CHECK(!dev.RunChunk(*dev.FindMod("ev_a"), "assert(dd.actor.hero(12):add_buff('SPD5')) CROSS_OK = true "
+                                                  "local t, u = BIG_T, BIG_U while true do local _ = (t == u) end",
+                  "=cross2", &error, &budget) && budget);
+        const double cmpMs = Ms(t2);
+        g_crashFind = false;
+        CHECK(campaign.Broken() && !dev.Broken());
+        CHECK(Lua(dev, "ev_a", "assert(CROSS_OK) BIG_T, BIG_U = nil, nil"));
+        std::printf("  跨 VM 嵌套里存档会话崩溃之后，开发会话的同一个入口 %.0f ms 被打断（预算 50 ms；崩溃的嵌套入口没有返回，不补时间）\n", cmpMs);
+        CHECK(cmpMs < 400);
+        campaign.Teardown();
+        dev.Teardown();
+        CHECK(CoreCount() == 0 && ddlua::EventBinding::GlobalSdkCount() == 0);
+    }
+}
+
+// ---------------------------------------------------------------- 状态的 JSON 编解码
+void TestStateJson()
+{
+    g_log.clear();
+    ddlua::Vm vm(16 * 1024 * 1024, nullptr);
+    std::string out, error;
+    CHECK(vm.Protected([&](lua_State* L) {
+        luaL_dostring(L, R"(return { a = 1, b = 2.5, c = "文字\n\"q\"", d = { 1, 2, { x = false } }, e = {}, big = 9007199254740993, neg = -0.0 })");
+        CHECK(ddlua::state_json::Encode(L, -1, "state", out, &error));
+        lua_pop(L, 1);
+        CHECK(ddlua::state_json::Decode(L, out, &error));
+        lua_getfield(L, -1, "big");
+        CHECK(lua_isinteger(L, -1) && lua_tointeger(L, -1) == 9007199254740993ll);
+        lua_pop(L, 1);
+        lua_getfield(L, -1, "b");
+        CHECK(!lua_isinteger(L, -1) && lua_tonumber(L, -1) == 2.5);
+        lua_pop(L, 1);
+        lua_getfield(L, -1, "c");
+        CHECK(std::string(lua_tostring(L, -1)) == "文字\n\"q\"");
+        lua_pop(L, 2);
+    }, &error));
+    std::printf("  编码：%s\n", out.c_str());
+    CHECK(out.find("\"d\":[1,2,{\"x\":false}]") != std::string::npos && out.find("\"e\":{}") != std::string::npos);
+    CHECK(vm.Protected([&](lua_State* L) {
+        luaL_dostring(L, "return { list = { 1, 2, n = 3 } }");
+        CHECK(!ddlua::state_json::Encode(L, -1, "state", out, &error) && error.find("state.list") != std::string::npos && error.find("混用") != std::string::npos);
+        lua_pop(L, 1);
+        luaL_dostring(L, "return { ['a b'] = { [3] = 1 } }");
+        CHECK(!ddlua::state_json::Encode(L, -1, "state", out, &error) && error.find("state[\"a b\"]") != std::string::npos && error.find("空洞") != std::string::npos);
+        lua_pop(L, 1);
+        CHECK(!ddlua::state_json::Decode(L, "[1,", &error) && !ddlua::state_json::Decode(L, "3", &error));
+    }, &error));
+    vm.Close();
+}
+
+// ---------------------------------------------------------------- 场景 Mod p4b_combat 的离线预演
+// 假世界里走一遍城镇、走廊、战斗（帧间执行排队的操作），场景 Mod 的日志里不能有「失败」，三轮都要做完
+void P4bFrames(ddlua::Session& s, double& t, double seconds)
+{
+    for (const double end = t + seconds; t < end; t += 0.05) {
+        FakeDrain();
+        Tick(s, t);
+    }
+}
+
+void P4bState(const char* to)
+{
+    Fire f("app.state");
+    f.I("from", 1).I("to", 2).S("from_name", "x").S("to_name", to);
+    f.Go();
+}
+
+void TestP4bScenarioMod()
+{
+    g_log.clear();
+    CHECK(ResetHubFromDump());
+    ResetWorld();
+    ResetCombat();
+    ResetP4bRoot();
+    g_fc.raid = false;  // 城镇
+    const auto host = MakeCombatHost();
+    ddlua::Session s(host, TestConfig(), "存档#P4b 场景");
+    g_now = 0;
+    s.SetClock([] { return g_now; });
+    s.Load({ { "场景 p4b_combat", std::string(DD_PROJECT_ROOT) + "/tests/lua/scenario/p4b_combat" } });
+    CHECK(s.LoadedCount() == 1);
+    double t = 0;
+    P4bFrames(s, t, 3.5);
+    // 城镇这一轮之后进地牢：场景 Mod 靠 dd.actor.party 认识队伍（F5，走廊里不用先有事件）
+    P4bState("as_raid_update");
+    g_fc.raid = true;
+    g_world.party = { 0x10000 };
+    bool ruled = false;
+    CHECK(FakeRuleEval("p4b_rule", 0x10000, 0, 42, false, &ruled) && ruled);
+    P4bFrames(s, t, 4.5);
+    // 战斗：靠 dd.actor.in_battle（游戏的战斗状态）认出战斗，怪物靠 dd.actor.monsters
+    g_world.battleState = 1;
+    Fire start("battle.start");
+    start.Go();
+    Fire dmg("damage.pre");
+    dmg.P("target", P(0x10000)).P("attacker", P(0x20000)).Fl("damage", 3).B("is_hero", true);
+    dmg.Go();
+    Fire skill("skill.pre");
+    skill.P("performer", P(0x10000)).P("skill", P(0x80000)).P("target", P(0x20000));
+    skill.Go();
+    P4bFrames(s, t, 4.5);
+    // 战斗结束：怪物随战斗销毁，怪物身上的脚本 Buff 状态按 gone 丢弃
+    g_world.battleState = 0;
+    g_world.monsters.clear();
+    ++g_world.battle;
+    Fire end("battle.end");
+    end.Go();
+    P4bFrames(s, t, 31);
+    std::size_t passed = 0;
+    std::size_t failed = 0;
+    for (const auto& line : g_log) {
+        if (line.rfind("[p4b_combat] 通过", 0) == 0) {
+            ++passed;
+        } else if (line.rfind("[p4b_combat] 失败", 0) == 0 || (line.rfind("[p4b_combat]", 0) == 0 && line.find("出错") != std::string::npos)) {
+            ++failed;
+            std::printf("    %s\n", line.c_str());
+        }
+    }
+    std::printf("  p4b_combat 预演：通过 %zu 行，失败 %zu 行\n", passed, failed);
+    CHECK(failed == 0 && passed >= 40);
+    for (const char* tag : { "rounddone.town", "rounddone.corridor", "rounddone.battle", "effect.town", "effect.corridor", "effect.battle",
+             "queue.done.town", "queue.done.battle", "script.remove.corridor", "monster.battle", "rule.readonly", "fs", "define.game" }) {
+        if (CountLog(std::string("[p4b_combat] 通过 [") + tag + "]") != 1) {
+            std::printf("    没有「通过 [%s]」\n", tag);
+            CHECK(false);
+        }
+    }
+    CHECK(LogHas("reason=gone") && LogHas("[p4b_combat] 信息 [summary]"));
+    s.Teardown();
+    CHECK(CoreCount() == 0 && s.memory().residual == 0);
+}
+
+// ================================================================ P4c1：dd.store 和脚本 Buff 状态随存档保存
+
+// campaign.save 主题（DDCore 有插件声明持久化时可用；DDLua 总是声明）
+void EnsureSaveTopic()
+{
+    Topic* topic = g_hub->Find("campaign.save");
+    if (!topic) {
+        using F = FieldDesc;
+        constexpr auto R = ddc::events::kAccessR;
+        topic = g_hub->AddTopic("campaign.save", TopicKind::App,
+            { F{ "files", DD_FIELD_STRING, R }, F{ "in_raid", DD_FIELD_BOOL, R }, F{ "in_battle", DD_FIELD_BOOL, R }, F{ "main_thread", DD_FIELD_BOOL, R },
+                F{ "serial", DD_FIELD_INT, R }, F{ "index", DD_FIELD_INT, R } },
+            false, false);
+    }
+    g_hub->SetAvailability(topic, true, "");
+}
+
+// 像 DDCore 的 campaign.save：先派发主题（Lua 的 dd.on 回调），再调用保存回调（等同 plugin.cpp 的 OnPersistSave 调用会话的 PersistSave）
+void FakeCampaignSave(ddlua::Session& session, const char* files, bool inRaid, bool inBattle, std::uint32_t index)
+{
+    EnsureSaveTopic();
+    Fire f("campaign.save");
+    f.S("files", files).B("in_raid", inRaid).B("in_battle", inBattle).B("main_thread", true).I("serial", 1).I("index", index);
+    f.Go();
+    const DDPersistSaveInfo info{ sizeof(DDPersistSaveInfo), files, inRaid, inBattle, true, 1, index };
+    g_fp.saving = true;
+    session.PersistSave(info);
+    g_fp.saving = false;
+}
+
+void Verify(ddlua::Session& session, const char* key, std::uint32_t status, const char* reason)
+{
+    const DDPersistVerify v{ sizeof(DDPersistVerify), key, status, reason };
+    session.PersistVerify(v);
+}
+
+// 一个 P4c1 的会话：fresh 为真时是新的世界（第一次进存档），为假时沿用上一个会话的世界（读档：buff 表还在）
+struct P4cSession {
+    ddlua::Host host;
+    std::unique_ptr<ddlua::Session> session;
+    P4cSession(std::initializer_list<const char*> mods, bool fresh, ddlua::Config config = TestConfig(), bool persistent = true, bool service = true)
+    {
+        if (fresh) {
+            g_log.clear();
+            CHECK(ResetHubFromDump());
+            ResetWorld();
+            ResetCombat();
+            ResetP4bRoot();
+        }
+        EnsureSaveTopic();
+        host = MakeCombatHost();
+        host.persist = service ? &kFakePersist : nullptr;
+        session = std::make_unique<ddlua::Session>(host, config, persistent ? "存档#P4c" : "开发");
+        session->SetPersistent(persistent);
+        g_now = 0;
+        session->SetClock([] { return g_now; });
+        session->Load(Sources(mods));
+    }
+    ddlua::Session& operator*() { return *session; }
+    ddlua::Session* operator->() { return session.get(); }
+};
+
+const ddlua::store::BuffState* FindState(const ddlua::store::Payload& p, std::uint32_t kind, std::uint32_t id)
+{
+    for (const auto& b : p.buffs) {
+        if (b.kind == kind && b.id == id) {
+            return &b;
+        }
+    }
+    return nullptr;
+}
+
+// ---------------------------------------------------------------- 旁路数据的格式
+void TestStoreFormat()
+{
+    using ddlua::store::BuffState;
+    ddlua::store::Payload p;
+    p.store = "{\"a\":1,\"s\":\"line\\nbreak\"}";
+    p.buffs.push_back(BuffState{ "id with space", DD_ACTOR_HERO, 12, 0, 5, "{\"x\":[1,2]}" });
+    p.buffs.push_back(BuffState{ "m", DD_ACTOR_MONSTER, 4500, 0, 1, "{}" });
+    const std::string bytes = ddlua::store::Encode(p);
+    CHECK(bytes.rfind("DDLUA-STORE 1\nstore ", 0) == 0 && bytes.find("buff hero 12 0 5 11 id with space\n") != std::string::npos);
+    ddlua::store::Payload back;
+    std::string why;
+    CHECK(ddlua::store::Decode(bytes, &back, &why) && back.store == p.store && back.buffs.size() == 2);
+    CHECK(back.buffs[0].buffId == "id with space" && back.buffs[0].kind == DD_ACTOR_HERO && back.buffs[0].id == 12 && back.buffs[0].guid == 5 &&
+        back.buffs[0].json == "{\"x\":[1,2]}");
+    CHECK(back.buffs[1].kind == DD_ACTOR_MONSTER && back.buffs[1].id == 4500 && back.buffs[1].json == "{}");
+    // 只有 dd.store
+    CHECK(ddlua::store::Decode(ddlua::store::Encode({ "{}", {} }), &back, &why) && back.store == "{}" && back.buffs.empty());
+    // 截断、头不对、段不对
+    CHECK(!ddlua::store::Decode(bytes.substr(0, bytes.size() - 2), &back, &why));
+    CHECK(!ddlua::store::Decode("DDLUA-STORE 2\nstore 2\n{}\n", &back, &why) && why.find("第一行") != std::string::npos);
+    CHECK(!ddlua::store::Decode("DDLUA-STORE 1\nstore 5\n{}\n", &back, &why));
+    CHECK(!ddlua::store::Decode("DDLUA-STORE 1\nother 1\n", &back, &why) && why.find("不认识") != std::string::npos);
+    CHECK(!ddlua::store::Decode("DDLUA-STORE 1\n", &back, &why) && why.find("store") != std::string::npos);
+    CHECK(!ddlua::store::Decode("DDLUA-STORE 1\nstore 2\n{}\nbuff ghost 1 0 1 2 x\n{}\n", &back, &why) && why.find("种类") != std::string::npos);
+    CHECK(!ddlua::store::Decode("DDLUA-STORE 1\nstore 2\n{}\nbuff hero 1 0 1 2\n{}\n", &back, &why));
+}
+
+// ---------------------------------------------------------------- 存档、读档：dd.store、英雄和怪物的状态、核对
+void TestStoreRoundTrip()
+{
+    ResetPersistFakes();
+    std::string savedA, savedB;
+    std::uint32_t heroGuid = 0, monsterGuid = 0, spdGuid = 0;
+    {
+        P4cSession s({ "store_a", "store_b" }, true);
+        CHECK(s->LoadedCount() == 2 && g_fp.loadCalls == 2);
+        CHECK(Lua(*s, "store_a", R"lua(
+            assert(MAIN.status == "empty" and MAIN.reason == nil and MAIN.counter == nil and dd.store == MAIN.store)
+            assert(dd.store_status() == "empty")
+            dd.store.counter = 1
+            dd.store.list = { 1, 2.5, "三", { deep = true } }
+            local ok, g = dd.actor.hero(12):add_buff("lua_store_buff", { state = { shield = 4 } })
+            assert(ok)
+            local ok2 = dd.actor.monster(4500):add_buff("lua_store_buff", { state = { shield = 2, hits = { 1, 2 } } })
+            assert(ok2 and APPLIED == 2)
+        )lua"));
+        CHECK(Lua(*s, "store_b", R"lua(assert(MAIN.status == "empty") dd.store.counter = 7)lua"));
+        spdGuid = FakeGameAdd(0x10100, "SPD5", false);  // hero#13 身上一条别的 buff（读档时拿来构造「id 对不上」）
+        // 地牢、战斗中存了一次档
+        FakeCampaignSave(*s, "persist.map.json,persist.roster.json,persist.game.json,persist.raid.json", true, true, 1);
+        CHECK(Lua(*s, "store_b", R"lua(
+            assert(#SAVES == 1 and SAVES[1].files:find("persist.raid.json") and SAVES[1].in_raid and SAVES[1].in_battle and SAVES[1].index == 1)
+        )lua"));
+        CHECK(g_fp.saved.count("store_a") == 1 && g_fp.saved.count("store_b") == 1);
+        CHECK(g_fp.savedVersion["store_a"] == "1.4.0" && g_fp.savedVersion["store_b"] == "2.0.1");
+        ddlua::store::Payload a, b;
+        std::string why;
+        CHECK(ddlua::store::Decode(g_fp.saved["store_a"], &a, &why));
+        CHECK(a.store.find("\"counter\":1") != std::string::npos && a.store.find("[1,2.5,\"三\",{\"deep\":true}]") != std::string::npos);
+        const auto* hero = FindState(a, DD_ACTOR_HERO, 12);
+        const auto* monster = FindState(a, DD_ACTOR_MONSTER, 4500);
+        CHECK(a.buffs.size() == 2 && hero && monster);
+        if (hero && monster) {
+            heroGuid = hero->guid;
+            monsterGuid = monster->guid;
+            CHECK(hero->buffId == "lua_store_buff" && hero->json.find("\"shield\":4") != std::string::npos);
+            CHECK(monster->json.find("\"shield\":2") != std::string::npos && monster->json.find("\"hits\":[1,2]") != std::string::npos);
+        }
+        // 快照在所有 campaign.save 回调之后取：回调里改的 dd.store 写进去了
+        CHECK(ddlua::store::Decode(g_fp.saved["store_b"], &b, &why) && b.store.find("\"saved_in_callback\":1") != std::string::npos &&
+            b.store.find("\"counter\":7") != std::string::npos && b.buffs.empty());
+        CHECK(LogHas("campaign.save #1（persist.map.json,persist.roster.json,persist.game.json,persist.raid.json，地牢，战斗中）：写出 2 个 Mod"));
+        savedA = g_fp.saved["store_a"];
+        savedB = g_fp.saved["store_b"];
+        // 战斗结束、怪物销毁之后再存：怪物的状态不再导出（还没被每秒的清理丢弃也一样）
+        const FakeActor monsterActor = g_world.monsters[0x20000];
+        g_world.monsters.erase(0x20000);
+        FakeCampaignSave(*s, "persist.roster.json,persist.raid.json", true, false, 2);
+        CHECK(ddlua::store::Decode(g_fp.saved["store_a"], &a, &why) && a.buffs.size() == 1 && FindState(a, DD_ACTOR_HERO, 12));
+        g_world.monsters[0x20000] = monsterActor;  // 读档后战斗从存档恢复，怪物 guid 不变（P4-0D 0B-9）
+    }  // 退出存档：载体还在游戏里，状态直接丢弃（不调用 on_remove）
+
+    // 读第 1 次存的档：再加几条对不上的状态
+    ddlua::store::Payload a;
+    std::string why;
+    CHECK(ddlua::store::Decode(savedA, &a, &why));
+    a.buffs.push_back({ "lua_store_buff", DD_ACTOR_HERO, 12, 0, 9999, "{\"gone\":true}" });          // 条目不在
+    a.buffs.push_back({ "lua_store_buff", DD_ACTOR_HERO, 13, 0, spdGuid, "{\"wrong\":true}" });      // guid 在，但 id 是 SPD5
+    a.buffs.push_back({ "lua_store_buff", DD_ACTOR_HERO, 77, 0, 1, "{}" });                          // 英雄不在名册里
+    a.buffs.push_back({ "lua_store_buff", DD_ACTOR_HERO, 12, 1, heroGuid, "{}" });                   // 备用名册
+    g_fp.loads["store_a"] = { DD_PERSIST_OK, DD_PERSIST_LOADED, "地牢里的存档，raid 等探索存档读完再核对", ddlua::store::Encode(a), "1.4.0", true };
+    g_fp.loads["store_b"] = { DD_PERSIST_OK, DD_PERSIST_PREV, "当前一代不一致（名册的哈希不同），用上一代；地牢里的存档，raid 等探索存档读完再核对", savedB, "2.0.1", true };
+    {
+        P4cSession s({ "store_a", "store_b" }, false);
+        CHECK(s->LoadedCount() == 2);
+        CHECK(Lua(*s, "store_a", R"lua(
+            assert(MAIN.status == "loaded" and MAIN.reason:find("raid") and MAIN.counter == 1, tostring(MAIN.status))
+            assert(dd.store.list[3] == "三" and math.type(dd.store.list[2]) == "float" and dd.store.list[4].deep == true)
+            assert(APPLIED == 0)  -- 导入不调用 on_apply
+        )lua"));
+        CHECK(Lua(*s, "store_a", ("assert(dd.buff.state(dd.actor.hero(12), " + std::to_string(heroGuid) + ").shield == 4)").c_str()));
+        CHECK(LogHas("脚本 Buff 状态（英雄）：从旁路恢复 1 条，丢弃 4 条"));
+        CHECK(LogHas("lua_store_buff（hero#12，guid 9999）：条目不存在或 id 不一致") && LogHas("lua_store_buff（hero#77，guid 1）：英雄不在名册里"));
+        CHECK(LogHas("（hero#13，guid " + std::to_string(spdGuid) + "）：条目不存在或 id 不一致") && LogHas("备用名册上的英雄不恢复"));
+        CHECK(s->PendingStates() == 1);  // 怪物的等 raid 核对
+        CHECK(Lua(*s, "store_b", R"lua(assert(MAIN.status == "prev" and MAIN.reason:find("上一代") and MAIN.counter == 7 and dd.store.saved_in_callback == 1))lua"));
+        // 第三个返回值：等 raid 核对（审核 R2B 备注 6：上一代的原因里本来就可能有 raid，不能按原因判断）
+        CHECK(Lua(*s, "store_a", R"lua(local st, why, pending = dd.store_status() assert(st == "loaded" and pending == true, tostring(pending)))lua"));
+        CHECK(Lua(*s, "store_b", R"lua(local st, why, pending = dd.store_status() assert(st == "prev" and pending == true))lua"));
+        // raid 一致：恢复怪物的状态，dd.store_status 的说明去掉「待核对」
+        Verify(*s, "store_a", DD_PERSIST_LOADED, "");
+        CHECK(s->PendingStates() == 0 && LogHas("[store_a] dd.store：raid 核对一致（loaded）") && LogHas("脚本 Buff 状态（怪物）：从旁路恢复 1 条，丢弃 0 条"));
+        CHECK(Lua(*s, "store_a", ("local st = dd.buff.state(dd.actor.monster(4500), " + std::to_string(monsterGuid) +
+                                     ") assert(st.shield == 2 and st.hits[2] == 2) local s1, w1, p1 = dd.store_status() assert(s1 == 'loaded' and w1 == nil and p1 == false)")
+                                     .c_str()));
+        // raid 不一致：状态改成 mismatch，原因写清楚
+        Verify(*s, "store_b", DD_PERSIST_MISMATCH, "探索存档（persist.raid.json）的哈希不同");
+        CHECK(Lua(*s, "store_b", R"lua(local st, why, pending = dd.store_status() assert(st == "mismatch" and why:find("persist.raid.json") and pending == false))lua"));
+        CHECK(LogHas("[store_b] dd.store：raid 核对不一致（探索存档（persist.raid.json）的哈希不同）"));
+        Verify(*s, "nobody", DD_PERSIST_MISMATCH, "x");  // 不认识的 key 忽略
+        CHECK(LogHas("[store_b] dd.store：raid 核对不一致") && LogHas("这次进存档不再写这个 Mod 的旁路"));
+        // 读档后再存：恢复的状态照常写出；raid 核对不一致的 store_b，DDCore 拒绝再写（F2，审核 S1），DDLua 只记一次、不报 ERROR
+        g_fp.saved.erase("store_b");
+        g_fp.blocked.push_back("store_b");
+        FakeCampaignSave(*s, "persist.roster.json,persist.raid.json", true, true, 1);
+        ddlua::store::Payload again;
+        CHECK(ddlua::store::Decode(g_fp.saved["store_a"], &again, &why) && again.buffs.size() == 2 && again.store.find("\"counter\":1") != std::string::npos);
+        FakeCampaignSave(*s, "persist.roster.json,persist.raid.json", true, true, 2);
+        CHECK(g_fp.saved.count("store_b") == 0 && !LogHas("[store_b] persist.save 失败"));
+        CHECK(CountLog("[store_b] dd.store：DDCore 这次进存档不再写这个 Mod 的旁路（raid 二次核对不一致，或归档原来的旁路失败，原因见 DDCore.log），之后的存档都不写，直到下次进存档") == 1);
+        CHECK(LogHas("campaign.save #2（persist.roster.json,persist.raid.json，地牢，战斗中）：写出 1 个 Mod：store_a"));
+        g_fp.blocked.clear();
+    }
+    // raid 没核对就退出：等着的怪物状态丢弃
+    g_fp.loads["store_a"].data = savedA;
+    {
+        P4cSession s({ "store_a" }, false);
+        CHECK(s->PendingStates() == 1);
+        s->Teardown();
+        CHECK(LogHas("还有 1 条旁路里的状态没有恢复（等 raid 核对的怪物状态），丢弃"));
+    }
+    // 城镇存档里有怪物状态（不该有）：直接丢弃
+    g_fp.loads["store_a"].raidPending = false;
+    {
+        P4cSession s({ "store_a" }, false);
+        CHECK(s->PendingStates() == 0 && LogHas("旁路里有怪物的状态，但存档不在地牢里"));
+    }
+    CHECK(CoreCount() == 0);
+}
+
+// ---------------------------------------------------------------- dd.store_status 的各种结果
+void TestStoreStatus()
+{
+    ResetPersistFakes();
+    g_fp.loads["store_a"] = { DD_PERSIST_OK, DD_PERSIST_MISMATCH, "当前一代：名册的哈希不同；上一代：没有文件" };
+    g_fp.loads["store_b"] = { DD_PERSIST_OK, DD_PERSIST_LOADED, "", "garbage", "2.0.1" };  // 数据坏了
+    {
+        P4cSession s({ "store_a", "store_b" }, true);
+        CHECK(Lua(*s, "store_a", R"lua(
+            assert(MAIN.status == "mismatch" and MAIN.reason:find("名册") and MAIN.counter == nil and next(dd.store) == nil)
+        )lua"));
+        CHECK(Lua(*s, "store_b", R"lua(assert(MAIN.status == "mismatch" and MAIN.reason:find("解析失败") and next(dd.store) == nil))lua"));
+        CHECK(LogHas("[store_a] dd.store：mismatch：当前一代：名册的哈希不同") && LogHas("[store_b] dd.store：旁路数据解析失败"));
+        // 不一致之后照常写出新的（旁路保留一代，不自动修复）
+        CHECK(Lua(*s, "store_a", "dd.store.fresh = true"));
+        FakeCampaignSave(*s, "persist.roster.json", false, false, 1);
+        CHECK(g_fp.saved["store_a"].find("\"fresh\":true") != std::string::npos);
+    }
+    // persist 服务拒绝（观察 hook 没装上）
+    g_fp.loads["store_a"] = { DD_PERSIST_E_UNAVAILABLE };
+    {
+        P4cSession s({ "store_a" }, true);
+        CHECK(Lua(*s, "store_a", R"lua(assert(MAIN.status == "unavailable" and MAIN.reason:find("persist.load 失败")))lua"));
+    }
+    // DDCore 没有 persist 服务
+    {
+        P4cSession s({ "store_a" }, true, TestConfig(), true, false);
+        CHECK(Lua(*s, "store_a", R"lua(assert(MAIN.status == "unavailable" and MAIN.reason:find("没有 persist 服务")) dd.store.x = 1)lua"));
+        FakeCampaignSave(*s, "persist.roster.json", false, false, 1);  // 不写
+    }
+    // 开发会话：dd.store 只在内存里
+    ResetPersistFakes();
+    {
+        P4cSession s({ "store_a", "store_b" }, true, TestConfig(), false);
+        CHECK(g_fp.loadCalls == 0);
+        CHECK(Lua(*s, "store_b", R"lua(assert(MAIN.status == "empty" and MAIN.reason:find("开发会话")) dd.store.x = 1)lua"));
+        FakeCampaignSave(*s, "persist.roster.json", false, false, 1);
+        CHECK(g_fp.saved.empty() && s->SaveCount() == 0);
+        CHECK(Lua(*s, "store_b", "assert(#SAVES == 1)"));  // 订阅照常收到
+    }
+    CHECK(CoreCount() == 0);
+}
+
+// ---------------------------------------------------------------- 上限、整体赋值、不能保存的数据
+void TestStoreLimits()
+{
+    ResetPersistFakes();
+    ddlua::Config config = TestConfig();
+    config.storeMaxKb = 1;
+    P4cSession s({ "store_a", "store_b" }, true, config);
+    CHECK(Lua(*s, "store_a", R"lua(dd.store.big = string.rep("x", 2000))lua"));
+    CHECK(Lua(*s, "store_b", R"lua(dd.store = { replaced = true, n = 3 })lua"));  // 整体赋值也认
+    FakeCampaignSave(*s, "persist.roster.json", false, false, 1);
+    CHECK(g_fp.saved.count("store_a") == 0 && LogHas("[store_a] 随存档写出的数据") && LogHas("超过 store_max_kb（1 KB），这次不写"));
+    CHECK(LogHas("dd.store.big：字符串超过 1 KB"));  // 编码到上限就停下，说出位置（F2，审核 B-N6）
+    CHECK(g_fp.saved["store_b"].find("\"replaced\":true") != std::string::npos && g_fp.saved["store_b"].find("\"n\":3") != std::string::npos);
+    CHECK(Lua(*s, "store_b", R"lua(dd.store.later = 1)lua"));
+    FakeCampaignSave(*s, "persist.roster.json", false, false, 2);
+    CHECK(g_fp.saved["store_b"].find("\"later\":1") != std::string::npos && g_fp.saved["store_b"].find("\"replaced\":true") != std::string::npos);
+    // 不能保存的 dd.store：这次不写、ERROR，说出位置
+    CHECK(Lua(*s, "store_a", R"lua(dd.store.big = nil dd.store.f = print)lua"));
+    FakeCampaignSave(*s, "persist.roster.json", false, false, 3);
+    CHECK(g_fp.saved.count("store_a") == 0 && LogHas("[store_a] dd.store 不能保存") && LogHas("dd.store.f"));
+    // 状态表后来变得不能保存：这一条跳过，其余照常
+    CHECK(Lua(*s, "store_a", R"lua(
+        dd.store.f = nil
+        local h = dd.actor.hero(12)
+        local _, g1 = h:add_buff("lua_store_buff", { state = { ok = 1 } })
+        local _, g2 = h:add_buff("lua_store_buff", { state = { ok = 2 } })
+        dd.buff.state(h, g2).bad = print
+    )lua"));
+    FakeCampaignSave(*s, "persist.roster.json", false, false, 4);
+    ddlua::store::Payload a;
+    std::string why;
+    CHECK(ddlua::store::Decode(g_fp.saved["store_a"], &a, &why) && a.buffs.size() == 1 && a.buffs[0].json == "{\"ok\":1}");
+    CHECK(LogHas("脚本 Buff 的状态不能保存，这一条这次跳过"));
+    // 脚本 Buff 的状态累计超过 store_max_kb：编码到上限就停下，这个 Mod 这次不写（F2，审核 B-N6），别的 Mod 照常
+    CHECK(Lua(*s, "store_a", R"lua(
+        local h = dd.actor.hero(12)
+        for i = 1, 3 do h:add_buff("lua_store_buff", { state = { pad = string.rep("y", 400) } }) end
+    )lua"));
+    g_fp.saved.erase("store_a");
+    FakeCampaignSave(*s, "persist.roster.json", false, false, 5);
+    CHECK(g_fp.saved.count("store_a") == 0 && LogHas("[store_a] 随存档写出的数据超过 store_max_kb（1 KB），这次不写") && LogHas("脚本 Buff 的状态就已经超过"));
+    CHECK(g_fp.saved.count("store_b") == 1);
+    // campaign.save 之外 DDCore 拒绝 save（这里假服务的 saving 为假）
+    const DDPersistSaveInfo info{ sizeof(DDPersistSaveInfo), "persist.roster.json", false, false, true, 1, 5 };
+    s->PersistSave(info);
+    CHECK(LogHas("persist.save 失败：时机不对"));
+}
+
+// ---------------------------------------------------------------- 经过 plugin.cpp：声明、保存回调、核对回调都送到存档会话
+void TestStorePlugin()
+{
+    // DDPlugin_Load 在场景预演（TestScenarioRehearsal）里调用过一次，那时向假服务声明了持久化；单独运行本组时在这里加载
+    if (g_fp.declares == 0) {
+        const DDApi api{ sizeof(DDApi), DD_ABI_VERSION, &FakeQuery, kPlugin };
+        CHECK(DDPlugin_Load(&api));
+    }
+    CHECK(g_fp.declares == 1 && g_fp.onSave && g_fp.onVerify);
+    if (!g_fp.onSave || !g_fp.onVerify) {
+        return;
+    }
+    g_log.clear();
+    ResetPersistFakes();
+    CHECK(ResetHubFromDump());
+    EnsureSaveTopic();
+    ResetWorld();
+    g_fp.loads["store_b"] = { DD_PERSIST_OK, DD_PERSIST_LOADED, "", ddlua::store::Encode({ "{\"counter\":41}", {} }), "2.0.1" };
+    g_fakeModsAvailable = true;
+    g_fakeMods = { { "DDLua Test Store B", "mod_local_source", Fixture("store_b") } };
+    FirePhase(DD_PHASE_CAMPAIGN_LOAD, 61);
+    CHECK(LogHas("[store_b] dd.store：loaded") && g_fp.loadCalls == 1);
+    Fire f("campaign.save");
+    f.S("files", "persist.roster.json").B("in_raid", false).B("in_battle", false).B("main_thread", true).I("serial", 61).I("index", 1);
+    f.Go();
+    const DDPersistSaveInfo info{ sizeof(DDPersistSaveInfo), "persist.roster.json", false, false, true, 61, 1 };
+    g_fp.saving = true;
+    g_fp.onSave(&info, g_fp.user);
+    g_fp.saving = false;
+    CHECK(g_fp.saved["store_b"].find("\"counter\":41") != std::string::npos && g_fp.saved["store_b"].find("\"saved_in_callback\":1") != std::string::npos);
+    const DDPersistVerify verify{ sizeof(DDPersistVerify), "store_b", DD_PERSIST_MISMATCH, "测试：raid 不一致" };
+    g_fp.onVerify(&verify, g_fp.user);
+    CHECK(LogHas("[store_b] dd.store：raid 核对不一致（测试：raid 不一致）"));
+    FirePhase(DD_PHASE_CAMPAIGN_UNLOAD, 61);
+    // 没有存档会话时回调什么都不做
+    g_fp.saving = true;
+    g_fp.onSave(&info, g_fp.user);
+    g_fp.saving = false;
+    g_fp.onVerify(&verify, g_fp.user);
+    g_fakeModsAvailable = false;
+    g_fakeMods.clear();
+    CHECK(TickSubs() == 0 && CoreCount() == 0);
+}
+
+// ---------------------------------------------------------------- 规则回调交还原函数（P4c1 的遗留修正）
+void TestRuleOriginal()
+{
+    P4bSession s({ "ev_a" });
+    CHECK(Lua(*s, "ev_a", R"lua(
+        MODE = "true"
+        R = dd.buff.rule("lua_orig", function()
+            if MODE == "error" then error("故意") end
+            if MODE == "nil" then return nil end
+            return MODE == "true"
+        end)
+    )lua"));
+    bool result = false;
+    CHECK(FakeRuleEval("lua_orig", 0x10000, 0, 42, false, &result) && result);
+    CHECK(Lua(*s, "ev_a", "MODE = 'false'"));
+    CHECK(FakeRuleEval("lua_orig", 0x10000, 0, 42, true, &result) && result);  // 不成立、is_false_rule 取反
+    // 出错：交还原函数（城镇里规则 42 的前置检查就返回假、不取反，和没有 Lua Mod 时一样），不是「不成立再取反」
+    CHECK(Lua(*s, "ev_a", "MODE = 'error'"));
+    result = true;
+    CHECK(!FakeRuleEval("lua_orig", 0x10000, 0, 42, true, &result) && result);
+    CHECK(LogHas("这次交还游戏原来的判定") && g_fc.ruleOriginal == 1);
+    // Y6：返回 nil（或不返回）是有意交还原函数，不算出错，连续多次也不停用
+    CHECK(Lua(*s, "ev_a", "MODE = 'nil'"));
+    for (int i = 0; i < 5; ++i) {
+        result = true;
+        CHECK(!FakeRuleEval("lua_orig", 0x10000, 0, 42, true, &result) && result);
+    }
+    CHECK(g_fc.ruleOriginal == 6 && !LogHas("返回了 nil"));  // max_failures = 3：算出错的话已经停用了
+    CHECK(Lua(*s, "ev_a", "assert(R:active()) MODE = 'true'"));
+    CHECK(FakeRuleEval("lua_orig", 0x10000, 0, 42, false, &result) && result);
+    s->Teardown();
+
+    // C-Y7：每个 Mod 每帧的 combat 回调总时间（combat_frame_ms）用完后，这一帧余下的规则交还原函数，下一帧重新计
+    ddlua::Config config = TestConfig();
+    config.combatFrameMs = 2;
+    P4bSession f({ "ev_a" }, config);
+    CHECK(Lua(*f, "ev_a", R"lua(
+        CALLS = 0
+        dd.buff.rule("lua_slow", function()
+            CALLS = CALLS + 1
+            local t = os.clock() + 0.0008
+            while os.clock() < t do end
+            return true
+        end)
+    )lua"));
+    int answered = 0, passed = 0;
+    for (int i = 0; i < 10; ++i) {
+        result = false;
+        FakeRuleEval("lua_slow", 0x10000, 0, 42, false, &result) ? ++answered : ++passed;
+    }
+    std::printf("  combat_frame_ms = 2：一帧里 10 次判定（每次约 0.8 ms），进 Lua %d 次，交还原函数 %d 次\n", answered, passed);
+    CHECK(answered >= 2 && answered <= 4 && passed == 10 - answered && LogHas("combat_frame_ms"));
+    Tick(*f, 1.0);  // 帧边界清零
+    CHECK(FakeRuleEval("lua_slow", 0x10000, 0, 42, false, &result) && result);
+    CHECK(Lua(*f, "ev_a", ("assert(CALLS == " + std::to_string(answered + 1) + ")").c_str()));
+    f->Teardown();
+
+    // C-Y7：每个 Mod 最多 max_per_mod 条载体有状态
+    ddlua::Config few = TestConfig();
+    few.maxPerMod = 2;
+    P4bSession st({ "ev_a" }, few);
+    CHECK(Lua(*st, "ev_a", R"lua(
+        APPLIED = 0
+        assert(dd.buff.define{ id = "lua_cap", stat = "combat_stat_add", sub_stat = "speed_rating", duration = 3,
+            on_apply = function() APPLIED = APPLIED + 1 end })
+        local h = dd.actor.hero(12)
+        assert(h:add_buff("lua_cap", { state = { n = 1 } }) and h:add_buff("lua_cap", { state = { n = 2 } }))
+        local no, why = h:add_buff("lua_cap", { state = { n = 3 } })
+        assert(no == nil and why:find("max_per_mod"), tostring(why))
+        assert(APPLIED == 2 and dd.stats().states == 2, tostring(dd.stats().states))
+    )lua"));
+}
+
+// ================================================================ P4c2：场景 Mod 的离线预演
+// shield_lite（DDShield 的 Lua 复刻）、p4c_shield（驱动护盾规则）、p4c_persist（dd.store 和脚本 Buff 状态随存档）、p4b_combat，
+// 在假世界里按 docs/10-p4-scenario.md 的流程走一遍：城镇存档（招募）、读档；走廊存档、读档（raid 核对，加载线程上的延迟 buff.remove）；
+// 战斗中存档、读档（死门上的吸收）；打完战斗、撤退一场、回城、再读城镇存档（解雇）；改过的旁路（不一致）；一个没有 Lua Mod 的存档。
+// DDLua.log、DDCore.log（格式照 core.cpp、persist.cpp）和 rig_tamper.log（格式照 rig.py tamper-persist，带运行标识）写到
+// build/p4c_rehearsal/，tools/p4_scenario_check.py --selftest 用它们自测。
+// 假世界的结算照 DDCore：damage.final 的 absorb 全部吸收时不扣血，部分吸收时先补回再扣（死门上不补）；加删 buff 后刷新属性时
+// 删掉 remove_if_not_active、规则不成立的条目（FakeRefresh）
+constexpr std::uintptr_t kP4cHero = 0x10000;   // hero#12（假世界里英雄的职业都是 crusader）
+constexpr std::uintptr_t kP4cHero2 = 0x10100;  // hero#13
+constexpr const char* kP4cRunId = "20261114-100000-5150";
+constexpr const char* kP4cRoster = "0123456789ABCDEF";
+constexpr const char* kP4cTampered = "0123456789ABCDE0";
+FILE* g_p4cCore = nullptr;
+double g_p4cT = 0;
+std::uint32_t g_p4cSerial = 0;
+std::uint32_t g_p4cSaveIndex = 0;       // 整次运行的 campaign.save 次数（hook 报告、退到桌面那一行）
+std::uint32_t g_p4cSessionSave = 0;     // 本次进存档的第几次（campaign.save #k，DDCore 每次 CampaignLoad 从 0 数起）
+std::uint32_t g_p4cWrites = 0;        // 观察到的存档写入次数（hook 报告里的「写 N 次」）
+bool g_p4cRosterWritten = false;      // 这次进存档写过名册了没有（DDCore 只记第一次）
+int g_p4cRound = 0;
+
+void P4cCore(const std::string& text, int level = DD_LOG_INFO)
+{
+    g_logClock = g_p4cT;
+    if (g_p4cCore) {
+        WriteLogLine(g_p4cCore, level, text);
+    }
+}
+
+std::vector<ddlua::ModSource> P4cSources()
+{
+    const std::string root = std::string(DD_PROJECT_ROOT) + "/";
+    return { { "DDLua Test P4b Combat（mod_local_source）", root + "tests/lua/scenario/p4b_combat" },
+        { "DDLua Example Shield Lite（mod_local_source）", root + "examples/lua/shield_lite" },
+        { "DDLua Test P4c Shield（mod_local_source）", root + "tests/lua/scenario/p4c_shield" },
+        { "DDLua Test P4c Persist（mod_local_source）", root + "tests/lua/scenario/p4c_persist" } };
+}
+
+// 游戏按数据层的 effects 文件加载 shield_lite 的 effect（本身不改属性，没有 buff）
+void P4cLoadShieldEffects()
+{
+    FILE* file = nullptr;
+    _wfopen_s(&file, ddlua::Utf8ToWide(std::string(DD_PROJECT_ROOT) + "/examples/lua/shield_lite/effects/shield_lite.effects.darkest").c_str(), L"rb");
+    CHECK(file != nullptr);
+    if (!file) {
+        return;
+    }
+    char line[1024];
+    std::size_t n = 0;
+    while (std::fgets(line, sizeof(line), file)) {
+        const std::string text(line);
+        const std::size_t at = text.find(".name \"");
+        if (text.rfind("effect:", 0) != 0 || at == std::string::npos) {
+            continue;
+        }
+        const std::size_t from = at + 7;
+        const std::string name = text.substr(from, text.find('"', from) - from);
+        FakeEffect e;
+        e.info.size = sizeof(e.info);
+        strcpy_s(e.info.name, name.c_str());
+        e.info.target = text.find("\"performer\"") != std::string::npos ? 0 : 1;
+        e.info.chance = 1;
+        e.info.on_hit = true;
+        g_fc.effects[name] = e;
+        ++n;
+    }
+    std::fclose(file);
+    CHECK(n >= 20);
+}
+
+// 游戏判定带脚本规则的 buff：每帧对身上有这些 buff 的角色判定一次
+void P4cRules()
+{
+    for (const auto& [actor, table] : g_fc.tables) {
+        if (!g_world.heroes.count(actor) && !g_world.monsters.count(actor)) {
+            continue;
+        }
+        for (const auto& b : table) {
+            const std::string id = b.def.id;
+            const char* rule = id == "p4b_rule_buff" ? "p4b_rule" : id == "p4c_shield_probe" ? "shielded" : nullptr;
+            bool holds = false;
+            if (rule) {
+                FakeRuleEval(rule, actor, 0, 42, false, &holds, id.c_str());
+            }
+        }
+    }
+}
+
+void P4cFrames(ddlua::Session& s, double seconds)
+{
+    for (const double end = g_p4cT + seconds; g_p4cT < end; g_p4cT += 0.05) {
+        g_logClock = g_p4cT;
+        FakeDrain();
+        P4cRules();
+        Tick(s, g_p4cT);
+    }
+    g_logClock = g_p4cT;
+}
+
+void P4cFire(const char* topic)
+{
+    g_logClock = g_p4cT;
+    Fire f(topic);
+    f.Go();
+}
+
+void P4cRoundStart()
+{
+    ++g_p4cRound;
+    g_logClock = g_p4cT;
+    Fire f("battle.round.start");
+    f.P("battle", P(0x60000)).I("round", g_p4cRound);
+    f.Go();
+}
+
+void P4cTurn(std::uintptr_t actor)
+{
+    g_logClock = g_p4cT;
+    Fire f("battle.turn.start");
+    f.P("actor", P(actor));
+    f.Go();
+}
+
+// 怪物死亡（actor.death，p4c_persist 据此区分打完和撤退）
+void P4cMonsterDeath(std::int64_t guid)
+{
+    g_logClock = g_p4cT;
+    Fire f("actor.death");
+    f.I("hero_id", 0).B("is_monster", true).I("monster_guid", guid).I("attacker_id", 0).I("damage_type", 0);
+    f.Go();
+}
+
+// 技能：skill.pre → 技能自带的 effect（effect.pre）→ skill.post。圣骑士的 Smite 在数据层带 shield_self_gain_5
+void P4cSkill(std::uintptr_t performer, std::uintptr_t target, const char* effect)
+{
+    g_logClock = g_p4cT;
+    Fire pre("skill.pre");
+    pre.P("performer", P(performer)).P("skill", P(0x80000)).P("target", P(target)).I("target_count", 1).B("friendly", false);
+    pre.Go();
+    if (effect) {
+        Fire e("effect.pre");
+        e.P("performer", P(performer)).P("target", P(performer)).P("effect", P(0x81000)).S("effect_name", effect);
+        e.Go();
+    }
+    Fire post("skill.post");
+    post.P("performer", P(performer)).P("skill", P(0x80000)).P("target", P(target)).I("target_count", 1).B("friendly", false);
+    post.Go();
+}
+
+// 一次伤害：damage.pre → damage.final（读回 absorb，照 DDCore 的 ConsumeBlockDetour 结算）→ damage.post
+void P4cHit(std::uintptr_t target, std::uintptr_t attacker, double damage)
+{
+    g_logClock = g_p4cT;
+    FakeActor& actor = ActorAt(target);
+    const bool hero = g_world.heroes.count(target) != 0;
+    const double before = actor.hp;
+    Fire pre("damage.pre");
+    pre.P("target", P(target)).P("attacker", P(attacker)).Fl("damage", damage).I("damage_type", 0).I("source_id", 1).I("source_type", 0)
+        .B("crit", false).Fl("hp_before", before).B("is_hero", hero);
+    pre.Go();
+    const double dmg = pre.At("damage").v.f;
+    const bool deathsDoor = hero && before <= 0;
+    Fire fin("damage.final");
+    fin.P("target", P(target)).P("attacker", P(attacker)).Fl("damage", dmg).I("damage_type", 0).B("blocked", false).B("deaths_door", deathsDoor)
+        .Fl("hp_before", before).B("is_hero", hero).Fl("absorb", 0);
+    fin.Go();
+    const double absorb = (std::min)((std::max)(fin.At("absorb").v.f, 0.0), dmg);
+    double after = before;
+    if (absorb < dmg && !deathsDoor) {
+        after = before + absorb - dmg;
+        if (hero && after < 0) {
+            after = 0;
+        }
+    }
+    actor.hp = static_cast<float>(after);
+    Fire post("damage.post");
+    post.P("target", P(target)).P("attacker", P(attacker)).Fl("damage", dmg).I("damage_type", 0).I("source_id", 1).I("source_type", 0)
+        .B("crit", false).Fl("hp_before", before).B("is_hero", hero).Fl("hp_after", actor.hp).P("timeline", P(0x90000)).B("cancelled", false);
+    post.Go();
+}
+
+// 技能的另一种时序（P4 场景日志里 Smite 的实际情况：skill.pre 后 0.1 秒结算伤害，约 2 秒后才施加自带的 effect）：
+// skill.pre → 伤害 → skill.post，过 wait 秒（技能演出）再施加 effect。返回 shield_lite 给这次施加记的技能（SHIELD apply 行的
+// skill 字段），没有 apply 行时返回 "(无)"
+std::string P4cSkillLate(ddlua::Session& s, std::uintptr_t performer, std::uintptr_t target, const char* effect, double damage, double wait)
+{
+    g_logClock = g_p4cT;
+    Fire pre("skill.pre");
+    pre.P("performer", P(performer)).P("skill", P(0x80000)).P("target", P(target)).I("target_count", 1).B("friendly", false);
+    pre.Go();
+    P4cHit(target, performer, damage);
+    Fire post("skill.post");
+    post.P("performer", P(performer)).P("skill", P(0x80000)).P("target", P(target)).I("target_count", 1).B("friendly", false);
+    post.Go();
+    P4cFrames(s, wait);
+    const std::size_t mark = g_log.size();
+    Fire e("effect.pre");
+    e.P("performer", P(performer)).P("target", P(performer)).P("effect", P(0x81000)).S("effect_name", effect);
+    e.Go();
+    for (std::size_t i = mark; i < g_log.size(); ++i) {
+        const std::string& line = g_log[i];
+        const std::size_t at = line.find("\"skill\":\"");
+        if (line.rfind("[shield_lite] SHIELD ", 0) == 0 && line.find("\"ev\":\"apply\"") != std::string::npos && at != std::string::npos) {
+            const std::size_t from = at + 9;
+            return line.substr(from, line.find('"', from) - from);
+        }
+    }
+    return "(无)";
+}
+
+void P4cState(const char* to)
+{
+    g_logClock = g_p4cT;
+    Fire f("app.state");
+    f.I("from", 1).I("to", 2).S("from_name", "x").S("to_name", to);
+    f.Go();
+}
+
+void P4cHookReport(const char* title, std::size_t subs, std::size_t semantic)
+{
+    P4cCore(std::string("======== hook 报告（") + title + "），共 5 个目标 ========");
+    P4cCore("#1 内联 Darkest.exe+0x3DCE10 偷取 5 字节，状态 正常");
+    P4cCore("事件系统：已注册 listener 0 个，语义 hook " + std::to_string(semantic) + " 个，订阅 " + std::to_string(subs) + " 个");
+    P4cCore("persist：观察 hook 4 个（已装），声明的插件 1 个，观察到存档读 0 次、写 " + std::to_string(g_p4cWrites) + " 次，campaign.save 派发 " +
+        std::to_string(g_p4cSaveIndex) + " 次，旁路写盘 " + std::to_string(g_p4cSaveIndex * 4) + " 个（合并 0 次，失败 0 次，重试 0 次）");
+    P4cCore("======== 报告结束 ========");
+}
+
+// 游戏写完一组存档：DDCore 的 campaign.save 行，再派发主题、调用 DDLua 的保存回调
+void P4cSave(ddlua::Session& s, bool inRaid, bool inBattle)
+{
+    ++g_p4cSaveIndex;
+    ++g_p4cSessionSave;
+    const char* files = inRaid ? "persist.map.json,persist.roster.json,persist.game.json,persist.raid.json"
+                               : "persist.roster.json,persist.town.json,persist.estate.json,persist.game.json";
+    g_logClock = g_p4cT;
+    g_p4cWrites += 4;
+    if (!g_p4cRosterWritten) {
+        g_p4cRosterWritten = true;
+        P4cCore(std::string("persist：观察到写存档：设备 steam_profile_7，persist.roster.json，4096 字节，哈希 ") + kP4cRoster + "，" +
+            (inRaid ? "其他" : "主") + "线程（进存档后第一次写名册）");
+    }
+    FakeCampaignSave(s, files, inRaid, inBattle, g_p4cSessionSave);
+    P4cCore("persist：campaign.save #" + std::to_string(g_p4cSessionSave) + "（帧边界）：文件 " + files + "；地牢 " + (inRaid ? "1" : "0") + "，战斗 " +
+        (inBattle ? "1" : "0") + "，都在主线程；名册 " + kP4cRoster + "/4096" + (inRaid ? "，raid 00000000DEADBEEF/2048" : "") + "；提交旁路文件 " +
+        std::to_string(g_fp.saved.size()) + " 个");
+}
+
+struct P4cRun {
+    ddlua::Host host;
+    std::unique_ptr<ddlua::Session> session;
+    std::uint32_t serial = 0;
+};
+
+// 进存档：DDCore 的 CampaignLoad 和 persist 行，会话加载 4 个 Mod，再派发 campaign.load。status 是 DD_PERSIST_EMPTY 时是新战役；
+// DD_PERSIST_MISMATCH、DD_PERSIST_PREV 只给 p4c_persist（场景里改的是它的旁路），PREV 交上一代的数据，别的 Mod 照常 loaded
+std::unique_ptr<P4cRun> P4cEnter(std::uint32_t status, bool inRaid, const std::string& reason = "")
+{
+    auto run = std::make_unique<P4cRun>();
+    run->serial = ++g_p4cSerial;
+    ++g_world.campaign;  // 每次进存档 actor 句柄换代（英雄的状态按 hero id 导入）
+    g_world.active = true;
+    g_p4cRound = 0;
+    g_p4cSessionSave = 0;
+    g_p4cRosterWritten = false;
+    g_fp.loads.clear();
+    const std::string raidReason = inRaid ? "地牢里的存档，raid 等探索存档读完再核对" : "";
+    for (const auto& [key, data] : g_fp.saved) {
+        FakePersistKey k{ DD_PERSIST_OK, status, status == DD_PERSIST_LOADED ? raidReason : reason, data, "1.0.0", inRaid };
+        if ((status == DD_PERSIST_MISMATCH || status == DD_PERSIST_PREV) && key != "p4c_persist") {
+            k.status = DD_PERSIST_LOADED;
+            k.reason = raidReason;
+        }
+        if (k.status == DD_PERSIST_PREV) {
+            k.data = g_fp.prevSaved[key];
+        }
+        g_fp.loads[key] = k;
+    }
+    const std::string serial = std::to_string(run->serial);
+    P4cCore("阶段 CampaignLoad，帧 " + std::to_string(1000 * run->serial) + "，存档序号 " + serial + "，线程 1，Campaign=0000000000070000，" +
+        "Buff::Library=0000000000071000，状态 last=2 next=" + (inRaid ? "6" : "19"));
+    P4cCore("启用 Mod 列表 4 项（已安装 300 个），找到目录 4 项");
+    P4cCore(std::string("persist：进存档：设备 steam_profile_7，账号 10000001，名册 ") + (status == DD_PERSIST_MISMATCH ? "1111111111111111" : kP4cRoster) +
+        "/4096，存档在" + (inRaid ? "地牢里" : "城镇") + "；旁路目录 \\\\?\\D:\\rig\\DDModLoader\\save\\10000001\\steam_profile_7");
+    if (status == DD_PERSIST_EMPTY) {
+        for (const char* key : { "p4b_combat", "p4c_persist", "p4c_shield", "shield_lite" }) {
+            P4cCore(std::string("persist：DDLua/") + key + "：empty：没有旁路文件");
+        }
+    }
+    for (const auto& [key, k] : g_fp.loads) {
+        std::string text = "persist：DDLua/" + key + "：";
+        if (k.status == DD_PERSIST_MISMATCH) {
+            P4cCore(text + "mismatch：" + k.reason, DD_LOG_WARN);
+        } else {
+            const bool prev = k.status == DD_PERSIST_PREV;
+            P4cCore(text + (prev ? "prev（上一代" : "loaded（当前一代") + "，版本 1.0.0，写于 1763100000123，数据 " + std::to_string(k.data.size()) + " 字节）" +
+                (k.reason.empty() ? "" : "：" + k.reason));
+        }
+    }
+    g_logClock = g_p4cT;
+    WriteLogLine(g_logSink, DD_LOG_INFO, "[存档#" + serial + "] 进入存档：启用 4 个 Mod，0 个没有找到目录（见 DDCore.log）");
+    g_log.emplace_back("[存档#" + serial + "] 进入存档：启用 4 个 Mod，0 个没有找到目录（见 DDCore.log）");
+    EnsureSaveTopic();
+    run->host = MakeCombatHost();
+    run->host.persist = &kFakePersist;
+    ddlua::Config config = TestConfig();
+    config.loadBudgetMs = 500;
+    config.logLinesPerSec = 100000;  // 预演把几十秒的流程压在一两秒里，按真实时间限速会丢行
+    run->session = std::make_unique<ddlua::Session>(run->host, config, "存档#" + serial);
+    run->session->SetPersistent(true);
+    g_now = g_p4cT;
+    run->session->SetClock([] { return g_now; });
+    run->session->Load(P4cSources());
+    CHECK(run->session->LoadedCount() == 4);
+    P4cHookReport("CampaignLoad", g_hub->ExternalSubscriberCount(), 12);
+    g_logClock = g_p4cT;
+    Fire load("campaign.load");
+    load.I("serial", run->serial).P("campaign", P(0x70000));
+    load.Go();
+    return run;
+}
+
+// 地牢存档：as_raid_start 加载结束后核对 raid（DDCore 的 OnFrameBoundary → on_verify）
+void P4cVerifyRaid(P4cRun& run, bool ok)
+{
+    for (const auto& [key, k] : g_fp.loads) {
+        if (k.status != DD_PERSIST_LOADED) {
+            continue;
+        }
+        if (ok) {
+            P4cCore("persist：DDLua/" + key + "：raid 核对一致（00000000DEADBEEF/2048）");
+            Verify(*run.session, key.c_str(), DD_PERSIST_LOADED, "");
+        }
+    }
+}
+
+void P4cLeave(std::unique_ptr<P4cRun>& run)
+{
+    g_logClock = g_p4cT;
+    P4cCore("阶段 CampaignUnload，帧 " + std::to_string(1000 * run->serial + 500) + "，存档序号 " + std::to_string(run->serial) + "，线程 1");
+    if (g_fc.ruleCalls) {
+        P4cCore("规则统计（退出存档时）：命中 " + std::to_string(g_fc.ruleCalls) + " 次（交还原函数 " + std::to_string(g_fc.ruleOriginal) +
+            " 次），跳过 0 次，崩溃 0 次，累计 0.4 ms，单次最长 6.0 us，单帧峰值 6.2 us / 9 次");
+    }
+    // 同 core.cpp：先 SetCampaignActive(false)（英雄句柄解析不了），再派发 CampaignUnload。拆除时不调用 on_remove（F7）
+    g_world.active = false;
+    const std::size_t goneBefore = CountLog("条载体的 actor 不再能解析");
+    run->session->Teardown();
+    if (CountLog("条载体的 actor 不再能解析") != goneBefore) {
+        std::printf("    存档#%u 退出时脚本 Buff 的载体按 gone 调用了 on_remove\n", run->serial);
+        CHECK(false);
+    }
+    g_hub->EndScope(DD_EVENT_SCOPE_CAMPAIGN);
+    run.reset();
+    g_fc.queue.clear();
+    g_p4cT += 1;
+    // 退出存档时游戏删掉 Raid：下一次进存档时（地牢里的存档要等 load_raid 线程）才重新有队伍、战斗状态。
+    // 怪物和它们的 buff 表留在假世界里，读战斗中的存档时由 P4cRaidLoading 「恢复」
+    g_fc.raid = false;
+    g_world.party.clear();
+    g_world.battleState = 0;
+}
+
+// 游戏删掉 remove_on_battle_complete 的 buff（战斗结束），或回城时队伍英雄身上来源 skill 的 buff（town_visit）
+void P4cGameRemoveWhere(bool battleComplete)
+{
+    for (auto& [actor, table] : g_fc.tables) {
+        std::vector<std::uint32_t> guids;
+        for (const auto& b : table) {
+            const bool hit = battleComplete ? b.def.remove_on_battle_complete
+                                            : (b.def.source == 1 && g_world.heroes.count(actor) != 0);
+            if (hit) {
+                guids.push_back(b.guid);
+            }
+        }
+        for (const auto guid : guids) {
+            FakeGameRemove(actor, guid, battleComplete ? "other" : "town_visit");
+        }
+    }
+}
+
+std::size_t P4cTagCount(const char* who, const char* tag)
+{
+    return CountLog(std::string("[") + who + "] 通过 [" + tag + "]");
+}
+
+// p4b_combat 在某个场合做了几轮（「信息 [round] where=…」）
+std::size_t P4cRounds(const char* where)
+{
+    return CountLog(std::string("[p4b_combat] 信息 [round] where=") + where + " ");
+}
+
+// 读地牢里的存档（审核 R3 之后的真实时序）：CampaignLoad 时还没有 Raid（上一次退出存档时删掉了），之后 as_raid_start 停留期间
+// load_raid 线程新建 Raid、读档线程重建战斗（加载中：读接口、枚举都读不到），结束后才有队伍和战斗状态
+void P4cRaidLoading(P4cRun& run, double seconds, std::int32_t battleState)
+{
+    P4cState("as_raid_start");
+    g_fc.loading = true;
+    P4cFrames(*run.session, seconds);
+    g_fc.loading = false;
+    g_fc.raid = true;
+    g_world.party = { kP4cHero, kP4cHero2 };
+    g_world.battleState = battleState;
+    P4cState("as_raid_update");
+}
+
+// 一场战斗里 p4b_combat 不能做走廊、城镇那一轮（审核 R3-B3：读进战斗中的存档时游戏不派发 battle.start，旧的场景 Mod
+// 把这场战斗当成走廊）；开战前记下，战斗结束时核对
+struct P4cBattleGuard {
+    std::size_t corridor = 0, town = 0;
+};
+
+P4cBattleGuard P4cGuardNow()
+{
+    return { P4cRounds("corridor"), P4cRounds("town") };
+}
+
+void P4cGuardCheck(const P4cBattleGuard& g, const char* what)
+{
+    if (P4cRounds("corridor") != g.corridor || P4cRounds("town") != g.town) {
+        std::printf("    %s：p4b_combat 在战斗里做了走廊或城镇那一轮（审核 R3-B3）\n", what);
+        CHECK(false);
+    }
+}
+
+// 开战：Battle::Create 填好怪物表、置 bs_create，再派发 battle.start。之后 5～9 秒才有第一次出手（探针日志，审核 R3-B1），
+// 这段时间里游戏不派发带角色的事件，调用方用 P4cFrames 空等
+P4cBattleGuard P4cBattleStart(std::initializer_list<std::pair<std::uintptr_t, FakeActor>> monsters)
+{
+    for (const auto& [p, actor] : monsters) {
+        g_world.monsters[p] = actor;
+    }
+    ++g_world.battle;
+    g_world.battleState = 1;
+    g_p4cRound = 0;
+    const P4cBattleGuard guard = P4cGuardNow();
+    P4cFire("battle.start");
+    P4cRoundStart();
+    return guard;
+}
+
+// 战斗结束（打完或撤退）：游戏先把状态清零（撤退时 5A93B3），删掉 remove_on_battle_complete 的 buff，清空怪物表，再派发 battle.end
+void P4cBattleEnd(const P4cBattleGuard& guard, const char* what)
+{
+    P4cGuardCheck(guard, what);
+    g_world.battleState = 0;
+    P4cGameRemoveWhere(true);
+    g_world.monsters.clear();
+    ++g_world.battle;
+    P4cFire("battle.end");
+    g_hub->EndScope(DD_EVENT_SCOPE_BATTLE);
+}
+
+void TestP4cScenarioRehearsal()
+{
+    g_log.clear();
+    ResetPersistFakes();
+    CHECK(ResetHubFromDump());
+    ResetWorld();
+    ResetCombat();
+    ResetP4bRoot();
+    P4cLoadShieldEffects();
+    g_fc.smiteEffects = { "Unholy Killer 1", "shield_self_gain_5" };  // shield_lite 的数据层给圣骑士的 Smite 加上 shield_self_gain_5
+    g_world.heroes[kP4cHero].hp = 30;
+    g_world.heroes[kP4cHero2].hp = 30;
+    g_world.monsters.clear();
+    g_p4cT = 0;
+    g_p4cSerial = 0;
+    g_p4cSaveIndex = 0;
+    const std::string outDir = ProjectFile("build/p4c_rehearsal");
+    CreateDirectoryW(ddlua::Utf8ToWide(ProjectFile("build")).c_str(), nullptr);
+    CreateDirectoryW(ddlua::Utf8ToWide(outDir).c_str(), nullptr);
+    FILE* luaLog = nullptr;
+    _wfopen_s(&luaLog, ddlua::Utf8ToWide(outDir + "/DDLua.log").c_str(), L"wb");
+    _wfopen_s(&g_p4cCore, ddlua::Utf8ToWide(outDir + "/DDCore.log").c_str(), L"wb");
+    CHECK(luaLog && g_p4cCore);
+    if (!luaLog || !g_p4cCore) {
+        return;
+    }
+    std::fputs("\xEF\xBB\xBF", luaLog);
+    std::fputs("\xEF\xBB\xBF", g_p4cCore);
+    g_logSink = luaLog;
+    P4cCore(std::string("DDCore 1.0.0 启动，运行标识 ") + kP4cRunId + "，主线程 1，游戏根目录 （离线预演）");
+    P4cCore("插件 DDLua 加载成功（版本 1.0.0）");
+    WriteLogLine(luaLog, DD_LOG_INFO, std::string("日志开始，DDCore 1.0.0，运行标识 ") + kP4cRunId + "，插件路径 （离线预演）");
+    WriteLogLine(luaLog, DD_LOG_INFO, "[DDLua] DDLua 1.0.0（Lua 5.4.9，按 C++ 编译；Lua API 1）加载，DDCore 1.0.0");
+    WriteLogLine(luaLog, DD_LOG_INFO, "[DDLua] 配置（没有 DDLua.cfg，用默认值）：memory_limit_mb=128 budget_ms=50 load_budget_ms=500 dev_mode=0");
+    WriteLogLine(luaLog, DD_LOG_INFO, "[DDLua] 只订阅了 lifecycle（CampaignLoad、CampaignUnload），没有订阅事件主题，没有安装 hook");
+    P4cCore("persist：插件 DDLua 声明了存档旁路，观察 hook 已安装 4 个（排队写文件、读文件、选槽复制 backup、退到桌面），只读不改游戏行为");
+    P4cCore("阶段 AssetsReady，帧 2，线程 1");
+    P4cHookReport("AssetsReady", 0, 0);
+
+    // ---- 1. 城镇：新战役（没有旁路）；p4c_persist 给英雄加两条同 id 的载体，招募一个英雄（存档），退回主菜单
+    g_fc.raid = false;
+    auto run = P4cEnter(DD_PERSIST_EMPTY, false);
+    P4cFrames(*run->session, 4.5);
+    CHECK(P4cTagCount("p4c_persist", "stack") == 1);
+    P4cFire("hero.recruit");                             // 招募：游戏写名册
+    P4cSave(*run->session, false, false);
+    P4cLeave(run);
+
+    // ---- 2. 读城镇存档：核对；出发（load_raid 线程在跑时是加载中），进地牢后先停 5 秒（p4b_combat 的走廊一轮：走廊里游戏不派发
+    // 带角色的事件，场景 Mod 靠 dd.actor.party 认识队伍，审核 R3-B3），再走几步（每步存档）
+    run = P4cEnter(DD_PERSIST_LOADED, false);
+    P4cFrames(*run->session, 4.0);
+    CHECK(P4cTagCount("p4c_persist", "persist.town") == 1);
+    P4cRaidLoading(*run, 1.0, 0);
+    {
+        const std::size_t before = P4cRounds("corridor");
+        P4cFrames(*run->session, 5.0);
+        if (P4cRounds("corridor") != before + 1) {
+            std::printf("    第一次进走廊、停 5 秒后 p4b_combat 没有做走廊那一轮（审核 R3-B3）\n");
+            CHECK(false);
+        }
+    }
+    for (int step = 0; step < 4; ++step) {
+        P4cFrames(*run->session, 1.0);
+        P4cFire("raid.step");
+        P4cSave(*run->session, true, false);
+    }
+    P4cFrames(*run->session, 1.0);
+    P4cLeave(run);
+
+    // ---- 3. 读走廊存档（地牢里：先按名册给数据，load_raid 线程跑完、raid 核对后判定），读档后等 10 秒；
+    // 打一场战斗，战斗中存档后退回主菜单
+    run = P4cEnter(DD_PERSIST_LOADED, true);
+    {
+        // load_raid 线程上游戏删了一条 buff：DDCore 复制字段、排到主线程作为延迟事件派发
+        const std::uint32_t guid = FakeGameAdd(kP4cHero2, "SPD5", false);
+        FakeGameRemove(kP4cHero2, guid, "other", true);
+    }
+    P4cRaidLoading(*run, 1.0, 0);
+    P4cFrames(*run->session, 0.5);
+    P4cVerifyRaid(*run, true);
+    P4cFrames(*run->session, 8.5);
+    CHECK(P4cTagCount("p4c_persist", "persist.corridor") == 1);
+    constexpr std::uintptr_t kMonster = 0x20000;
+    constexpr std::uintptr_t kMonster2 = 0x20100;
+    // 开战后 6 秒没有事件（p4c_shield 驱动护盾规则，p4c_persist、p4b_combat 加战斗的载体，都靠 dd.actor 的枚举），之后一次一个角色
+    P4cBattleGuard guard = P4cBattleStart({ { kMonster, { 4500, 12 } }, { kMonster2, { 4501, 9 } } });
+    P4cFrames(*run->session, 6.0);
+    P4cTurn(kP4cHero);
+    // 圣骑士的 Smite：自然获得护盾，按游戏的时序 skill.post 之后约 1.5 秒才施加 shield_self_gain_5（修复 F6：shield_lite 原来只认
+    // skill.pre 到 skill.post 之间，这里归因是空的）。伤害是怪物一侧的全部吸收（驱动给的 10 点护盾）
+    {
+        const std::string skill = P4cSkillLate(*run->session, kP4cHero, kMonster, "shield_self_gain_5", 6, 1.5);
+        if (skill != "smite") {
+            std::printf("    skill.post 之后才施加的 shield_self_gain_5 归给了「%s」，应为 smite\n", skill.c_str());
+            CHECK(false);
+        }
+    }
+    P4cFrames(*run->session, 0.1);
+    P4cTurn(kMonster);
+    P4cSkill(kMonster, kP4cHero, nullptr);
+    P4cHit(kP4cHero, kMonster, 4);                       // 驱动里这个怪物对 h 的穿透 50%：英雄一侧的部分吸收
+    P4cFrames(*run->session, 1.5);
+    P4cTurn(kP4cHero2);
+    P4cSkill(kP4cHero2, kMonster, nullptr);
+    P4cHit(kMonster, kP4cHero2, 7);                      // 怪物一侧的部分吸收（剩 4，生命 12 → 9）
+    P4cFrames(*run->session, 1.5);
+    P4cTurn(kMonster2);
+    P4cSkill(kMonster2, kP4cHero, nullptr);
+    P4cHit(kP4cHero, kMonster2, 3);                      // 英雄一侧的全部吸收
+    P4cFrames(*run->session, 1.0);
+    P4cRoundStart();                                     // 第 2 回合：再生、衰减、穿透清掉（第 1 回合不结算）
+    P4cFrames(*run->session, 1.0);
+    P4cTurn(kMonster2);
+    P4cSkill(kMonster2, kP4cHero2, nullptr);
+    P4cHit(kP4cHero2, kMonster2, 13);                    // 部分吸收（护盾不够）
+    P4cFrames(*run->session, 1.0);
+    P4cSave(*run->session, true, true);
+    P4cGuardCheck(guard, "第一场战斗（读档前）");
+    P4cLeave(run);
+
+    // ---- 4. 读战斗中的存档：游戏不派发 battle.start（读档线程把战斗状态写成非零、重建怪物表）；英雄的状态马上核对，怪物的等
+    // raid 核对。读档后等 10 秒（p4c_shield 驱动这一场，p4b_combat 做战斗那一轮），之后一次一个角色，打完这场
+    run = P4cEnter(DD_PERSIST_LOADED, true);
+    g_p4cRound = 2;                                      // 战斗从存档恢复，回合号接着走
+    guard = P4cGuardNow();
+    P4cRaidLoading(*run, 1.0, 46);
+    P4cFrames(*run->session, 0.5);
+    P4cVerifyRaid(*run, true);
+    P4cFrames(*run->session, 8.5);
+    CHECK(P4cTagCount("p4c_persist", "persist.battle") == 1);
+    P4cTurn(kMonster);
+    P4cSkill(kMonster, kP4cHero, nullptr);
+    P4cHit(kP4cHero, kMonster, 3);
+    P4cFrames(*run->session, 1.5);
+    P4cTurn(kP4cHero);
+    P4cSkill(kP4cHero, kMonster, "shield_self_gain_5");
+    P4cHit(kMonster, kP4cHero, 20);
+    P4cFrames(*run->session, 1.0);
+    P4cRoundStart();
+    P4cFrames(*run->session, 0.5);
+    P4cTurn(kMonster2);
+    P4cSkill(kMonster2, kP4cHero2, nullptr);
+    P4cHit(kP4cHero2, kMonster2, 30);
+    P4cFrames(*run->session, 1.0);
+    P4cTurn(kMonster);
+    P4cSkill(kMonster, kP4cHero2, nullptr);
+    P4cHit(kP4cHero2, kMonster, 40);                     // hero#13 被打到死门（生命 0）
+    P4cFrames(*run->session, 1.0);
+    P4cTurn(kP4cHero2);
+    P4cSkill(kP4cHero2, kMonster, "shield_self_gain_5"); // 死门上获得护盾
+    P4cFrames(*run->session, 0.2);                       // shield_lite：生命 ≤ 0 时护盾清零
+    P4cHit(kP4cHero2, kMonster, 5);                      // 死门上没有护盾：p4c_shield 写一半的吸收量（不补生命）
+    P4cFrames(*run->session, 1.0);
+    P4cHit(kP4cHero2, kMonster, 5);                      // 第二次写全部（按格挡处理）
+    P4cFrames(*run->session, 1.5);
+    P4cMonsterDeath(4500);                               // 打完：怪物都死了
+    P4cMonsterDeath(4501);
+    const std::size_t corridorBefore = P4cRounds("corridor");
+    P4cBattleEnd(guard, "读进来的战斗");                  // 游戏删掉 remove_on_battle_complete 的载体，清空怪物表
+    P4cFrames(*run->session, 2.5);                       // 每秒的清理：怪物身上的载体 gone
+    CHECK(P4cTagCount("p4c_persist", "bend.remove") == 1 && P4cTagCount("p4c_persist", "monster.gone") >= 1);
+    {
+        // 第 7 步：打完后在走廊里停 5 秒，这次进存档的走廊那一轮在走廊里做（不是在刚才读进来的战斗里，审核 R3-B3）
+        P4cFrames(*run->session, 2.5);
+        if (P4cRounds("corridor") != corridorBefore + 1) {
+            std::printf("    读进来的战斗打完后，p4b_combat 没有在走廊里做走廊那一轮\n");
+            CHECK(false);
+        }
+    }
+    P4cFire("raid.step");
+    P4cSave(*run->session, true, false);
+    P4cFrames(*run->session, 1.0);
+    // 第二场战斗（撤退）：开战后不打，英雄先手、轮到英雄时直接撤退：这场一个怪物都没出过手（审核 R3-B1 的第 3 点）。
+    // p4c_persist 加这一场的载体、p4c_shield 驱动（这次进存档的第 2 场）都靠枚举
+    constexpr std::uintptr_t kMonster3 = 0x20200;
+    guard = P4cBattleStart({ { kMonster3, { 4502, 15 } } });
+    P4cFrames(*run->session, 5.0);
+    P4cTurn(kP4cHero);
+    P4cFrames(*run->session, 1.0);
+    P4cBattleEnd(guard, "撤退的战斗");                    // 撤退：没有怪物死亡
+    P4cFrames(*run->session, 2.5);
+    CHECK(P4cTagCount("p4c_persist", "bend.retreat") == 1);
+    // 回城（as_raid_finish 里依次 RaidFinish、TownVisitStart、存档）：游戏删掉队伍英雄身上来源 skill 的 buff（town_visit），存一次城镇；
+    // 之后是结算后的过渡和 load_town 线程（as_town_visit_start，加载中：读接口返回「加载中」、写操作被拒绝，审核 R2A-S1），
+    // 场景 Mod 在这两段里不做城镇那一轮，到 as_town_visit_update 才做
+    g_fc.raid = false;
+    g_world.party.clear();
+    P4cGameRemoveWhere(false);
+    P4cFire("raid.finish");
+    g_hub->EndScope(DD_EVENT_SCOPE_RAID);
+    P4cFrames(*run->session, 0.5);
+    P4cSave(*run->session, false, false);
+    P4cState("as_raid_result_to_town_transition");
+    P4cFrames(*run->session, 1.0);
+    P4cState("as_town_visit_start");
+    g_fc.loading = true;
+    P4cFrames(*run->session, 4.0);                       // 比两个场景 Mod 的等待（2、3 秒）长：不看加载中就会在这里加载体、做一轮
+    g_fc.loading = false;
+    CHECK(CountLog("加载线程正在运行") == 0);
+    P4cState("as_town_visit_update");
+    P4cFrames(*run->session, 5.0);                       // p4b_combat 的城镇一轮（本次进存档第一次在城镇）
+    CHECK(P4cTagCount("p4c_persist", "town_visit") >= 1);
+    P4cLeave(run);
+
+    // ---- 5. 回城后再读城镇存档：回城时城镇的载体被清掉了，p4c_persist 重新加两条；招募、解雇一次（存档），改旁路时名册里有带状态的标记
+    run = P4cEnter(DD_PERSIST_LOADED, false);
+    P4cFrames(*run->session, 4.0);
+    CHECK(P4cTagCount("p4c_persist", "persist.town") == 2);
+    P4cFire("hero.dismiss");                             // 解雇：游戏写名册
+    P4cSave(*run->session, false, false);
+    P4cFrames(*run->session, 0.5);
+    P4cLeave(run);
+
+    // ---- 6. rig.py tamper-persist p4c_persist 改过旁路之后读档：两代都不一致
+    {
+        FILE* tamper = nullptr;
+        _wfopen_s(&tamper, ddlua::Utf8ToWide(outDir + "/rig_tamper.log").c_str(), L"wb");
+        CHECK(tamper != nullptr);
+        if (tamper) {
+            std::fprintf(tamper, "{\"time\": 0, \"run\": \"%s\", \"game_running\": true, \"key\": \"p4c_persist\", \"what\": \"roster\", "
+                                 "\"current_only\": false, \"device\": \"steam_profile_7\", "
+                                 "\"changed\": [\"p4c_persist.ddsave %s->%s\", \"p4c_persist.ddsave.prev %s->%s\"]}\n",
+                kP4cRunId, kP4cRoster, kP4cTampered, kP4cRoster, kP4cTampered);
+            std::fclose(tamper);
+        }
+    }
+    run = P4cEnter(DD_PERSIST_MISMATCH, false, std::string("当前一代：名册的哈希不同（旁路 ") + kP4cTampered + "/4096 字节，存档 1111111111111111/4096 字节）；上一代：名册的哈希不同（旁路 " +
+        kP4cTampered + "/4096 字节，存档 1111111111111111/4096 字节）");
+    P4cFrames(*run->session, 0.1);
+    P4cSave(*run->session, false, false);                // 读城镇存档后游戏马上写 persist.narration.json（审核 R2B 备注 1）
+    P4cFrames(*run->session, 4.5);                       // 名册扫完（约 2 秒），p4b_combat 的城镇一轮做完再退出（中途退出会留下测试 buff）
+    CHECK(P4cTagCount("p4c_persist", "persist.mismatch") == 1);
+    P4cLeave(run);
+
+    // ---- 6b. 可选部分 D（第 12 步之后）：再读一次，读档后的那次存档让旁路有两代；只改当前一代，再读档是 prev（上一代是更早的那次存档，
+    // persist.store 按 last 找本次运行里那次存档核对，审核 R2B-1）
+    run = P4cEnter(DD_PERSIST_LOADED, false);
+    P4cFrames(*run->session, 0.1);
+    P4cSave(*run->session, false, false);
+    P4cFrames(*run->session, 4.5);
+    P4cLeave(run);
+    {
+        FILE* tamper = nullptr;
+        _wfopen_s(&tamper, ddlua::Utf8ToWide(outDir + "/rig_tamper.log").c_str(), L"ab");
+        CHECK(tamper != nullptr);
+        if (tamper) {
+            std::fprintf(tamper, "{\"time\": 0, \"run\": \"%s\", \"game_running\": true, \"key\": \"p4c_persist\", \"what\": \"roster\", "
+                                 "\"current_only\": true, \"device\": \"steam_profile_7\", \"changed\": [\"p4c_persist.ddsave %s->%s\"]}\n",
+                kP4cRunId, kP4cRoster, kP4cTampered);
+            std::fclose(tamper);
+        }
+    }
+    run = P4cEnter(DD_PERSIST_PREV, false, std::string("当前一代不一致（名册的哈希不同（旁路 ") + kP4cTampered + "/4096 字节，存档 " + kP4cRoster +
+        "/4096 字节）），用上一代");
+    P4cFrames(*run->session, 0.1);
+    P4cSave(*run->session, false, false);
+    P4cFrames(*run->session, 4.0);
+    CHECK(LogHas("[p4c_persist] 信息 [store] status=prev"));
+    P4cLeave(run);
+
+    // ---- 7. 一个没有 Lua Mod 的存档（可选的 #6）：不创建 VM，hook 报告和主菜单相同
+    {
+        const std::string serial = std::to_string(++g_p4cSerial);
+        P4cCore("阶段 CampaignLoad，帧 9000，存档序号 " + serial + "，线程 1，Campaign=0000000000070000，Buff::Library=0000000000071000，状态 last=2 next=19");
+        P4cCore("启用 Mod 列表 0 项（已安装 300 个），找到目录 0 项");
+        WriteLogLine(luaLog, DD_LOG_INFO, "[存档#" + serial + "] 进入存档：启用 0 个 Mod，0 个没有找到目录（见 DDCore.log）");
+        WriteLogLine(luaLog, DD_LOG_INFO, "[存档#" + serial + "] 没有可加载的 Lua Mod，不创建 VM");
+        P4cHookReport("CampaignLoad", 0, 0);
+        g_p4cT += 5;
+        P4cCore("阶段 CampaignUnload，帧 9500，存档序号 " + serial + "，线程 1");
+    }
+    P4cCore("persist：退到桌面：后台写盘已写完（本次运行写盘 " + std::to_string(g_p4cSaveIndex * 4) + " 个，合并 0 次，失败 0 次，重试 0 次）");
+
+    g_logSink = nullptr;
+    std::fclose(luaLog);
+    std::fclose(g_p4cCore);
+    g_p4cCore = nullptr;
+
+    // 判定（tools/p4_scenario_check.py 对同一份日志逐条核对公式）
+    std::size_t passed = 0, failed = 0, shields = 0;
+    for (const auto& line : g_log) {
+        const bool scenario = line.rfind("[p4c_", 0) == 0 || line.rfind("[p4b_combat]", 0) == 0 || line.rfind("[shield_lite]", 0) == 0;
+        passed += scenario && line.find("] 通过 ") != std::string::npos ? 1 : 0;
+        shields += line.rfind("[shield_lite] SHIELD ", 0) == 0 ? 1 : 0;
+        if (scenario && (line.find("] 失败") != std::string::npos || line.find("出错") != std::string::npos)) {
+            ++failed;
+            std::printf("    %s\n", line.c_str());
+        }
+    }
+    std::printf("  P4c2 场景预演：通过 %zu 行，失败 %zu 行，SHIELD %zu 行；日志样本在 %s\n", passed, failed, shields, outDir.c_str());
+    CHECK(failed == 0 && passed >= 60);
+    for (const char* ev : { "\"ev\":\"init\"", "\"ev\":\"apply\"", "\"ev\":\"absorb\"", "\"ev\":\"hit\"", "\"ev\":\"round\"", "\"ev\":\"clear\"", "\"ev\":\"carrier\"",
+             "\"ev\":\"save\"", "\"ev\":\"restore\"", "\"ev\":\"rule\"", "\"kind\":\"full\"", "\"kind\":\"partial\"", "\"skill\":\"smite\"", "\"op\":\"regen\"",
+             "\"op\":\"decay\"", "\"op\":\"max\"", "\"op\":\"full\"", "\"op\":\"break\"", "\"op\":\"set\"", "\"op\":\"pierce\"", "\"ev\":\"zero\"",
+             "\"skip\":true", "\"result\":\"original\"" }) {
+        if (CountLog(ev) == 0) {
+            std::printf("    shield_lite 没有写出 %s\n", ev);
+            CHECK(false);
+        }
+    }
+    for (const char* tag : { "drive.1", "define", "rule.live" }) {
+        if (P4cTagCount("p4c_shield", tag) == 0) {
+            std::printf("    p4c_shield 没有「通过 [%s]」\n", tag);
+            CHECK(false);
+        }
+    }
+    CHECK(CountLog("[p4c_shield] 信息 [deathsdoor] kind=partial") == 1 && CountLog("[p4c_shield] 信息 [deathsdoor] kind=full") == 1);
+    for (const char* tag : { "rounddone.town", "rounddone.corridor", "rounddone.battle", "effect.town", "effect.corridor", "effect.battle",
+             "queue.done.town", "queue.done.corridor", "queue.done.battle", "rule.live.town", "rule.live.corridor", "rule.live.battle",
+             "monster.battle", "monster.remove.battle", "define.game" }) {
+        if (P4cTagCount("p4b_combat", tag) == 0) {
+            std::printf("    p4b_combat 没有「通过 [%s]」\n", tag);
+            CHECK(false);
+        }
+    }
+    for (const char* tag : { "bend.remove", "bend.retreat", "restore.noadd", "remove.match", "town_visit", "monster.gone", "persist.mismatch" }) {
+        if (P4cTagCount("p4c_persist", tag) == 0) {
+            std::printf("    p4c_persist 没有「通过 [%s]」\n", tag);
+            CHECK(false);
+        }
+    }
+    CHECK(TickSubs() == 0 && CoreCount() == 0);
+}
+
 }  // namespace
 
 int main(int argc, char** argv)
@@ -4537,6 +8080,23 @@ int main(int argc, char** argv)
         { "入口末尾的超时（第三轮 R3A-备注1）", TestEntryEndOverrun },
         { "挂起的协程和 GC 停顿（第三轮 R3A-备注2，只记数据）", TestGcThreadsMeasure },
         { "GC 停顿的补偿和阈值（核对审核应修 1）", TestGcPauseCredit },
+        { "F5 队伍、怪物、战斗状态的只读枚举（dd.actor.party / monsters / in_battle）", TestActorEnum },
+        { "P4b 读：枚举、定义、快照、effect 句柄", TestCombatReads },
+        { "P4b 写：定义、添加、删除、标签、拒绝、排队和 done", TestCombatWrites },
+        { "P4b effect：施加、文本定义、脚本 Effect、技能句柄", TestCombatEffects },
+        { "P4b 脚本 Buff：状态的绑定、回调、丢弃、导出导入", TestScriptBuff },
+        { "P4b 规则：只读、预算、停用、撤销", TestRules },
+        { "P4b dd.fs 的写入", TestDataFs },
+        { "P4b 嵌套入口：预算、补时间、粘滞超时、崩溃隔离、跨 VM", TestNestedEntries },
+        { "P4b 状态的 JSON 编解码", TestStateJson },
+        { "P4b 场景 Mod p4b_combat 的离线预演", TestP4bScenarioMod },
+        { "P4c1 旁路数据的格式", TestStoreFormat },
+        { "P4c1 dd.store 和脚本 Buff 状态的存档、读档、核对", TestStoreRoundTrip },
+        { "P4c1 dd.store_status 的各种结果", TestStoreStatus },
+        { "P4c1 上限、整体赋值、不能保存的数据", TestStoreLimits },
+        { "P4c1 经过 plugin.cpp 的声明和回调", TestStorePlugin },
+        { "P4c1 规则回调交还原函数", TestRuleOriginal },
+        { "P4c2 场景 Mod（shield_lite、p4c_shield、p4c_persist、p4b_combat）的离线预演", TestP4cScenarioRehearsal },
     };
     int index = 0;
     for (const auto& test : tests) {

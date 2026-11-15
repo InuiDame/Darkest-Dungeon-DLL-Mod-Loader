@@ -400,7 +400,7 @@ dd.on("stress.post", function(ev)
       fmt(p.orig), fmt(ev.amount), fmt(ev.applied), fmt(p.before), fmt(ev.stress_after)))
 end, { priority = MOD_PRIORITY })
 
--- skill.pre：可写字段都是指针，Lua 只能读；写指针、写只读字段、取消都要报错
+-- skill.pre：Lua 只能读（P3 时 skill、target 可写但是指针，P4 起全部只读，事件也不带可写标志）；写指针、写只读字段、取消都要报错
 dd.on("skill.pre", function(ev)
   if done.skill then
     return
@@ -410,8 +410,8 @@ dd.on("skill.pre", function(ev)
   local ptr_ok, ptr_err = try(function() ev.target = target end)
   local ro_ok, ro_err = try(function() ev.target_count = 1 end)
   local cancel_ok, cancel_err = try(function() ev:cancel() end)
-  result("skill.pre", not ptr_ok and ptr_err:find("指针", 1, true) ~= nil and not ro_ok and ro_err:find("只读", 1, true) ~= nil and
-    not cancel_ok and ev.writable,
+  result("skill.pre", not ptr_ok and (ptr_err:find("指针", 1, true) ~= nil or ptr_err:find("只读", 1, true) ~= nil) and not ro_ok and ro_err:find("只读", 1, true) ~= nil and
+    not cancel_ok and not ev.writable,
     string.format("performer=%s target=%s target_count=%d friendly=%s writable=%s；写指针字段报错「%s」；写只读字段报错「%s」；取消报错「%s」",
       tostring(performer), tostring(target), ev.target_count, tostring(ev.friendly), tostring(ev.writable), ptr_err, ro_err, cancel_err))
 end)
