@@ -12,6 +12,8 @@
 - 查某个选型的结论：`docs/adr/`（索引在 `docs/README.md`）
 - 构建、测试、派发或审核：`docs/06-workflow.md`
 - 接手进行中的工作：`docs/08-handoff.md`
+- 跑或改用户场景验收：`docs/09-lua-scenario.md`（P3）、`docs/10-p4-scenario.md`（P4）
+- 代码注释里的审核编号：`docs/history/`
 
 ## 工作约定
 

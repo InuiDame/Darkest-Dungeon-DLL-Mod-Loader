@@ -2,7 +2,7 @@
 
 阶段流程、验收分级和工具见 [06-workflow.md](06-workflow.md)。上一阶段通过用户手动验收后，下一阶段才启动。
 
-**当前进度**：P0–P3 已完成，下一步是 P4。接手说明见 [08-handoff.md](08-handoff.md)。
+**当前进度**：P0–P4 已完成，下一步是 P5。接手说明见 [08-handoff.md](08-handoff.md)。
 
 ## 已完成
 
@@ -12,23 +12,14 @@
 | P1 Native ABI 与 DDCore | 2026-11-10 | 协议识别、早期加载、版本协商；DDCore 的日志、调度、生命周期、hook 仲裁；SDK、插件模板、示例；`check_sigs.py` |
 | P2 事件系统（native） | 2026-11-10 | 91 个原生事件、11 个 Query 的桥接（各有 1 个因游戏缺类型描述符不可用），13 个语义 hook（`.pre` 可改、可取消），订阅优先级和作用域，非主线程事件排队；场景验收中 146 个主题收到 67 个，覆盖见 [07-event-coverage.md](07-event-coverage.md) |
 | P3 Lua 运行时 | 2026-11-11 | `DDLua.dll`：单 VM、每个 Mod 一张 `_ENV` 的沙箱，按真实时间的执行预算和内存上限（Lua 按 C++ 编译并打补丁，[ADR 0019](adr/0019-lua-as-cpp-with-patches.md)、[0020](adr/0020-lua-budget-best-effort.md)），按存档发现和加载、拆除（[0021](adr/0021-lua-vm-per-campaign.md)），事件绑定、调度器和协程、热重载（[0022](adr/0022-lua-subscription-per-sdk-subscription.md)、[0023](adr/0023-lua-payload-and-coroutines.md)），DDCore 的 `game` 服务（启用 Mod 列表、actor 句柄，[0024](adr/0024-actor-handles-are-values.md)）；LuaLS 声明、Lua Mod 模板和示例；三轮对抗审核加一轮核对，Lua 官方测试集只有按设计的差异；场景验收见 [09-lua-scenario.md](09-lua-scenario.md) |
-
-## P4 Effect 与 Buff
-
-- 查询、枚举、施加、移除，定位 buff 增删函数。
-- P3 留下的：`skill.pre` 的写入验证（字段是指针，要等技能和 Effect 有句柄）；跨 VM 的嵌套入口拿不到 GC 停顿的补偿，开放写操作后要再测；`dd.fs` 的写入。
-- 文本定义、脚本 Effect、脚本 Buff、规则扩展。
-- 存档旁路持久化，tray 图标接入。
-
-**验收**：用 Lua 复刻 DDShield 的一部分（如 `shield_gain_N`）行为一致；脚本 Buff 的状态经过存档和读档后保持一致；重复施加、战斗结束清理等边界正确。
-
-**审核重点**：buff 表扩容时的指针失效、存档和旁路不一致。
+| P4 Effect 与 Buff | 2026-11-15 | DDCore 的 `combat` 服务（buff 的读写和标签、运行时定义、effect 的施加、规则扩展、技能句柄，`buff.*` 和 `damage.final` 主题，[ADR 0025](adr/0025-combat-write-timing.md)–[0030](adr/0030-damage-final-absorb.md)、[0033](adr/0033-skill-pre-read-only.md)）和 `persist` 服务（存档旁路，[0031](adr/0031-persist-sidecar-content-hash.md)），DDLua 的 `dd.buff`、`dd.effect`、脚本 Buff、规则、`dd.store`、`dd.fs` 写入（[0032](adr/0032-fs-write-data-dir.md)）和队伍、怪物的只读枚举（[0034](adr/0034-party-monster-enumeration.md)），DDShield 护盾的 Lua 复刻 `examples/lua/shield_lite`；四轮对抗审核，修复 F1–F7；场景验收分两次运行（第二次补做战斗中读档），见 [10-p4-scenario.md](10-p4-scenario.md) |
 
 ## P5 回合外系统
 
 - 各系统单例和字段的逆向，写入知识库。
 - 只读接口，然后逐个开放写操作，覆盖庄园、名册、英雄、库存、任务、地牢、城镇事件。
 - 屏幕与状态机。
+- P4 留下的：`skill.pre` 的写入（挪到 `5B9B50` 之前，先查清冷却和每场次数的计数，[ADR 0033](adr/0033-skill-pre-read-only.md)）；`dd.raid` 在 P4 的只读枚举上扩展（站位、火把、房间和走廊，[ADR 0034](adr/0034-party-monster-enumeration.md)）；读档恢复的战斗要不要补派发 `battle.start`、`battle.end` 要不要带结果（打完还是撤退），以及给 Lua 一个查询当前场合（城镇、走廊、战斗）的接口。
 
 **验收**：场景脚本覆盖每个模块的读写，改动反映在界面和存档里，改动后存档可以正常读取。
 

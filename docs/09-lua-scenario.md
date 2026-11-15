@@ -1,11 +1,11 @@
 # Lua 运行时的场景验收
 
-agent 只能做到主菜单自检，进存档、地牢、战斗的验收项由用户按这份流程操作一次，日志作证据（[ADR 0016](adr/0016-test-rig-and-manual-scenarios.md)）。P3 在 2026-11-11 按这份流程验收通过：检查脚本 29 项，通过 28，唯一的可选项没有触发。后续阶段扩充 Lua 能力时，在这里加场景步骤，在 `tools/p3_scenario_check.py` 和 `tests/lua/scenario/` 加对应的检查。
+agent 只能做到主菜单自检，进存档、地牢、战斗的验收项由用户按这份流程操作一次，日志作证据（[ADR 0016](adr/0016-test-rig-and-manual-scenarios.md)）。P3 在 2026-11-11 按这份流程验收通过：检查脚本 29 项，通过 28，唯一的可选项没有触发。后续阶段扩充 Lua 能力时，在这里加场景步骤，在 `tools/p3_scenario_check.py` 和 `tests/lua/scenario/` 加对应的检查。P4（Effect、Buff、持久化）的场景另写在 [10-p4-scenario.md](10-p4-scenario.md)（scenario4 方案、`tools/p4_scenario_check.py`），部署和保存日志的做法和这里相同。
 
 场景分两次游戏运行：
 
 1. **scenario 方案**：DDCore、DDLua、只读探针 `probe_p3c` 和 5 个测试 Lua Mod，在存档 A 里走完大部分验收项；
-2. **lua 方案**：只有 DDCore 和 DDLua，进一个没有 Lua Mod 的存档 B，对照验收 #7 的口径（1 个目标、语义 hook 0、订阅 0）。
+2. **lua 方案**：只有 DDCore 和 DDLua，进一个没有 Lua Mod 的存档 B，对照验收 #7 的口径（1 + 4 个目标、语义 hook 0、订阅 0）。P4c1 起 DDLua 总是声明使用存档旁路，DDCore 在 AppReady 装 4 个只读的观察 hook（排队写文件、读文件、选槽复制 backup、退到桌面；存档的读取早于 `CampaignLoad`，不能按需安装），所以 hook 报告是每帧 hook 加这 4 个，报告里另有一行 `persist：观察 hook 4 个`。P4c1 之前的日志没有这一行，按原来的 1 个目标判断。只有 DDCore 和不声明持久化的 native 插件的方案（如 `combat`）仍是 1 个目标。
 
 游戏每次启动都会重写日志，所以每次退出游戏后先用 `rig.py save-log` 把日志复制出来，最后用一条命令检查两份副本，把输出交给 agent。
 
@@ -206,7 +206,7 @@ python -B DD.ModLoader/tools/p3_scenario_check.py --log-dir DD.ModLoader/build/r
 ## 日志里的关键行（给 agent 核对）
 
 - `DDLua.log`：`[存档#N] 进入存档：启用 X 个 Mod`、`[<id>] 发现 Lua Mod … 来源 <标题>（mod_local_source）`、`加载顺序：`、`加载完成：成功 4 个，共 5 个 Lua Mod`、`[p3d_core] 通过 [标签] …`、`[p3d_faulty] … 超出执行预算 …`、`订阅核对（拆除后）：… 0 个`、`分配器残留 0 字节`、`[DDLua] 没有 Lua VM 了，撤销 lifecycle TICK`。lua 方案那次：`[存档#N] 没有可加载的 Lua Mod，不创建 VM`。
-- `DDCore.log`：第一行 `DDCore 1.0.0 启动，运行标识 …`、`插件 DDLua 加载成功`（scenario 方案还有 `插件 probe_p3c 加载成功`）、`新战斗：战斗序号 N（探索序号 M，…，actor 服务调用时发现）`（每场战斗一行，同一次探索里递增）、`启用 Mod 列表 N 项（已安装 M 个），找到目录 K 项`、`hook 报告（CampaignLoad）` 后面的 `事件系统：已注册 listener … 订阅 N 个`、`进入 as_raid_start（新建 Raid），探索序号 N`。lua 方案那次 `CampaignLoad` 的报告应为「共 1 个目标」「已注册 listener 0 个，语义 hook 0 个，订阅 0 个」。
+- `DDCore.log`：第一行 `DDCore 1.0.0 启动，运行标识 …`、`插件 DDLua 加载成功`（scenario 方案还有 `插件 probe_p3c 加载成功`）、`新战斗：战斗序号 N（探索序号 M，…，actor 服务调用时发现）`（每场战斗一行，同一次探索里递增）、`启用 Mod 列表 N 项（已安装 M 个），找到目录 K 项`、`hook 报告（CampaignLoad）` 后面的 `事件系统：已注册 listener … 订阅 N 个`、`进入 as_raid_start（新建 Raid），探索序号 N`。lua 方案那次 `CampaignLoad` 的报告应为「共 5 个目标」（每帧 hook 加 4 个持久化观察 hook，同一份报告里有 `persist：观察 hook 4 个（已装）`）「已注册 listener 0 个，语义 hook 0 个，订阅 0 个」。
 - `probe_p3c.log`：`battle.start 第 k 场：探索序号 N，战斗序号 B`（同一个 N 下至少两场，B 递增），第二场起 `上一场战斗的怪物句柄 m 个，仍能解析 0 个（应为 0），其中 guid 和本场怪物相同 j 个`（j 应大于 0）；`battle.end 第 k 场：… 本存档英雄句柄 h 个，仍能解析 h 个（不计阵亡、解雇的 …）`；`==== 汇总（退出存档）====` 后三行；第二次进存档的 `上一个存档的英雄句柄 N 个，仍能解析 0 个`。指针字段的逐条日志每次进存档最多 60 行，每场战斗开始时至少再给 20 行，所以每次进存档都有样本。
 - `DDLua.log` 的 `[p3c_actor]`：第二场起 `通过 第 k 场（探索 N，战斗 B）：上一场的怪物里和本场怪物 guid 相同的 j 个；旧句柄失效 j/j，== 不相等 j/j，不是同一个对象 j/j，表键分开 j/j，新句柄驻留 j/j`（N、B 和探针那一行对上）；`通过 wait_event 快照的 target 就是保存的英雄句柄`（等的是第一个在 `damage.pre` 里挨打的英雄）。`[p3d_core] 信息 [damage.halve] … 判不了，下一场再试` 表示减半的那个英雄有受到伤害的百分比修正，下一场会再减半一次。减半的效果用这个英雄同一段里其余伤害估出的倍率判断：战斗里的减半只用本场的伤害，走廊里的减半只用上一场战斗结束之后的走廊伤害（倍率的增减益常在战斗结束时到期）。没有可用的伤害时，掉血正好是写入值就判通过，否则判不了。
 

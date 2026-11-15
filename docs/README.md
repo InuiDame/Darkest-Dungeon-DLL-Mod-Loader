@@ -2,7 +2,7 @@
 
 项目目标：在 DDModLoader 的基础上，为《暗黑地牢》增加 native 插件接口（DLL）和 Lua 脚本接口，用 xmake 构建，工程形式参照 `DD.Plugins`。
 
-当前状态：P0–P3 已通过验收，下一步是 P4（Effect 与 Buff），进度见 [04-roadmap.md](04-roadmap.md)，接手请先读 [08-handoff.md](08-handoff.md)。
+当前状态：P0–P4 已通过验收，下一步是 P5（回合外系统）。进度见 [04-roadmap.md](04-roadmap.md)，接手请先读 [08-handoff.md](08-handoff.md)。
 
 | 文档 | 内容 |
 | --- | --- |
@@ -12,8 +12,9 @@
 | [04-roadmap.md](04-roadmap.md) | 分阶段目标、交付物、验收标准、审核重点 |
 | [06-workflow.md](06-workflow.md) | 阶段流程、验收分级、工具、派发和审核简报 |
 | [07-event-coverage.md](07-event-coverage.md) | 事件主题覆盖表，由 `tools/event_coverage.py` 从 `test_events` 日志生成 |
-| [08-handoff.md](08-handoff.md) | 接手说明：当前状态、下一步、未验证项 |
+| [08-handoff.md](08-handoff.md) | 接手说明：当前状态、下一步、未验证项、已知限制、遗留整理项 |
 | [09-lua-scenario.md](09-lua-scenario.md) | Lua 运行时的用户场景验收：部署、存档、流程、检查脚本 |
+| [10-p4-scenario.md](10-p4-scenario.md) | P4（Effect、Buff、持久化）的用户场景验收：scenario4 方案、DDShield 的 Lua 复刻、存档读档、检查脚本 |
 | [history/](history/) | 已完成阶段的审核发现索引（代码注释里的审核编号查这里） |
 | [adr/](adr/) | 架构决策记录，见下表 |
 
@@ -47,5 +48,15 @@
 | [0022](adr/0022-lua-subscription-per-sdk-subscription.md) | 每个 Lua 订阅对应一个 SDK 订阅，过滤放在 DDLua |
 | [0023](adr/0023-lua-payload-and-coroutines.md) | 事件负载在回调返回后失效，协程只在帧边界恢复 |
 | [0024](adr/0024-actor-handles-are-values.md) | Actor 句柄是不带指针的值 |
+| [0025](adr/0025-combat-write-timing.md) | 写操作在安全点立即执行，事件回调里排队，规则回调里拒绝 |
+| [0026](adr/0026-buff-topics-on-container-ops.md) | buff.* 主题挂在 buff 表的容器操作上，删除原因按调用栈判断 |
+| [0027](adr/0027-script-buff-carrier.md) | 脚本 Buff 用游戏的 buff 条目做载体，状态按（actor，组 guid） |
+| [0028](adr/0028-runtime-definitions.md) | 运行时定义：buff 只开放 POD 字段，effect 用游戏的解析器并先预检，每次进存档重新注册 |
+| [0029](adr/0029-rule-extension-entry-hook.md) | 规则扩展复用 is_actor_status / actorStatus，在 479CD0 入口接管，可以交还原函数 |
+| [0030](adr/0030-damage-final-absorb.md) | damage.final 在格挡判定处派发，吸收量可写 |
+| [0031](adr/0031-persist-sidecar-content-hash.md) | 存档旁路按内容哈希核对，不一致时不给数据；观察 hook 常驻 |
+| [0032](adr/0032-fs-write-data-dir.md) | dd.fs 只写本 Mod 的数据目录 |
+| [0033](adr/0033-skill-pre-read-only.md) | skill.pre 不开放写入 |
+| [0034](adr/0034-party-monster-enumeration.md) | 队伍、怪物、战斗状态的只读枚举先于 P5 的 dd.raid 提供 |
 
 新的决策按 `NNNN-slug.md` 顺序编号，同时加进上表。原决策表里的 RE 工具选型（Ghidra，见 `knowledge/README.md`）和「阶段顺序按路线图」没有单独成文。

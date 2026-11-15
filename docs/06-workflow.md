@@ -29,10 +29,12 @@
 | 测试目录 | `python -B DD.ModLoader/tools/rig.py <命令>`，`status`、`deploy`、`run`、`save-log`、`compare-log`、`verify-real` 等，见 `--help` |
 | 保存一次运行的日志 | `python -B DD.ModLoader/tools/rig.py save-log <名字>`，复制到 `build/rig_logs/<名字>/`，保留修改时间并记下方案和部署时间，同名拒绝 |
 | 特征码离线校验 | `python -B DD.ModLoader/tools/check_sigs.py [exe...]`，默认 Steam 版和离线版 |
-| Actor 偏移校验 | `python -B DD.ModLoader/tools/check_actor_layout.py`，核对 DDCore 里 actor 字段的偏移常量和战斗计数清零点，游戏更新后运行 |
+| Actor 偏移校验 | `python -B DD.ModLoader/tools/check_actor_layout.py`，核对 DDCore 里 actor 字段、buff 表和 Instance、枚举表和来源标志、Effect 和技能、队伍和怪物表、免疫表的偏移和常量，以及战斗计数清零点，游戏更新后运行 |
 | Lua 类型声明 | `python -B DD.ModLoader/tools/gen_lua_types.py`，从 `sdk/lua/topics.json`（`rig.py deploy topics` 运行一次导出）生成 `sdk/lua/dd_topics.lua`，`--check` 只核对 |
 | Lua 离线测试 | `xmake build dd_lua_tests && xmake run dd_lua_tests`（`-v` 打印日志），沙箱、预算、生命周期、事件、调度、句柄 |
 | P3 场景检查 | `python -B DD.ModLoader/tools/p3_scenario_check.py`，逐项判断场景日志通过、失败或没有触发；`--selftest DD.ModLoader/build/p3d_rehearsal` 用 `dd_lua_tests` 生成的预演日志自测；用法见 [09-lua-scenario.md](09-lua-scenario.md) |
+| P4 场景检查 | `python -B DD.ModLoader/tools/p4_scenario_check.py --log-dir <scenario4 的日志> --combat-log-dir <combat 的日志>`，`--selftest` 用 `dd_lua_tests` 生成的 `build/p4c_rehearsal` 自测；构造旁路不一致用 `rig.py tamper-persist`，重跑前清旁路用 `rig.py reset-persist`；用法见 [10-p4-scenario.md](10-p4-scenario.md) |
+| 探针日志分析 | `python -B DD.ModLoader/tools/p4_probe_report.py --log-dir <目录>`，逐项判定 P4 探针（`probe_p4`，方案 `probe4`）的待核实清单 |
 | 运行中比对 .text | `python -B DD.ModLoader/tools/rig_textdiff.py`，列出被改动的区间，确认没有多余的 hook |
 | 更新事件覆盖表 | `python -B DD.ModLoader/tools/event_coverage.py`，读 `test_events.log`，重新生成 `docs/07-event-coverage.md` |
 | 看函数 | `bash knowledge/tools/ghidra/decompile.sh <RVA>...`，或 `python -B knowledge/tools/dd_disasm.py` |

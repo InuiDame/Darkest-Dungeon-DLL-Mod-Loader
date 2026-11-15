@@ -16,3 +16,5 @@ Lua 回调拿到的负载是 userdata，只保存 `DDEvent*`，回调返回后�
 `dd.wait_event` 至少晚一帧。`campaign.unload` 主题 Lua 收不到：按存档的会话在 lifecycle 的 `CampaignUnload` 里先拆除。
 
 2026-11-11 敲定（P3）。
+
+P4 起字段能不能写看主题的 `DD_EVENT_F_WRITABLE`，不只看 `.pre` 后缀：`damage.final` 的 `absorb` 可写（[ADR 0030](0030-damage-final-absorb.md)），`skill.pre` 整个只读（[ADR 0033](0033-skill-pre-read-only.md)）。

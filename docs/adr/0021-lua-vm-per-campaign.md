@@ -15,3 +15,5 @@ Mod 由 `<Mod 目录>/lua/manifest.json` 识别，`id` 用于依赖、日志和�
 切换存档时脚本状态全部丢失，要跨存档保留的数据等 P4 的持久化。直接退出游戏不保证有 `CampaignUnload`，进程退出时不碰 VM。
 
 2026-11-11 敲定（P3）。
+
+「切换存档时脚本状态全部丢失」由 [ADR 0031](0031-persist-sidecar-content-hash.md) 取代：VM 仍然每次进存档新建，`dd.store` 和脚本 Buff 的状态经存档旁路随存档保存。「没有 Lua Mod 时 hook 和原版一致」也不再成立：DDLua 存在时常驻 4 个只读的存档观察 hook，hook 报告是 1 + 4 个目标。
