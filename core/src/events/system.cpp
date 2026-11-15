@@ -5,6 +5,8 @@
 
 #include <windows.h>
 
+#include <intrin.h>
+
 #include <algorithm>
 #include <climits>
 #include <cstdio>
@@ -304,6 +306,23 @@ std::vector<FieldDesc> DamageFields(bool post)
 }
 enum { DF_target, DF_attacker, DF_damage, DF_type, DF_srcId, DF_srcType, DF_crit, DF_hp, DF_isHero, DF_hpAfter, DF_timeline, DF_cancelled };
 
+// 最终伤害（P4，D12）：护体和格挡判定之后、扣血之前。absorb 可写
+std::vector<FieldDesc> DamageFinalFields()
+{
+    return {
+        F("target", POINTER, kAccessR),
+        F("attacker", POINTER, kAccessR),
+        F("damage", FLOAT, kAccessR),
+        F("damage_type", INT, kAccessR),
+        F("blocked", BOOL, kAccessR),
+        F("deaths_door", BOOL, kAccessR),
+        F("hp_before", FLOAT, kAccessR),
+        F("is_hero", BOOL, kAccessR),
+        F("absorb", FLOAT, kAccessRW),
+    };
+}
+enum { DFF_target, DFF_attacker, DFF_damage, DFF_type, DFF_blocked, DFF_deathsDoor, DFF_hp, DFF_isHero, DFF_absorb };
+
 std::vector<FieldDesc> EffectFields(bool post)
 {
     std::vector<FieldDesc> fields = {
@@ -316,6 +335,7 @@ std::vector<FieldDesc> EffectFields(bool post)
         F("heal_amount", FLOAT, kAccessR),
         F("target_stress", FLOAT, kAccessR),
         F("target_hp", FLOAT, kAccessR),
+        F("effect_name", STRING, kAccessR),
     };
     if (post) {
         fields.push_back(F("target_stress_after", FLOAT, kAccessR));
@@ -324,14 +344,16 @@ std::vector<FieldDesc> EffectFields(bool post)
     }
     return fields;
 }
-enum { EF_performer, EF_target, EF_effect, EF_item, EF_source, EF_stressAmt, EF_healAmt, EF_stress, EF_hp, EF_stressAfter, EF_hpAfter, EF_cancelled };
+enum { EF_performer, EF_target, EF_effect, EF_item, EF_source, EF_stressAmt, EF_healAmt, EF_stress, EF_hp, EF_name, EF_stressAfter, EF_hpAfter, EF_cancelled };
 
-std::vector<FieldDesc> SkillFields(bool post)
+// skill.pre 不开放写入（P4，D11）：DDCore 的 hook 点在游戏分派之后，执行者已经记下原技能（performer+0x8E0）、
+// 即时 buff 已经施加，这里换技能或目标会和游戏状态对不上。技能字段经 combat.skill_from_pointer 转成技能句柄
+std::vector<FieldDesc> SkillFields(bool)
 {
     return {
         F("performer", POINTER, kAccessR),
-        F("skill", POINTER, post ? kAccessR : kAccessRW),
-        F("target", POINTER, post ? kAccessR : kAccessRW),
+        F("skill", POINTER, kAccessR),
+        F("target", POINTER, kAccessR),
         F("target_count", INT, kAccessR),
         F("friendly", BOOL, kAccessR),
     };
@@ -415,6 +437,8 @@ using AttackSkillFn = void(__fastcall*)(void*, void*, const void*, void*);
 using FriendlySkillFn = void(__fastcall*)(void*, void*, const void*, void*, bool);
 using AdvanceRoundFn = void(__fastcall*)(void*);
 using StartTurnFn = int(__fastcall*)(void*, void*, void*);
+using ConsumeBlockFn = bool(__fastcall*)(void*, int, float);
+using ActorPredicateFn = bool(__fastcall*)(void*);
 
 struct HookOrig {
     DamageFn heroDamage = nullptr;
@@ -430,7 +454,17 @@ struct HookOrig {
     FriendlySkillFn friendlySkill = nullptr;
     AdvanceRoundFn advanceRound = nullptr;
     StartTurnFn startTurn = nullptr;
+    ConsumeBlockFn consumeBlock = nullptr;
 };
+
+// damage.final 要的攻击者：480400 的参数里没有，在外层的槽位 50（ApplyHealthDamageInternal）记下。
+// 只有主线程用；嵌套的伤害（反击之类）按栈恢复
+struct DamageContext {
+    void* target = nullptr;
+    void* attacker = nullptr;
+    DamageContext* outer = nullptr;
+};
+DamageContext* g_damageContext = nullptr;
 
 struct HookDef {
     const char* name = nullptr;
@@ -440,6 +474,7 @@ struct HookDef {
     void* detour = nullptr;
     void** orig = nullptr;
     std::vector<Topic*> topics;  // 任意一个有订阅就安装
+    std::function<bool()> extraDesired;  // 外部 hook：订阅之外的安装条件（例如有规则注册）
     std::uint64_t handle = 0;
     bool installed = false;
     bool failed = false;
@@ -468,6 +503,7 @@ struct Context {
     Topic* stressPost = nullptr;
     Topic* healPre = nullptr;
     Topic* healPost = nullptr;
+    Topic* damageFinal = nullptr;
 };
 
 bool IsMain()
@@ -592,7 +628,10 @@ void* DamageImpl(DamageFn orig, bool isHero, void* self, void* prng, float damag
             amount = 0.0f;
         }
     }
+    DamageContext context{ self, attacker, g_damageContext };
+    g_damageContext = &context;
     void* result = orig(self, prng, amount, type, src, st, crit, attacker);
+    g_damageContext = context.outer;
     if (Dispatchable(c.damagePost)) {
         Slot post[kMaxFields]{};
         if (!slots[DF_target].set) {
@@ -626,6 +665,126 @@ void* __fastcall MonsterDamageDetour(void* self, void* prng, float damage, const
     const int* st, bool crit, void* attacker)
 {
     return DamageImpl(g_ctx->orig.monsterDamage, false, self, prng, damage, type, src, st, crit, attacker);
+}
+
+// Hero/Monster 虚表槽位 40、43（Hero 478190：HP==0，即在死门上；4781B0：HP<0 或 +0x1304，已死）。
+// 4836A0 在 480400 返回假之后先问 43、再问 40，两个都为假才扣血（4836A0 的反编译，[静态]）
+bool CallActorPredicate(void* actor, std::size_t slot, bool* out)
+{
+    __try {
+        auto** vtable = *static_cast<void***>(actor);
+        *out = reinterpret_cast<ActorPredicateFn>(vtable[slot])(actor);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+bool SetActorHp(void* actor, float value)
+{
+    __try {
+        *reinterpret_cast<float*>(static_cast<std::uint8_t*>(actor) + kActorHp) = value;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+constexpr std::size_t kVtSlotDeathsDoor = 40;  // 0x140
+constexpr std::size_t kVtSlotDead = 43;        // 0x158
+constexpr float kDamageEpsilon = 1e-6f;        // 4836A0 扣血前比较的阈值（0xEE61E0 处的常量）
+
+// 怪物受伤（5FC3E0）在 480400 返回假之后的扣血规则（P4 审核 A-S2，[静态]）：只有免疫一个分支不扣血——
+// [[Monster+0x1468]+0xF97]（.can_be_damaged_directly）为 0 且 DEB7D0[伤害类型] 非 0（类型 0–7、9、10、13–19）；
+// 其余一律 HP -= 最终伤害（没有阈值，不问槽位 43、40）。+0x1306 的英雄型怪物改走英雄的 4836A0，不经过这个返回点。
+enum class MonsterDeduct { NotMonsterPath, Deducts, Immune, Unknown };
+
+MonsterDeduct MonsterRule(void* actor, int type)
+{
+    const auto* table = g_ctx->addr->monsterImmuneTable;
+    if (type < 0 || type >= 20 || !table) {
+        return MonsterDeduct::Unknown;  // 表只有 20 种类型有意义；超出时游戏读的是表外的字节
+    }
+    __try {
+        const auto* p = static_cast<const std::uint8_t*>(actor);
+        const auto* monsterClass = *reinterpret_cast<const std::uint8_t* const*>(p + 0x1468);
+        if (!monsterClass) {
+            return MonsterDeduct::Unknown;
+        }
+        return monsterClass[0xF97] == 0 && table[type] != 0 ? MonsterDeduct::Immune : MonsterDeduct::Deducts;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return MonsterDeduct::Unknown;
+    }
+}
+
+// damage.final：Actor::ConsumeHealthDamageBlock（480400，rcx=Actor、edx=伤害类型、xmm2=最终伤害），返回真表示格挡。
+// 4836A0 先算 roundf((Actor+0xBE0 + 常量) * 伤害) 作为最终伤害，调用 480400；返回真就不扣血、显示 Blocked（弹字 0x31），
+// 否则在 43、40 两个槽位都为假时扣 HP -= 最终伤害，再按扣完的 HP 判定死门。所以部分吸收在这里先把吸收量补回 HP，
+// 死门按补回后的生命判定（DDShield 的 ShieldAbsorbFinal 也是这么做的）
+bool __fastcall ConsumeBlockDetour(void* self, int type, float damage)
+{
+    auto& c = *g_ctx;
+    if (!c.orig.consumeBlock) {
+        return false;
+    }
+    // 调用者：怪物受伤的返回点是 MonsterBlockReturn；其余（英雄 4836A0，含英雄型怪物）按英雄的规则
+    const void* caller = _ReturnAddress();
+    const bool blocked = c.orig.consumeBlock(self, type, damage);
+    if (!IsMain() || !self || !Dispatchable(c.damageFinal) || ActivePvP()) {
+        return blocked;
+    }
+    const MonsterDeduct monster =
+        c.addr->monsterBlockReturn && caller == c.addr->monsterBlockReturn ? MonsterRule(self, type) : MonsterDeduct::NotMonsterPath;
+    bool dead = false;
+    bool deathsDoor = false;
+    const bool predicatesOk = CallActorPredicate(self, kVtSlotDead, &dead) && CallActorPredicate(self, kVtSlotDeathsDoor, &deathsDoor);
+    const bool isHero = c.addr->heroVtable && *static_cast<void* const*>(self) == c.addr->heroVtable;
+    void* attacker = g_damageContext && g_damageContext->target == self ? g_damageContext->attacker : nullptr;
+    Slot slots[kMaxFields]{};
+    const auto set = [&](int index) -> Slot& {
+        slots[index].set = true;
+        return slots[index];
+    };
+    set(DFF_target).v.p = self;
+    set(DFF_attacker).v.p = attacker;
+    set(DFF_damage).v.f = monster == MonsterDeduct::Immune ? 0.0f : damage;  // 免疫的怪物：游戏不扣血，最终伤害按 0
+    set(DFF_type).v.i = type;
+    set(DFF_blocked).v.b = blocked;
+    set(DFF_deathsDoor).v.b = deathsDoor;
+    set(DFF_hp).v.f = ReadFloat(self, kActorHp);
+    set(DFF_isHero).v.b = isHero;
+    set(DFF_absorb).v.f = 0.0;
+    Payload payload;
+    payload.slots = slots;
+    payload.originThread = GetCurrentThreadId();
+    payload.allowWrite = true;
+    c.hub->Dispatch(c.damageFinal, payload);
+    if (blocked || damage <= kDamageEpsilon || monster == MonsterDeduct::Immune) {
+        return blocked;  // 免疫：游戏只弹 immune、不扣血，absorb 不起作用（也不改成 Blocked）
+    }
+    const double absorb = (std::min)((std::max)(slots[DFF_absorb].v.f, 0.0), static_cast<double>(damage));
+    if (absorb >= damage) {
+        return true;  // 全部吸收：按格挡处理
+    }
+    if (absorb <= 0.0) {
+        return false;
+    }
+    // 部分吸收：先补回生命，游戏随后照常扣。只在确定游戏会扣血时补，否则补回的会变成治疗
+    bool refund = false;
+    switch (monster) {
+    case MonsterDeduct::NotMonsterPath:
+        refund = predicatesOk && !dead && !deathsDoor;  // 英雄：4836A0 在槽位 43、40 都为假时才扣
+        break;
+    case MonsterDeduct::Deducts:
+        refund = ReadFloat(self, kActorHp) > 0.0f;  // 怪物一律扣；HP 已经不大于 0（被 .kill 之类杀死）时不补
+        break;
+    default:
+        break;  // 判断不了：不补（吸收无效，宁可少挡）
+    }
+    if (refund) {
+        SetActorHp(self, ReadFloat(self, kActorHp) + static_cast<float>(absorb));
+    }
+    return false;
 }
 
 float HealImpl(HealFn orig, void* self, void* prng, float amount, void* healer, int type, bool crit, void* out,
@@ -779,6 +938,9 @@ void __fastcall EffectApplyDetour(void* prng, void* performer, void* target, con
     const bool swapped = *(static_cast<const std::uint8_t*>(effect) + kEffectSwapRoles) != 0;
     void* const actualPerformer = swapped ? target : performer;
     void* const actualTarget = swapped ? performer : target;
+    // Effect+0 是 char[64] 名字（4F02D0），复制一份保证以 0 结尾
+    char effectName[65] = {};
+    std::memcpy(effectName, effect, 64);
     Slot slots[kMaxFields]{};
     const auto fill = [&] {
         slots[EF_performer].v.p = actualPerformer;
@@ -800,6 +962,8 @@ void __fastcall EffectApplyDetour(void* prng, void* performer, void* target, con
         slots[EF_stress].set = true;
         slots[EF_hp].v.f = actualTarget ? ReadFloat(actualTarget, kActorHp) : 0.0f;
         slots[EF_hp].set = true;
+        slots[EF_name].v.s = effectName;
+        slots[EF_name].set = true;
     };
     bool cancelled = false;
     if (PreAllowed(c.effectPre)) {
@@ -820,7 +984,7 @@ void __fastcall EffectApplyDetour(void* prng, void* performer, void* target, con
         if (!slots[EF_performer].set) {
             fill();
         }
-        std::memcpy(post, slots, sizeof(Slot) * (EF_hp + 1));
+        std::memcpy(post, slots, sizeof(Slot) * (EF_name + 1));
         post[EF_stressAfter].v.f = actualTarget ? ReadFloat(actualTarget, kActorStress) : 0.0f;
         post[EF_stressAfter].set = true;
         post[EF_hpAfter].v.f = actualTarget ? ReadFloat(actualTarget, kActorHp) : 0.0f;
@@ -959,6 +1123,7 @@ void SkillImpl(void* battle, void* performer, const void* skill, void* targets, 
     const void* useSkill = skill;
     void* useTarget = primary;
     if (PreAllowed(c.skillPre)) {
+        // 只读（P4，D11），字段都不可写，不写回
         Slot slots[kMaxFields]{};
         slots[SF_performer].v.p = performer;
         slots[SF_performer].set = true;
@@ -974,14 +1139,8 @@ void SkillImpl(void* battle, void* performer, const void* skill, void* targets, 
         payload.slots = slots;
         payload.flags = DD_EVENT_F_PRE;
         payload.originThread = GetCurrentThreadId();
-        payload.allowWrite = true;
+        payload.allowWrite = false;  // 主题只读，事件不带 DD_EVENT_F_WRITABLE（审核 A-N5 / R2A-N2）
         c.hub->Dispatch(c.skillPre, payload);
-        useSkill = slots[SF_skill].v.p;
-        useTarget = slots[SF_target].v.p;
-        // 目标写回：只改 targets 的第一个元素，vector 结构不动
-        if (count > 0 && useTarget != primary && useTarget) {
-            first[0] = useTarget;
-        }
     }
     callOrig(useSkill);
     if (Dispatchable(c.skillPost)) {
@@ -1386,7 +1545,7 @@ struct System::Impl {
         c.damagePost = AddSemantic("damage.post", DamageFields(true), false, false);
         c.effectPre = AddSemantic("effect.pre", EffectFields(false), true, true);
         c.effectPost = AddSemantic("effect.post", EffectFields(true), false, false);
-        c.skillPre = AddSemantic("skill.pre", SkillFields(false), true, false);
+        c.skillPre = AddSemantic("skill.pre", SkillFields(false), false, false);  // 只读（D11），不带可写标志
         c.skillPost = AddSemantic("skill.post", SkillFields(true), false, false);
         c.hitPre = AddSemantic("hit.pre", HitFields(false), true, false);
         c.hitPost = AddSemantic("hit.post", HitFields(true), false, false);
@@ -1398,6 +1557,7 @@ struct System::Impl {
         c.stressPost = AddSemantic("stress.post", StressFields(true), false, false);
         c.healPre = AddSemantic("heal.pre", HealFields(false), true, false);
         c.healPost = AddSemantic("heal.post", HealFields(true), false, false);
+        c.damageFinal = AddSemantic("damage.final", DamageFinalFields(), true, false);
 
         // 应用与生命周期
         appTick = hub->AddTopic("app.tick", TopicKind::App, { FieldDesc{ "frame", DD_FIELD_INT, kAccessR } }, false, false);
@@ -1428,6 +1588,9 @@ struct System::Impl {
                 setMissing(b, std::string("特征码 ") + sig + " 缺失");
             }
         };
+        if (!vtables || !addr->consumeBlock) {
+            setMissing(c.damageFinal, !vtables ? "特征码 HeroVtable/MonsterVtable 缺失" : "特征码 ConsumeHealthDamageBlock 缺失");
+        }
         needInline(c.effectPre, c.effectPost, addr->effectApply, "EffectApplyInternal");
         needInline(c.turnStart, c.turnEnd, addr->combatStartTurn, "CombatStartTurn");
         needInline(c.roundStart, c.roundEnd, addr->advanceRound, "BattleAdvanceRound");
@@ -1439,7 +1602,7 @@ struct System::Impl {
         }
         if (!addr->raidCurrent) {
             // PvP 判定不可用时，.pre 主题一律不可用，防止不同步
-            for (Topic* t : { c.damagePre, c.effectPre, c.skillPre, c.hitPre, c.stressPre, c.healPre }) {
+            for (Topic* t : { c.damagePre, c.effectPre, c.skillPre, c.hitPre, c.stressPre, c.healPre, c.damageFinal }) {
                 if (t && t->available) {
                     setMissing(t, "特征码 RaidCurrent 缺失，无法判定 PvP");
                 }
@@ -1885,7 +2048,8 @@ struct System::Impl {
             def.topics = std::move(topics);
             hooks.push_back(std::move(def));
         };
-        std::vector<Topic*> damage = { c.damagePre, c.damagePost };
+        // damage.final 也要槽位 50：它在那里记下攻击者（480400 的参数里没有）
+        std::vector<Topic*> damage = { c.damagePre, c.damagePost, c.damageFinal };
         std::vector<Topic*> heal = { c.healPre, c.healPost };
         std::vector<Topic*> stress = { c.stressPre, c.stressPost };
         addVtable("damage:Hero", addr->heroVtable, kVtSlotDamage, reinterpret_cast<void*>(&HeroDamageDetour),
@@ -1916,12 +2080,14 @@ struct System::Impl {
             reinterpret_cast<void**>(&c.orig.advanceRound), { c.roundStart, c.roundEnd });
         addInline("battle.turn", addr->combatStartTurn, "CombatStartTurn", reinterpret_cast<void*>(&StartTurnDetour),
             reinterpret_cast<void**>(&c.orig.startTurn), { c.turnStart, c.turnEnd });
+        addInline("damage.final", addr->consumeBlock, "ConsumeHealthDamageBlock", reinterpret_cast<void*>(&ConsumeBlockDetour),
+            reinterpret_cast<void**>(&c.orig.consumeBlock), { c.damageFinal });
     }
 
     void ReconcileHooks()
     {
         for (auto& def : hooks) {
-            bool desired = false;
+            bool desired = def.extraDesired && def.extraDesired();
             for (Topic* topic : def.topics) {
                 if (topic && hub->SubscriberCount(topic) > 0) {
                     desired = true;
@@ -2222,6 +2388,38 @@ void System::OnAppReady()
 bool System::Loading() const
 {
     return impl_->loading;
+}
+
+void System::AddHook(ExternalHook hook)
+{
+    if (!hook.target || !hook.detour || !hook.orig) {
+        return;
+    }
+    HookDef def;
+    def.name = hook.name;
+    def.isVtable = hook.isVtable;
+    def.target = hook.target;
+    def.entryId = hook.entryId;
+    def.detour = hook.detour;
+    def.orig = hook.orig;
+    def.topics = std::move(hook.topics);
+    def.extraDesired = std::move(hook.extraDesired);
+    impl_->hooks.push_back(std::move(def));
+}
+
+void System::RequestReconcile()
+{
+    impl_->hub->MarkDirty();
+}
+
+bool System::HookInstalled(const char* name) const
+{
+    for (const auto& def : impl_->hooks) {
+        if (def.name && name && std::strcmp(def.name, name) == 0) {
+            return def.installed;
+        }
+    }
+    return false;
 }
 
 void System::FrameBoundary(const GameSample& sample, std::uint64_t frame, std::uint32_t, bool assetsReady)

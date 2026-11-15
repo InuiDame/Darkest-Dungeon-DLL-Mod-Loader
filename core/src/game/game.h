@@ -48,6 +48,42 @@ struct Addresses {
     const void* appliedUgcVector = nullptr; // 当前存档启用列表的 vector<UGCId>
     // actor 句柄（可选，P3c）：最大生命的计算函数
     const void* actorMaxStat = nullptr;
+    // combat 服务和 buff.*、damage.final（可选，P4a）
+    std::uint8_t* buffGroupAdd = nullptr;
+    std::uint8_t* buffGroupErase = nullptr;
+    std::uint8_t* buffDurationUpkeep = nullptr;
+    std::uint8_t* buffRuleActive = nullptr;
+    std::uint8_t* consumeBlock = nullptr;
+    const std::uint8_t* monsterBlockReturn = nullptr;  // 怪物受伤里 480400 的返回点（A-S2）
+    const std::uint8_t* monsterImmuneTable = nullptr;  // 伤害类型 -> 对 .can_be_damaged_directly 为假的怪物是否免疫（DEB7D0）
+    void* buffInstanceCopy = nullptr;
+    void* vectorDtor64 = nullptr;
+    void* vectorDtor64b = nullptr;
+    void* ehVectorDtor = nullptr;
+    void* buffLibraryIndex = nullptr;
+    void* effectLookup = nullptr;
+    void* applyEffect = nullptr;
+    void* prngFloat = nullptr;
+    void* freeU32Vector = nullptr;
+    void* parseEffectFile = nullptr;
+    void* gamePrng = nullptr;           // prng_minstd 对象
+    void* effectMap = nullptr;          // std::map<uint32, Effect*>（head 指针、size）
+    const std::uint8_t* altRosterFlag = nullptr;
+    // 只用来比对调用栈里的函数起始地址（buff.remove 的原因）
+    const void* updateBuffsInternal = nullptr;
+    const void* onStartTownVisit = nullptr;
+    const void* buffBurnDecay = nullptr;
+    const void* buffRemoveByGuid = nullptr;
+    const void* actorResetStats = nullptr;
+    const void* inventoryBuffRemove = nullptr;
+    const void* skillInstantBuffs = nullptr;
+    const void* updateTrinketBuffs = nullptr;
+    // persist 服务的观察 hook（可选，P4c1）
+    std::uint8_t* storageQueueWrite = nullptr;
+    std::uint8_t* storageReadFile = nullptr;
+    std::uint8_t* saveSlotBackup = nullptr;
+    std::uint8_t* appShutdown = nullptr;
+    void* const volatile* storageManager = nullptr;  // StorageManager* 全局；+0x38 是槽 5（当前 profile）的设备，设备 +0x20 是名字
 };
 
 struct ResolveReport {

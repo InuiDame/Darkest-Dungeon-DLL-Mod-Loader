@@ -1,6 +1,7 @@
 #include "core.h"
 
 #include "../../common/pattern.h"
+#include "combat/combat.h"
 #include "events/access.h"
 #include "events/system.h"
 #include "game/actors.h"
@@ -12,6 +13,7 @@
 #include "log.h"
 #include "logic/abi.h"
 #include "logic/deps.h"
+#include "persist/persist.h"
 #include "plugin/discovery.h"
 #include "runtime/lifecycle.h"
 #include "runtime/task_queue.h"
@@ -77,6 +79,9 @@ struct Core {
     TaskQueue tasks;
     std::unique_ptr<Lifecycle> lifecycle;
     std::unique_ptr<events::System> events;
+    std::unique_ptr<combat::Combat> combat;  // events 初始化成功时才有
+    std::unique_ptr<persist::Persist> persist;  // 存档旁路（P4c1）
+    bool inFrameBody = false;                // UpdateStateDetour 正在执行 OnFrameBody（帧边界，游戏代码不在栈上）
     std::vector<game::EnabledMod> enabledMods;  // CampaignLoad 时读取，CampaignUnload 后清空
 
     std::mutex registryMutex;
@@ -995,9 +1000,539 @@ uint32_t DD_CALL SvcGameBattleSerial()
     return OnMainThread() ? ActorEnvNow().battleSerial : 0;
 }
 
+bool LoadingNow();
+
+// 枚举和战斗状态（F5）：主线程、存档里、没有加载线程在跑（加载线程在新建 Raid、重建怪物表，见 LoadingNow）
+bool EnumReady()
+{
+    auto& c = C();
+    return OnMainThread() && c.tracker && c.tracker->CampaignActive() && !LoadingNow();
+}
+
+bool ListActors(bool party, DDActorRef* out, uint32_t capacity, uint32_t* outCount)
+{
+    if (outCount) {
+        *outCount = 0;
+    }
+    if (!EnumReady()) {
+        return false;
+    }
+    const game::ActorEnv env = ActorEnvNow();
+    const std::uint32_t n = party ? game::ActorListParty(env, out, capacity) : game::ActorListMonsters(env, out, capacity);
+    if (outCount) {
+        *outCount = n;
+    }
+    return true;
+}
+
+bool DD_CALL SvcGamePartyHeroes(DDActorRef* out, uint32_t capacity, uint32_t* outCount)
+{
+    return ListActors(true, out, capacity, outCount);
+}
+
+bool DD_CALL SvcGameBattleMonsters(DDActorRef* out, uint32_t capacity, uint32_t* outCount)
+{
+    return ListActors(false, out, capacity, outCount);
+}
+
+int32_t DD_CALL SvcGameBattleState()
+{
+    auto& c = C();
+    if (!EnumReady()) {
+        return -1;
+    }
+    ObserveBattle("actor 服务调用时");
+    const BattleSample sample = game::ReadBattleSample(c.addr.raidCurrent);
+    return sample.raid ? sample.state : 0;
+}
+
 const DDGameService kGameService = { { sizeof(DDGameService), DD_SERVICE_GAME_VERSION }, &SvcGameModsAvailable,
     &SvcGameModCount, &SvcGameModAt, &SvcGameActorKinds, &SvcGameRaidSerial, &SvcGameActorFromPointer, &SvcGameActorFind,
-    &SvcGameActorResolve, &SvcGameActorInfo, &SvcGameBattleSerial };
+    &SvcGameActorResolve, &SvcGameActorInfo, &SvcGameBattleSerial, &SvcGamePartyHeroes, &SvcGameBattleMonsters, &SvcGameBattleState };
+
+// combat -------------------------------------------------------------------
+// 插件传来的结构和字符串先在 SEH 下复制，再交给 combat 模块（它会调用游戏函数，访问冲突不能发生在那里）
+
+bool CopyIn(const void* src, void* dst, std::size_t size)
+{
+    if (!src) {
+        return false;
+    }
+    __try {
+        std::memcpy(dst, src, size);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+bool CopyActorRef(const DDActorRef* src, DDActorRef* out)
+{
+    return CopyIn(src, out, sizeof(DDActorRef)) && out->size >= sizeof(DDActorRef);
+}
+
+// 只认识 size 以内的字段，其余按 0
+template <class T>
+bool CopySized(const T* src, T* out)
+{
+    std::uint32_t size = 0;
+    if (!CopyIn(src, &size, sizeof(size)) || size < sizeof(std::uint32_t)) {
+        return false;
+    }
+    std::memset(out, 0, sizeof(T));
+    return CopyIn(src, out, (std::min)(static_cast<std::size_t>(size), sizeof(T)));
+}
+
+std::uint32_t CombatReject(DDCombatOpResult* out, std::uint32_t kind, std::uint32_t code)
+{
+    if (out && out->size >= sizeof(DDCombatOpResult)) {
+        out->kind = kind;
+        out->op = 0;
+        out->result = code;
+        out->guid = 0;
+        out->count = 0;
+        out->message = combat::Combat::ResultText(code);
+    }
+    return code;
+}
+
+const char* DD_CALL SvcCombatResultText(uint32_t result)
+{
+    return combat::Combat::ResultText(result);
+}
+
+bool DD_CALL SvcCombatSetOpHandler(DDPluginHandle plugin, DDCombatOpFn fn, void* user)
+{
+    auto* record = FromHandle(plugin);
+    auto& c = C();
+    return record && c.combat && c.combat->SetOpHandler(record->owner, fn, user);
+}
+
+bool DD_CALL SvcCombatSafePoint()
+{
+    auto& c = C();
+    return c.combat && c.combat->SafePoint();
+}
+
+bool DD_CALL SvcCombatReadReady()
+{
+    auto& c = C();
+    return c.combat && c.combat->ReadReady();
+}
+
+uint32_t DD_CALL SvcCombatEnumCount(uint32_t table)
+{
+    return combat::EnumCount(table);
+}
+
+const char* DD_CALL SvcCombatEnumName(uint32_t table, int32_t value)
+{
+    return combat::EnumName(table, value);
+}
+
+int32_t DD_CALL SvcCombatEnumValue(uint32_t table, const char* name)
+{
+    return name ? combat::EnumValue(table, ReadPluginString(name)) : -1;
+}
+
+uint32_t DD_CALL SvcCombatSourceFlags(int32_t source)
+{
+    return combat::SourceFlags(source);
+}
+
+bool DD_CALL SvcCombatBuffList(const DDActorRef* actor, uint32_t* guids, uint32_t capacity, uint32_t* count)
+{
+    auto& c = C();
+    DDActorRef ref{};
+    return c.combat && CopyActorRef(actor, &ref) && c.combat->BuffList(ref, guids, capacity, count);
+}
+
+bool DD_CALL SvcCombatBuffGet(const DDActorRef* actor, uint32_t guid, DDBuffInfo* out)
+{
+    auto& c = C();
+    DDActorRef ref{};
+    return c.combat && CopyActorRef(actor, &ref) && c.combat->BuffGet(ref, guid, out);
+}
+
+bool DD_CALL SvcCombatBuffDefGet(const char* id, DDBuffDef* out)
+{
+    auto& c = C();
+    return c.combat && id && c.combat->BuffDefGet(ReadPluginString(id), out);
+}
+
+uint32_t DD_CALL SvcCombatBuffAdd(DDPluginHandle plugin, const DDActorRef* actor, const char* id, const DDBuffAddOptions* options,
+    DDCombatOpResult* out)
+{
+    auto* record = FromHandle(plugin);
+    auto& c = C();
+    if (!record || !c.combat) {
+        return CombatReject(out, DD_COMBAT_OP_BUFF_ADD, !record ? DD_COMBAT_E_INVALID : DD_COMBAT_E_UNAVAILABLE);
+    }
+    combat::AddRequest request;
+    if (!CopyActorRef(actor, &request.actor) || !id || (options && !CopySized(options, &request.options))) {
+        return CombatReject(out, DD_COMBAT_OP_BUFF_ADD, DD_COMBAT_E_INVALID);
+    }
+    request.options.size = sizeof(DDBuffAddOptions);
+    request.id = ReadPluginString(id);
+    request.tag = request.options.tag ? ReadPluginString(request.options.tag) : std::string();
+    request.options.tag = nullptr;
+    return c.combat->BuffAdd(record->owner, std::move(request), out);
+}
+
+uint32_t DD_CALL SvcCombatBuffRemove(DDPluginHandle plugin, const DDActorRef* actor, const DDBuffRemoveSpec* spec, DDCombatOpResult* out)
+{
+    auto* record = FromHandle(plugin);
+    auto& c = C();
+    if (!record || !c.combat) {
+        return CombatReject(out, DD_COMBAT_OP_BUFF_REMOVE, !record ? DD_COMBAT_E_INVALID : DD_COMBAT_E_UNAVAILABLE);
+    }
+    combat::RemoveRequest request;
+    if (!CopyActorRef(actor, &request.actor) || !CopySized(spec, &request.spec)) {
+        return CombatReject(out, DD_COMBAT_OP_BUFF_REMOVE, DD_COMBAT_E_INVALID);
+    }
+    request.text = request.spec.text ? ReadPluginString(request.spec.text) : std::string();
+    request.spec.text = nullptr;
+    return c.combat->BuffRemove(record->owner, std::move(request), out);
+}
+
+uint32_t DD_CALL SvcCombatBuffDefine(DDPluginHandle plugin, const DDBuffDef* def, DDCombatOpResult* out)
+{
+    auto* record = FromHandle(plugin);
+    auto& c = C();
+    if (!record || !c.combat) {
+        return CombatReject(out, DD_COMBAT_OP_BUFF_DEFINE, !record ? DD_COMBAT_E_INVALID : DD_COMBAT_E_UNAVAILABLE);
+    }
+    DDBuffDef copy{};
+    if (!CopyIn(def, &copy, sizeof(copy)) || copy.size < sizeof(DDBuffDef)) {
+        return CombatReject(out, DD_COMBAT_OP_BUFF_DEFINE, DD_COMBAT_E_INVALID);
+    }
+    return c.combat->BuffDefine(record->owner, copy, out);
+}
+
+bool DD_CALL SvcCombatEffectGet(const char* name, DDEffectInfo* out)
+{
+    auto& c = C();
+    return c.combat && name && c.combat->EffectGet(ReadPluginString(name), out);
+}
+
+uint32_t DD_CALL SvcCombatEffectApply(DDPluginHandle plugin, const char* name, const DDActorRef* performer, const DDActorRef* target,
+    DDCombatOpResult* out)
+{
+    auto* record = FromHandle(plugin);
+    auto& c = C();
+    if (!record || !c.combat) {
+        return CombatReject(out, DD_COMBAT_OP_EFFECT_APPLY, !record ? DD_COMBAT_E_INVALID : DD_COMBAT_E_UNAVAILABLE);
+    }
+    combat::EffectRequest request;
+    if (!name || !CopyActorRef(performer, &request.performer) || (target && !CopyActorRef(target, &request.target))) {
+        return CombatReject(out, DD_COMBAT_OP_EFFECT_APPLY, DD_COMBAT_E_INVALID);
+    }
+    request.hasTarget = target != nullptr;
+    request.name = ReadPluginString(name);
+    return c.combat->EffectApply(record->owner, std::move(request), out);
+}
+
+uint32_t DD_CALL SvcCombatEffectDefine(DDPluginHandle plugin, const char* text, DDCombatOpResult* out)
+{
+    auto* record = FromHandle(plugin);
+    auto& c = C();
+    if (!record || !c.combat) {
+        return CombatReject(out, DD_COMBAT_OP_EFFECT_DEFINE, !record ? DD_COMBAT_E_INVALID : DD_COMBAT_E_UNAVAILABLE);
+    }
+    if (!text) {
+        return CombatReject(out, DD_COMBAT_OP_EFFECT_DEFINE, DD_COMBAT_E_INVALID);
+    }
+    return c.combat->EffectDefine(record->owner, ReadPluginString(text), out);
+}
+
+DDRuleId DD_CALL SvcCombatRuleRegister(DDPluginHandle plugin, const char* name, DDRuleFn fn, void* user)
+{
+    auto* record = FromHandle(plugin);
+    auto& c = C();
+    return record && c.combat && name && fn ? c.combat->RuleRegister(record->owner, ReadPluginString(name), fn, user) : 0;
+}
+
+bool DD_CALL SvcCombatRuleUnregister(DDPluginHandle plugin, DDRuleId id)
+{
+    auto* record = FromHandle(plugin);
+    auto& c = C();
+    return record && c.combat && c.combat->RuleUnregister(record->owner, id);
+}
+
+bool DD_CALL SvcCombatRuleStats(DDRuleStats* out)
+{
+    auto& c = C();
+    return c.combat && c.combat->RuleStats(out);
+}
+
+bool DD_CALL SvcCombatSkillFromPointer(const void* performer, const void* skill, DDSkillRef* out)
+{
+    auto& c = C();
+    return c.combat && c.combat->SkillFromPointer(performer, skill, out);
+}
+
+bool DD_CALL SvcCombatSkillInfo(const DDSkillRef* ref, DDSkillInfo* out)
+{
+    auto& c = C();
+    DDSkillRef copy{};
+    return c.combat && CopyIn(ref, &copy, sizeof(copy)) && copy.size >= sizeof(DDSkillRef) && copy.actor.size >= sizeof(DDActorRef) &&
+        c.combat->SkillInfo(copy, out);
+}
+
+const DDCombatService kCombatService = { { sizeof(DDCombatService), DD_SERVICE_COMBAT_VERSION }, &SvcCombatResultText,
+    &SvcCombatSetOpHandler, &SvcCombatSafePoint, &SvcCombatReadReady, &SvcCombatEnumCount, &SvcCombatEnumName, &SvcCombatEnumValue, &SvcCombatSourceFlags, &SvcCombatBuffList,
+    &SvcCombatBuffGet, &SvcCombatBuffDefGet, &SvcCombatBuffAdd, &SvcCombatBuffRemove, &SvcCombatBuffDefine, &SvcCombatEffectGet,
+    &SvcCombatEffectApply, &SvcCombatEffectDefine, &SvcCombatRuleRegister, &SvcCombatRuleUnregister, &SvcCombatRuleStats,
+    &SvcCombatSkillFromPointer, &SvcCombatSkillInfo };
+
+// SEH 隔离的回调（combat 模块用）
+bool InvokeCombatOp(DDCombatOpFn fn, const DDCombatOpResult* result, void* user, std::uint32_t owner)
+{
+    struct Call {
+        DDCombatOpFn fn;
+        const DDCombatOpResult* result;
+        void* user;
+    } call{ fn, result, user };
+    Fault fault;
+    const bool ok = GuardedInvoke(
+        [](void* raw) {
+            auto* c = static_cast<Call*>(raw);
+            c->fn(c->result, c->user);
+        },
+        &call, &fault);
+    if (!ok) {
+        LogError("插件 %s 的操作回调崩溃：%s", PluginName(owner).c_str(), DescribeFault(fault).c_str());
+    }
+    return ok;
+}
+
+// 规则回调在 buff 遍历里，次数很多：这里不写日志，崩溃由 combat 模块记一次并停用这条规则
+bool InvokeRule(DDRuleFn fn, const DDRuleContext* context, void* user, std::uint32_t* result)
+{
+    __try {
+        *result = fn(context, user);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+bool LoadingNow()
+{
+    auto& c = C();
+    const int last = *c.addr.stateLast;
+    const int next = *c.addr.stateNext;
+    const auto& s = c.addr.states;
+    return last == next && (last == s.loadCampaign || last == s.raidStart || last == s.townVisitStart);
+}
+
+void CreateCombat()
+{
+    auto& c = C();
+    combat::CombatDeps deps;
+    deps.addr = &c.addr;
+    deps.events = c.events.get();
+    deps.mainThread = c.mainThread;
+    deps.gameRoot = c.utf8GameRoot;
+    deps.log = [](int level, const std::string& text) {
+        (level >= DD_LOG_WARN ? (level >= DD_LOG_ERROR ? LogError : LogWarn) : LogInfo)("%s", text.c_str());
+    };
+    deps.pluginName = [](std::uint32_t owner) { return PluginName(owner); };
+    deps.actorEnv = [] { return ActorEnvNow(); };
+    deps.inFrameBody = [] { return C().inFrameBody; };
+    deps.campaignActive = [] { return C().tracker && C().tracker->CampaignActive(); };
+    deps.loadingNow = [] { return LoadingNow(); };
+    deps.invokeOp = &InvokeCombatOp;
+    deps.invokeRule = &InvokeRule;
+    // persist 的保存回调期间按事件回调处理写操作（排队），见 dd_api.h 的 persist 一节
+    deps.extraDepth = [] { return C().persist && C().persist->InSaveCallback() ? 1 : 0; };
+    struct Args {
+        combat::CombatDeps* deps;
+        std::unique_ptr<combat::Combat>* out;
+    } args{ &deps, &c.combat };
+    Fault fault;
+    if (!GuardedInvoke(
+            [](void* raw) {
+                auto* a = static_cast<Args*>(raw);
+                *a->out = std::make_unique<combat::Combat>(std::move(*a->deps));
+            },
+            &args, &fault)) {
+        LogError("combat 模块初始化崩溃：%s，combat 服务不可用", DescribeFault(fault).c_str());
+        c.combat.reset();
+    }
+}
+
+// persist -------------------------------------------------------------------
+
+const char* DD_CALL SvcPersistStatusText(uint32_t status)
+{
+    return persist::Persist::StatusText(status);
+}
+
+uint32_t DD_CALL SvcPersistDeclare(DDPluginHandle plugin, DDPersistSaveFn onSave, DDPersistVerifyFn onVerify, void* user)
+{
+    auto* record = FromHandle(plugin);
+    auto& c = C();
+    if (!record) {
+        return DD_PERSIST_E_INVALID;
+    }
+    return c.persist ? c.persist->Declare(record->owner, onSave, onVerify, user) : DD_PERSIST_E_UNAVAILABLE;
+}
+
+bool WriteOut(void* dst, const void* src, std::size_t size)
+{
+    __try {
+        std::memcpy(dst, src, size);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+uint32_t DD_CALL SvcPersistLoad(DDPluginHandle plugin, const char* key, DDPersistData* out)
+{
+    auto* record = FromHandle(plugin);
+    auto& c = C();
+    if (!record || !key) {
+        return DD_PERSIST_E_INVALID;
+    }
+    if (!c.persist) {
+        return DD_PERSIST_E_UNAVAILABLE;
+    }
+    std::uint32_t size = 0;
+    if (!CopyIn(out, &size, sizeof(size)) || size < sizeof(DDPersistData)) {
+        return DD_PERSIST_E_INVALID;
+    }
+    DDPersistData copy{};
+    copy.size = sizeof(copy);
+    const std::uint32_t result = c.persist->Load(record->owner, ReadPluginString(key), &copy);
+    if (result == DD_PERSIST_OK && !WriteOut(out, &copy, sizeof(copy))) {
+        return DD_PERSIST_E_INVALID;
+    }
+    return result;
+}
+
+uint32_t DD_CALL SvcPersistSave(DDPluginHandle plugin, const char* key, const void* data, uint32_t size, const char* version)
+{
+    auto* record = FromHandle(plugin);
+    auto& c = C();
+    if (!record || !key || (!data && size) || size > DD_PERSIST_MAX_DATA) {
+        return DD_PERSIST_E_INVALID;
+    }
+    if (!c.persist) {
+        return DD_PERSIST_E_UNAVAILABLE;
+    }
+    // 插件的数据先在 SEH 下复制
+    std::string bytes(size, '\0');
+    if (size && !CopyIn(data, bytes.data(), size)) {
+        return DD_PERSIST_E_INVALID;
+    }
+    return c.persist->Save(record->owner, ReadPluginString(key), std::move(bytes), version ? ReadPluginString(version) : std::string());
+}
+
+bool DD_CALL SvcPersistInfo(DDPersistInfo* out)
+{
+    auto& c = C();
+    std::uint32_t size = 0;
+    if (!c.persist || !CopyIn(out, &size, sizeof(size)) || size < sizeof(DDPersistInfo)) {
+        return false;
+    }
+    DDPersistInfo copy{};
+    copy.size = sizeof(copy);
+    return c.persist->Info(&copy) && WriteOut(out, &copy, sizeof(copy));
+}
+
+const DDPersistService kPersistService = { { sizeof(DDPersistService), DD_SERVICE_PERSIST_VERSION }, &SvcPersistStatusText,
+    &SvcPersistDeclare, &SvcPersistLoad, &SvcPersistSave, &SvcPersistInfo };
+
+bool InvokePersistSave(DDPersistSaveFn fn, const DDPersistSaveInfo* info, void* user, std::uint32_t owner)
+{
+    struct Call {
+        DDPersistSaveFn fn;
+        const DDPersistSaveInfo* info;
+        void* user;
+    } call{ fn, info, user };
+    Fault fault;
+    const bool ok = GuardedInvoke(
+        [](void* raw) {
+            auto* c = static_cast<Call*>(raw);
+            c->fn(c->info, c->user);
+        },
+        &call, &fault);
+    if (!ok) {
+        LogError("插件 %s 的 persist 保存回调崩溃：%s", PluginName(owner).c_str(), DescribeFault(fault).c_str());
+    }
+    return ok;
+}
+
+bool InvokePersistVerify(DDPersistVerifyFn fn, const DDPersistVerify* verify, void* user, std::uint32_t owner)
+{
+    struct Call {
+        DDPersistVerifyFn fn;
+        const DDPersistVerify* verify;
+        void* user;
+    } call{ fn, verify, user };
+    Fault fault;
+    const bool ok = GuardedInvoke(
+        [](void* raw) {
+            auto* c = static_cast<Call*>(raw);
+            c->fn(c->verify, c->user);
+        },
+        &call, &fault);
+    if (!ok) {
+        LogError("插件 %s 的 persist 核对回调崩溃：%s", PluginName(owner).c_str(), DescribeFault(fault).c_str());
+    }
+    return ok;
+}
+
+void CreatePersist()
+{
+    auto& c = C();
+    persist::PersistDeps deps;
+    deps.addr = &c.addr;
+    deps.events = c.events.get();
+    deps.hooks = &c.hooks;
+    deps.combat = c.combat.get();
+    deps.mainThread = c.mainThread;
+    deps.gameRoot = c.gameRoot;
+    deps.buildLabel = c.buildLabel;
+    deps.log = [](int level, const std::string& text) {
+        (level >= DD_LOG_WARN ? (level >= DD_LOG_ERROR ? LogError : LogWarn) : LogInfo)("%s", text.c_str());
+    };
+    deps.pluginName = [](std::uint32_t owner) { return PluginName(owner); };
+    deps.ownerOf = [](const std::string& name, bool* found) -> std::uint32_t {
+        auto& core = C();
+        std::lock_guard lock(core.registryMutex);
+        for (const auto& p : core.plugins) {
+            if (p->name == name && p->state == PluginState::Loaded) {
+                *found = true;
+                return p->owner;
+            }
+        }
+        *found = false;
+        return 0;
+    };
+    deps.campaignActive = [] { return C().tracker && C().tracker->CampaignActive(); };
+    deps.loadingNow = [] { return LoadingNow(); };
+    deps.campaignSerial = [] { return C().tracker ? C().tracker->CampaignSerial() : 0u; };
+    deps.actorEnv = [] { return ActorEnvNow(); };
+    deps.invokeSave = &InvokePersistSave;
+    deps.invokeVerify = &InvokePersistVerify;
+    struct Args {
+        persist::PersistDeps* deps;
+        std::unique_ptr<persist::Persist>* out;
+    } args{ &deps, &c.persist };
+    Fault fault;
+    if (!GuardedInvoke(
+            [](void* raw) {
+                auto* a = static_cast<Args*>(raw);
+                *a->out = std::make_unique<persist::Persist>(std::move(*a->deps));
+            },
+            &args, &fault)) {
+        LogError("persist 模块初始化崩溃：%s，persist 服务不可用", DescribeFault(fault).c_str());
+        c.persist.reset();
+    }
+}
 
 // 进入存档时读一次启用 Mod 列表，复制成自己的字符串
 void ReadEnabledModList()
@@ -1066,11 +1601,19 @@ const void* DD_CALL ServiceQuery(const char* service, uint32_t minVersion)
         { DD_SERVICE_GAME_INFO, &kGameInfoService, DD_SERVICE_GAME_INFO_VERSION },
         { DD_SERVICE_EVENTS, &kEventsService, DD_SERVICE_EVENTS_VERSION },
         { DD_SERVICE_GAME, &kGameService, DD_SERVICE_GAME_VERSION },
+        { DD_SERVICE_COMBAT, &kCombatService, DD_SERVICE_COMBAT_VERSION },
+        { DD_SERVICE_PERSIST, &kPersistService, DD_SERVICE_PERSIST_VERSION },
     };
     for (const auto& entry : kServices) {
         if (std::strcmp(entry.name, service) == 0) {
             if (entry.table == &kEventsService && !C().events) {
                 return nullptr;  // 事件系统没有初始化成功
+            }
+            if (entry.table == &kCombatService && !C().combat) {
+                return nullptr;  // combat 模块依赖事件系统
+            }
+            if (entry.table == &kPersistService && !C().persist) {
+                return nullptr;
             }
             return minVersion <= entry.version ? entry.table : nullptr;
         }
@@ -1098,6 +1641,12 @@ void HookReport(const char* title)
     }
     if (c.events) {
         LogInfo("%s", c.events->HookReportSummary().c_str());
+    }
+    if (c.combat) {
+        LogInfo("%s", c.combat->Summary().c_str());
+    }
+    if (c.persist) {
+        LogInfo("%s", c.persist->Summary().c_str());
     }
     LogInfo("======== 报告结束 ========");
 }
@@ -1136,10 +1685,20 @@ void OnFrameBody()
         LogInfo("阶段 CampaignUnload，帧 %llu，存档序号 %u，线程 %lu%s",
             static_cast<unsigned long long>(c.frame), serial, GetCurrentThreadId(),
             events.unloadAfterDestroy ? "（销毁之后才发现，异常路径）" : "");
+        // 最后一组存档还没派发 campaign.save 的先派发（Campaign 还在时）
+        if (c.persist) {
+            c.persist->BeforeCampaignUnload(!events.unloadAfterDestroy);
+        }
         c.lifecycle->SetCampaignActive(false);
         c.lifecycle->Fire(DD_PHASE_CAMPAIGN_UNLOAD, c.frame, serial);
         if (c.events) {
             c.events->OnCampaignUnload(serial);
+        }
+        if (c.combat) {
+            c.combat->OnCampaignUnload();
+        }
+        if (c.persist) {
+            c.persist->OnCampaignUnload();  // 等后台写完
         }
         c.enabledMods.clear();
     }
@@ -1156,6 +1715,13 @@ void OnFrameBody()
                 c.tracker->RaidSerial(), c.tracker->BattleSerial());
         }
         c.lifecycle->SetCampaignActive(true);
+        if (c.combat) {
+            c.combat->OnCampaignLoad();
+        }
+        // 读档的一致性依据（名册在这之前已经读完），恢复 DDCore 的标签（英雄）；插件在 CAMPAIGN_LOAD 回调里 load
+        if (c.persist) {
+            c.persist->OnCampaignLoad();
+        }
         c.lifecycle->Fire(DD_PHASE_CAMPAIGN_LOAD, c.frame, serial);
         if (c.events) {
             c.events->OnCampaignLoad(serial);
@@ -1163,10 +1729,18 @@ void OnFrameBody()
         HookReport("CampaignLoad");
     }
 
+    // 上一帧写完的一组存档：在任务、延迟事件、定时器之前派发 campaign.save，快照和刚写的存档对应（P4-0B 0B-13）
+    if (c.persist) {
+        c.persist->OnFrameBoundary();
+    }
     c.lifecycle->ProcessLate(c.frame, serial);
     c.tasks.Drain(NowMs(), &InvokeTask);
     if (c.events) {
         c.events->FrameBoundary(sample, c.frame, serial, c.assetsFired);
+    }
+    // 上一帧事件回调里排队的写操作（hook 已经同步、延迟事件已经派发，这里是安全点）
+    if (c.combat) {
+        c.combat->OnFrameBoundary();
     }
 
     if (c.assetsFired) {
@@ -1179,7 +1753,10 @@ void __fastcall UpdateStateDetour(void* app)
     auto& c = C();
     if (c.running) {
         Fault fault;
-        if (!GuardedInvoke([](void*) { OnFrameBody(); }, nullptr, &fault)) {
+        c.inFrameBody = true;
+        const bool ok = GuardedInvoke([](void*) { OnFrameBody(); }, nullptr, &fault);
+        c.inFrameBody = false;
+        if (!ok) {
             static bool logged = false;  // 每帧崩溃时只记一次，避免刷屏
             if (!logged) {
                 logged = true;
@@ -1199,6 +1776,12 @@ void Rollback(PluginRecord& record)
     const auto tasksRemoved = c.tasks.RemoveOwner(record.owner);
     std::vector<std::string> details;
     const auto eventsRemoved = c.events ? c.events->hub().RemoveOwner(record.owner) : 0;
+    if (c.combat) {
+        c.combat->OnPluginRollback(record.owner);
+    }
+    if (c.persist) {
+        c.persist->OnPluginRollback(record.owner);
+    }
     const auto hooksRemoved = c.hooks.RemoveOwner(record.owner, &details);
     LogInfo("回滚插件 %s：移除回调 %zu 个、任务 %zu 个、事件订阅 %zu 个、hook %zu 个", record.name.c_str(), lifecycleRemoved,
         tasksRemoved, eventsRemoved, hooksRemoved);
@@ -1564,8 +2147,12 @@ int CoreBoot(const dd::common::CoreBootInfo* info)
         }
         if (c.events) {
             c.events->hub().SetEndInvoke(&InvokeEventEnd);
+            // combat 的主题和 hook 挂在事件系统上，要在插件 Load（可能订阅 buff.*）之前创建
+            CreateCombat();
         }
     }
+    // persist 不依赖事件系统（没有时 campaign.save 主题不可用、标签不保存），要在插件 Load（declare）之前创建
+    CreatePersist();
 
     if (!InstallFrameHook()) {
         LogError("每帧 hook 不可用，DDCore 已整体停用");
@@ -1610,6 +2197,16 @@ void CoreAppSystemsCreated()
         Fault fault;
         if (!GuardedInvoke([](void* raw) { static_cast<Args*>(raw)->system->OnAppReady(); }, &args, &fault)) {
             LogError("事件系统 OnAppReady 崩溃：%s", DescribeFault(fault).c_str());
+        }
+    }
+    // 有插件声明持久化时装观察 hook（存档的读取早于 CAMPAIGN_LOAD，不能按需安装）
+    if (c.persist) {
+        struct Args {
+            persist::Persist* persist;
+        } args{ c.persist.get() };
+        Fault fault;
+        if (!GuardedInvoke([](void* raw) { static_cast<Args*>(raw)->persist->OnAppReady(); }, &args, &fault)) {
+            LogError("persist OnAppReady 崩溃：%s", DescribeFault(fault).c_str());
         }
     }
     c.lifecycle->Fire(DD_PHASE_APP_READY, c.frame, 0);

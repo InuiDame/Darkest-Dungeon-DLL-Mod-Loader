@@ -296,6 +296,74 @@ bool Resolve(HMODULE exe, Addresses& out, ResolveReport& report)
             out.appliedUgcVector = resolved;
         } else if (is("ActorMaxStat")) {
             out.actorMaxStat = resolved;
+        } else if (is("BuffGroupAdd")) {
+            out.buffGroupAdd = static_cast<std::uint8_t*>(resolved);
+        } else if (is("BuffGroupErase")) {
+            out.buffGroupErase = static_cast<std::uint8_t*>(resolved);
+        } else if (is("BuffDurationUpkeep")) {
+            out.buffDurationUpkeep = static_cast<std::uint8_t*>(resolved);
+        } else if (is("BuffRuleActive")) {
+            out.buffRuleActive = static_cast<std::uint8_t*>(resolved);
+        } else if (is("ConsumeHealthDamageBlock")) {
+            out.consumeBlock = static_cast<std::uint8_t*>(resolved);
+        } else if (is("MonsterBlockReturn")) {
+            const auto* hit = static_cast<const std::uint8_t*>(resolved);
+            std::int32_t disp = 0;
+            std::memcpy(&disp, hit + 52, 4);  // lea rcx,[rip+disp]（48 8D 0D），下一条指令在 +56
+            out.monsterBlockReturn = hit;
+            out.monsterImmuneTable = hit + 56 + disp;
+        } else if (is("BuffInstanceCopy")) {
+            out.buffInstanceCopy = resolved;
+        } else if (is("VectorDtor64")) {
+            out.vectorDtor64 = resolved;
+        } else if (is("VectorDtor64b")) {
+            out.vectorDtor64b = resolved;
+        } else if (is("EhVectorDtor")) {
+            out.ehVectorDtor = resolved;
+        } else if (is("BuffLibraryIndex")) {
+            out.buffLibraryIndex = resolved;
+        } else if (is("EffectLookup")) {
+            out.effectLookup = resolved;
+        } else if (is("ApplyEffect")) {
+            out.applyEffect = resolved;
+        } else if (is("PrngFloat")) {
+            out.prngFloat = resolved;
+        } else if (is("FreeU32Vector")) {
+            out.freeU32Vector = resolved;
+        } else if (is("ParseEffectFile")) {
+            out.parseEffectFile = resolved;
+        } else if (is("GamePrng")) {
+            out.gamePrng = resolved;
+        } else if (is("EffectMap")) {
+            out.effectMap = resolved;
+        } else if (is("AltRosterFlag")) {
+            out.altRosterFlag = static_cast<const std::uint8_t*>(resolved);
+        } else if (is("UpdateBuffsInternal")) {
+            out.updateBuffsInternal = resolved;
+        } else if (is("OnStartTownVisit")) {
+            out.onStartTownVisit = resolved;
+        } else if (is("BuffBurnDecay")) {
+            out.buffBurnDecay = resolved;
+        } else if (is("BuffRemoveByGuid")) {
+            out.buffRemoveByGuid = resolved;
+        } else if (is("ActorResetStats")) {
+            out.actorResetStats = resolved;
+        } else if (is("InventoryBuffRemove")) {
+            out.inventoryBuffRemove = resolved;
+        } else if (is("SkillInstantBuffs")) {
+            out.skillInstantBuffs = resolved;
+        } else if (is("UpdateTrinketBuffs")) {
+            out.updateTrinketBuffs = resolved;
+        } else if (is("StorageQueueWrite")) {
+            out.storageQueueWrite = static_cast<std::uint8_t*>(resolved);
+        } else if (is("StorageReadFile")) {
+            out.storageReadFile = static_cast<std::uint8_t*>(resolved);
+        } else if (is("SaveSlotBackup")) {
+            out.saveSlotBackup = static_cast<std::uint8_t*>(resolved);
+        } else if (is("AppShutdown")) {
+            out.appShutdown = static_cast<std::uint8_t*>(resolved);
+        } else if (is("StorageManager")) {
+            out.storageManager = static_cast<void* const volatile*>(resolved);
         }
     }
 

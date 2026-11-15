@@ -7,6 +7,11 @@
 // 读游戏内存全部在 SEH 保护下进行，虚表必须精确等于 Hero / Monster 的虚表（两者都没有子类）。
 // 依据：knowledge/dd1/combat.md 的「Actor 结构」「Actor 的标识和反查」；两个版本的偏移由 tools/check_actor_layout.py 核对。
 // 只在主线程调用（游戏对象只在主线程上修改）。离线测试用假的内存布局覆盖。
+//
+// 枚举（F5，P5 的 dd.raid 的只读部分）：
+//   队伍  Raid::Current+8 的 vector<Hero*>（4C41F0 对组类目标、槽位 13 的 target==1 分支都读它；Battle::HeroesRerank 5B8F80
+//         换位后按站位写回），每个指针都要虚表是 Hero、并且在名册里（ADR 0024 的成员关系）才给句柄；
+//   怪物  Battle+0x38（Raid+0x48D0），只算虚表是 Monster 的，表里的英雄跳过。
 
 #include "phase_tracker.h"
 
@@ -33,6 +38,7 @@ struct ActorEnv {
 namespace actor_layout {
 constexpr std::uintptr_t kRosterAlt = 0x728;       // Campaign+0x728：备用 Roster::System（App+0x54B 非零时游戏用它）
 constexpr std::uintptr_t kRosterHeroes = 0x20;     // Roster::System::m_HeroEntries，vector<Roster::Entry*>
+constexpr std::uintptr_t kRaidHeroes = 0x08;       // Raid 的队伍，vector<Hero*>（4C41F0 的 target_hero_random 读 +8/+0x10）
 constexpr std::uintptr_t kEntryHero = 0x08;        // Entry 内嵌的 Hero
 constexpr std::uintptr_t kHeroId = 0x137C;         // Hero 虚函数槽位 5
 constexpr std::uintptr_t kHeroClass = 0x1320;      // Hero 虚函数槽位 6：HeroClass*
@@ -50,6 +56,7 @@ constexpr std::uintptr_t kClassId = 0x08;          // ActorClass+8：职业 id�
 constexpr std::size_t kClassIdCapacity = 0x40;
 constexpr std::size_t kMaxRosterEntries = 4096;
 constexpr std::size_t kMaxBattleActors = 64;
+constexpr std::size_t kMaxPartyHeroes = 16;        // 游戏的队伍最多 4 人，超过 16 当作结构读错
 }  // namespace actor_layout
 
 // 可用的种类位（1u << DD_ACTOR_HERO 等）
@@ -60,5 +67,9 @@ void* ActorResolve(const ActorEnv& env, const DDActorRef& ref);
 bool ActorReadInfo(const ActorEnv& env, const DDActorRef& ref, DDActorInfo* out);
 // 当前战斗的取样（SEH 保护），给 PhaseTracker::ObserveBattle
 BattleSample ReadBattleSample(void* const volatile* raidCurrent);
+// 枚举：写入至多 capacity 个句柄（out 可为空），返回能给出句柄的总个数。没有 Raid、结构读不出来时是 0。
+// 队伍按 Raid+8 的顺序，怪物按 Battle+0x38 的顺序（站位）
+std::uint32_t ActorListParty(const ActorEnv& env, DDActorRef* out, std::uint32_t capacity);
+std::uint32_t ActorListMonsters(const ActorEnv& env, DDActorRef* out, std::uint32_t capacity);
 
 }  // namespace ddc::game

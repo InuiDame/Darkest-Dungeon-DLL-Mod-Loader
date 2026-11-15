@@ -26,6 +26,19 @@ struct SystemDeps {
     std::function<void(int level, const std::string& message)> log;
 };
 
+// 别的模块（combat）挂进来的 hook：和语义 hook 一样按需安装（topics 里任意一个有订阅，或者 extraDesired 返回真），
+// 在帧边界同步，内联的避开加载线程运行的状态
+struct ExternalHook {
+    const char* name = nullptr;      // 静态字符串
+    bool isVtable = false;
+    void* target = nullptr;          // 内联：函数入口；虚表：槽位地址
+    const char* entryId = nullptr;   // 内联：特征码 id（入口字节）
+    void* detour = nullptr;
+    void** orig = nullptr;
+    std::vector<Topic*> topics;
+    std::function<bool()> extraDesired;
+};
+
 class System
 {
 public:
@@ -43,6 +56,13 @@ public:
 
     // 三条加载线程之一正在运行。只在主线程读
     bool Loading() const;
+
+    // 挂一个外部 hook（构造之后、AppReady 之前调用），之后由 Reconcile 按需装卸
+    void AddHook(ExternalHook hook);
+    // extraDesired 的结果可能变了（例如规则注册），下一个帧边界重新同步
+    void RequestReconcile();
+    // 名字为 name 的语义 hook 或外部 hook 当前是否已安装（诊断）
+    bool HookInstalled(const char* name) const;
 
     // 诊断：已注册的 native listener 数和已安装的语义 hook 数
     std::size_t ListenerCount() const;

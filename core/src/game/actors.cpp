@@ -315,4 +315,54 @@ BattleSample ReadBattleSample(void* const volatile* raidCurrent)
     return sample;
 }
 
+namespace {
+
+// vector<Actor*> 里能转成 kind 句柄的元素（ActorFromPointer 核对虚表和成员关系：英雄要在名册里，怪物要在当前战斗里）
+std::uint32_t ListVector(const ActorEnv& env, std::uintptr_t vector, std::size_t max, std::uint32_t kind, DDActorRef* out,
+    std::uint32_t capacity)
+{
+    std::uintptr_t first = 0;
+    std::size_t count = 0;
+    if (!PointerVector(vector, max, &first, &count)) {
+        return 0;
+    }
+    std::uint32_t found = 0;
+    for (std::size_t i = 0; i < count; ++i) {
+        std::uintptr_t actor = 0;
+        if (!Read(first + i * sizeof(void*), actor) || actor == 0) {
+            continue;
+        }
+        DDActorRef ref{};
+        ref.size = sizeof(ref);
+        if (!ActorFromPointer(env, reinterpret_cast<const void*>(actor), &ref) || ref.kind != kind) {
+            continue;
+        }
+        if (out && found < capacity) {
+            out[found] = ref;
+        }
+        ++found;
+    }
+    return found;
+}
+
+}  // namespace
+
+std::uint32_t ActorListParty(const ActorEnv& env, DDActorRef* out, std::uint32_t capacity)
+{
+    const std::uintptr_t raid = LoadGlobal(env.raidCurrent);
+    if (raid == 0 || !env.campaignActive || !HeroesUsable(env)) {
+        return 0;
+    }
+    return ListVector(env, raid + kRaidHeroes, kMaxPartyHeroes, DD_ACTOR_HERO, out, capacity);
+}
+
+std::uint32_t ActorListMonsters(const ActorEnv& env, DDActorRef* out, std::uint32_t capacity)
+{
+    const std::uintptr_t raid = LoadGlobal(env.raidCurrent);
+    if (raid == 0 || !env.campaignActive || !MonstersUsable(env)) {
+        return 0;
+    }
+    return ListVector(env, raid + kRaidBattle + kBattleMonsters, kMaxBattleActors, DD_ACTOR_MONSTER, out, capacity);
+}
+
 }  // namespace ddc::game

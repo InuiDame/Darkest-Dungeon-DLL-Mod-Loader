@@ -289,10 +289,10 @@ typedef struct DDGameInfoService {
  * 主题分三类：
  *   native.<类名>  游戏事件总线（Event），只读
  *   query.<类名>   游戏询问（Query），可写结果，回调不可取消
- *   语义主题       damage.pre/post、effect.pre/post、skill.pre/post、hit.pre/post、
+ *   语义主题       damage.pre/post/final、effect.pre/post、skill.pre/post、hit.pre/post、
  *                  battle.round.start/end、battle.turn.start/end、stress.pre/post、heal.pre/post、
- *                  battle.start/end、actor.*、raid.*、town.*、hero.*、inventory.*、estate.currency、
- *                  app.tick、app.state、campaign.load/unload，以及插件自定义主题
+ *                  buff.add/remove/tick、battle.start/end、actor.*、raid.*、town.*、hero.*、inventory.*、
+ *                  estate.currency、app.tick、app.state、campaign.load/unload/save，以及插件自定义主题
  *
  * 负载 DDEvent* 是不透明指针，只在回调期间有效，不能保存。游戏对象以指针形式暴露，
  * 有效期同样只到回调结束；要跨回调保存 Hero、Monster，用 game 服务的 actor_from_pointer 转成句柄。
@@ -305,8 +305,8 @@ typedef struct DDGameInfoService {
  *     负载带 DD_EVENT_F_DEFERRED，只读，不可取消，指针字段读出来恒为 NULL；
  *   - 嵌套派发计深度，超过上限（DD_EVENT_MAX_DEPTH）时写错误日志并停止该次派发。
  *
- * 只有名字以 .pre 结尾的主题和 query.* 可写。对只读字段写入返回 DD_EV_E_READ_ONLY，
- * .pre 以外的主题调用 cancel 返回 DD_EV_E_NOT_CANCELLABLE。
+ * 只有名字以 .pre 结尾的主题、query.* 和 damage.final 可写（event_flags 带 DD_EVENT_F_WRITABLE）。
+ * 对只读字段写入返回 DD_EV_E_READ_ONLY，.pre 以外的主题调用 cancel 返回 DD_EV_E_NOT_CANCELLABLE。
  * 内置主题的数字字段在游戏里是 float、int32 或 uint32：写入的值超出这个宽度（float 的 nan、inf 和绝对值
  * 超过 FLT_MAX 的数，int32 / uint32 范围以外的整数）返回 DD_EV_E_RANGE，不写入。自定义主题按 int64 / double 保存，不限制。
  * PvP 对局中（ADR 0011）.pre 和 query.* 的订阅不派发，.post 和只读主题照常。
@@ -321,7 +321,55 @@ typedef struct DDGameInfoService {
  *   其余 .pre    不支持 cancel，写字段即可（hit.pre 的 hit=false 走未命中路径）。
  *
  * effect.* 的 performer 和 target 是实际生效的双方：部分 Effect 由游戏交换执行者和目标，
- * 负载里已经按交换后的结果给出，压力和 HP 字段也读实际目标。
+ * 负载里已经按交换后的结果给出，压力和 HP 字段也读实际目标。effect_name 是 effect 的名字。
+ *
+ * skill.pre / skill.post 只读（skill.pre 的 hook 点在游戏分派之后，执行者已经记下原技能、即时 buff 已经施加，
+ * 改技能和目标会和游戏状态对不上），主题和事件都不带可写标志（DD_EVENT_F_WRITABLE）。skill 字段经 combat.skill_from_pointer(performer, skill) 转成技能句柄。
+ *
+ * damage.final：游戏算完护体、格挡判定之后、扣血之前（Actor::ConsumeHealthDamageBlock，480400），每次命中一次。
+ *   字段 target、attacker、damage（最终伤害，只读）、damage_type、blocked（游戏自己是否已经格挡，只读）、
+ *   deaths_door（目标在死门上，只读）、hp_before、is_hero，可写的是 absorb（吸收量，0 到 damage）：
+ *   全部吸收按格挡处理（不扣血，游戏显示 Blocked）；部分吸收时把吸收的部分先补回生命，净损失 = damage - absorb，
+ *   死门按补回后的生命判定。blocked 为真时 absorb 不起作用；目标已经在死门上或已死时只有全部吸收有效。
+ *   怪物（5FC3E0）的扣血规则和英雄不同（审核 A-S2）：.can_be_damaged_directly 为假的怪物（cauldron_empty、bulrush 等）
+ *   对伤害类型 0–7、9、10、13–19 免疫，这时 damage 字段是 0、absorb 不起作用、游戏照常显示 immune；其余情况游戏一律扣血
+ *   （不看死门、已死），所以部分吸收照样补回，只是 HP 已经不大于 0（被 .kill 之类的 effect 杀死）时不补。英雄型怪物
+ *   （从 heroes 目录加载的）按英雄的规则。定位怪物路径的特征码 MonsterBlockReturn 缺失时，怪物的部分吸收不起作用。
+ *   怪物路径按 480400 的返回地址认（审核 R2A-N1）：别的 native 插件经 hook 服务在 480400 上串链、排在 DDCore 前面
+ *   （priority 更小，或相同 priority 先注册）时，DDCore 的 detour 从插件里进入，认不出怪物，按英雄的规则补回生命。
+ *   要和 damage.final 一起用的插件不要在 480400 上挂 priority ≤ 0 的 hook。
+ *   伤害数字的弹字仍显示 damage。PvP 对局中不派发。attacker 只在伤害经 Hero/Monster 虚表槽位 50 进来时有值。
+ *
+ * buff.add / buff.remove / buff.tick：只读。字段 actor（指针）、actor_kind、actor_id（同 DDActorRef 的 kind、id，
+ * 延迟事件里指针为 NULL 时用它们识别）、guid、id、stat_type、amount、duration、duration_type、source、sourcedata、
+ * rule_type、plugin、tag（由 combat.buff_add 加的条目才有）。
+ *   buff.add    新条目追加进 buff 表之后（Buff::Group::Add，5C4F50）：游戏的添加（技能、effect、饰品、建筑……）、
+ *               叠灼烧、怪物同伴和 combat.buff_add 都经过这里；读档恢复的条目不经过，不派发。
+ *   buff.remove 条目删除之前（Buff::Group::erase，5C4FF0，全部删除路径的汇合点），字段是删除前的值。
+ *               reason：expired（持续时间结算删掉 duration==0 的）、plugin（combat.buff_remove 的条件命中的条目；
+ *               删完后游戏刷新属性时顺带删掉的别的条目按下面的规则判断，通常是 refresh）、refresh（刷新属性时按
+ *               规则删除）、town_visit（回城清理：刚回来的队伍英雄身上 DD_SOURCE_F_TOWN_CLEAR 来源的 buff）、
+ *               skill_instant（技能的即时 buff）、trinket（UpdateTrinketBuffs）、burn_decay（灼烧衰减）、
+ *               by_guid（游戏按 guid 删除）、reset（ResetStats）、effect（effect 结算里删除）、item（inventory.cpp 的 429750，
+ *               推测是物品）、predicate（其他经虚函数槽位 14 的删除）、other。按调用栈里最内层认得的游戏函数判断，
+ *               依赖的特征码缺失时归入 predicate 或 other。
+ *   buff.tick   持续时间结算（Actor::BuffDurationUpkeep，47AAD0）之后，每条 duration 变了且还在表里的条目一次，
+ *               duration_before / duration_after 是递减前后的值。战斗回合、走廊格子（before_turn/after_turn 也会递减）、
+ *               撤退、战斗结束、回城都经过这里。减到 0 被删掉的条目在原函数里就被删了：删除之前先派发它的 buff.tick
+ *               （duration_after 是删除时的值，通常是 0），紧接着派发 buff.remove（reason expired）；同一次结算里
+ *               其他条目的 buff.tick 在原函数返回后派发，所以晚于这些 buff.remove。订阅 buff.tick 时也会装删除的 hook。
+ *   只在存档里派发：进存档之前（CampaignLoad 之前，load_campaign 线程上 Hero::Load 重新加 quirk、饰品）的增删和读档时
+ *   直接追加的条目（5C4D10）都不派发，需要时在 campaign.load 里用 combat.buff_list 枚举。进存档之后别的加载线程
+ *   （load_raid、load_town）上的增删按字段复制后排到主线程，作为延迟事件派发（actor 为 NULL，用 actor_kind、actor_id）。
+ *
+ * campaign.save：只读，有插件声明持久化（persist.declare，DDLua 总是声明）时才有。游戏在当前 profile 上写完一组存档文件
+ *   （任何 persist.*.json：城镇里写名册的一组、只写庄园或城镇文件的升级建筑和城镇事件，地牢里一次探索存档 60D610 的四个文件）
+ *   之后的下一个帧边界派发；加载线程（load_raid、load_town）上写的，等加载结束后的帧边界派发；读档过程中的写入（load_campaign
+ *   重写 persist.game.json）不算。同一帧里写的几个文件只派发一次。字段 files（这组在当前 profile 设备上写了哪些 persist.*.json，逗号分隔）、
+ *   in_raid（Raid::Current 非空）、in_battle、main_thread（这组都是主线程写的）、serial（存档序号）、index（本次进存档的
+ *   第几次 campaign.save）。派发完所有订阅之后，DDCore 依次调用各插件的 persist 保存回调，见 persist 服务。
+ *   帧边界里 campaign.save 在延迟事件之前派发（快照对应刚写的存档，之后的定时器、延迟事件不改它）：加载线程上删掉的
+ *   buff 要到之后的 buff.remove 才送到，这一帧的快照还带着它，读档时按「条目不在」丢弃（审核 R2B 备注 3）。
  *
  * battle.turn.* 只读，只在英雄回合派发（Combat_StartTurn 只有英雄路径调用）：
  * start 在 Combat_StartTurn 之前，end 在其返回后（不是英雄行动结束）。
@@ -478,7 +526,7 @@ typedef struct DDEventsService {
 /* ------------------------------------------------------------------ game */
 
 #define DD_SERVICE_GAME "game"
-#define DD_SERVICE_GAME_VERSION 1u
+#define DD_SERVICE_GAME_VERSION 2u
 
 /* 启用 Mod 列表的一项 */
 typedef struct DDModEntry {
@@ -567,7 +615,516 @@ typedef struct DDGameService {
     bool(DD_CALL* actor_info)(const DDActorRef* ref, DDActorInfo* out);
     /* 当前的战斗序号（从 1 开始，还没打过仗时为 0；战斗结束后保持不变，下一场战斗开始时加一），诊断用 */
     uint32_t(DD_CALL* battle_serial)(void);
+
+    /*
+     * 只读枚举（F5 起，P5 的 dd.raid 在这上面扩展）。三个函数都只在主线程、存档里、没有加载线程在跑时可用
+     * （加载线程在新建 Raid、重建怪物表：as_load_campaign、as_raid_start、as_town_visit_start 停留期间），否则
+     * party_heroes / battle_monsters 返回 false、*out_count 为 0，battle_state 返回 -1。不装 hook，不订阅事件；
+     * 读游戏内存在 SEH 保护下进行，读不出来按「没有」处理。
+     *
+     * party_heroes：当前探索队伍的英雄，Raid::Current+8 的 vector<Hero*>（effect 的组类目标 4C41F0 读的就是它），按这张表的
+     *   顺序：换位后游戏（Battle::HeroesRerank，5B8F80）按站位重排写回 [静态]，所以一般是第 1 位到第 4 位 [推测]。每个指针都要
+     *   虚表是 Hero、并且在名册里（ADR 0024 的成员关系）才给句柄，不满足的跳过。没有 Raid（城镇里）时成功、个数 0。
+     * battle_monsters：当前战斗的怪物，Battle+0x38 的 vector<Monster*>（按站位插入），只算虚表是 Monster 的（表里的英雄跳过）。
+     *   怪物死后变成尸体（同一个 guid，职业 id 换成 corpse_* 一类，身上的 buff 被游戏删掉）仍在表里，要不要算由调用方按职业 id
+     *   或生命判断。不在战斗里时个数 0（战斗销毁时游戏先清空这张表）。
+     *   两者都写入至多 capacity 个句柄（out 可为 NULL，只取个数；DDCore 写整个结构，含 size），*out_count 是总个数（可能大于 capacity）。
+     * battle_state：Battle+0x288（bs_none = 0）。非零就是战斗中，包括从存档恢复的战斗（游戏不派发 battle.start，读档线程已经
+     *   把状态写成非零）；撤退时游戏先把它置 0（5A93B3），之后怪物表才清空。没有 Raid 时是 0。
+     */
+    bool(DD_CALL* party_heroes)(DDActorRef* out, uint32_t capacity, uint32_t* out_count);
+    bool(DD_CALL* battle_monsters)(DDActorRef* out, uint32_t capacity, uint32_t* out_count);
+    int32_t(DD_CALL* battle_state)(void);
 } DDGameService;
+
+/* ------------------------------------------------------------------ combat */
+
+#define DD_SERVICE_COMBAT "combat"
+#define DD_SERVICE_COMBAT_VERSION 1u
+
+/*
+ * Buff、Effect、技能的读写，定义注册，规则注册（P4）。依据见 knowledge/dd1/combat.md，设计见 docs/02-architecture.md。
+ *
+ * 句柄都是值，不保存游戏指针（ADR 0024 的做法）：
+ *   buff  （actor 句柄，组 guid）。组 guid 在一个 actor 上只增不减，随存档保存，是条目唯一稳定的标识。
+ *   effect 名字。
+ *   技能  DDSkillRef（执行者句柄，技能 id，等级），每次在执行者职业的技能表里重新解析。
+ * 读取得到的是快照（字段值），不是活对象。
+ *
+ * 线程：全部只在主线程调用，其他线程返回 DD_COMBAT_E_THREAD 或 false。
+ *
+ * 写操作（buff_add、buff_remove、buff_define、effect_apply、effect_define）的时机：
+ *   - 安全点立即执行，同步返回 DD_COMBAT_OK 和结果。安全点是帧边界：lifecycle 的回调（TICK、CAMPAIGN_LOAD 等）、
+ *     task 服务的任务、操作回调（DDCombatOpFn），并且 DDCore 没有在派发事件、没有在调用游戏函数。
+ *   - 事件回调里（DDCore 正在派发原生事件、语义 hook 或 buff.* 主题，游戏可能持有 buff 表内的指针），以及安全点上
+ *     立即执行时同步派发的嵌套回调里：不执行，排进队列，返回 DD_COMBAT_QUEUED 和操作号（out->op）。
+ *     队列在下一个帧边界按调用顺序执行，执行前重新解析句柄、重新检查条件，结果经 set_op_handler 注册的回调通知；
+ *     退出存档时还没执行的操作丢弃，回调的 result 为 DD_COMBAT_E_CANCELLED。每个插件最多排 256 个，超出返回
+ *     DD_COMBAT_E_QUEUE_FULL。
+ *   - 规则回调（DDRuleFn）里一律返回 DD_COMBAT_E_IN_RULE，不排队。
+ *   - 不在存档里、加载线程正在运行（读档、进地牢、进城）、PvP 对局中（ADR 0011）：拒绝。
+ * 立即执行时游戏会同步派发 buff.add / buff.remove 等主题，订阅者的回调在这次调用返回之前运行（嵌套），
+ * 回调里的写操作照样排队。
+ *
+ * 失败原因除了返回码，out->message 给出文字（本线程下一次调用 combat 服务之前有效）。
+ */
+
+typedef enum DDCombatResult {
+    DD_COMBAT_OK = 0,
+    DD_COMBAT_QUEUED = 1,         /* 排进队列，结果经操作回调通知 */
+    DD_COMBAT_E_INVALID = 2,      /* 参数无效 */
+    DD_COMBAT_E_UNAVAILABLE = 3,  /* 依赖的特征码缺失，这项能力不可用 */
+    DD_COMBAT_E_THREAD = 4,       /* 不在主线程 */
+    DD_COMBAT_E_NO_CAMPAIGN = 5,  /* 不在存档里 */
+    DD_COMBAT_E_LOADING = 6,      /* 加载线程正在运行 */
+    DD_COMBAT_E_PVP = 7,          /* PvP 对局中 */
+    DD_COMBAT_E_IN_RULE = 8,      /* 在规则回调里 */
+    DD_COMBAT_E_QUEUE_FULL = 9,   /* 本插件排队的操作太多 */
+    DD_COMBAT_E_ACTOR = 10,       /* actor 句柄解析失败 */
+    DD_COMBAT_E_NOT_FOUND = 11,   /* buff 定义、effect、条目不存在 */
+    DD_COMBAT_E_NO_RAID = 12,     /* 施加 effect 需要 Raid::Current，城镇里没有 */
+    DD_COMBAT_E_EXISTS = 13,      /* 定义已经存在（游戏数据或别的插件定义的） */
+    DD_COMBAT_E_GAME = 14,        /* 调用游戏函数时出了异常（已被捕获） */
+    DD_COMBAT_E_CANCELLED = 15,   /* 排队的操作没有执行就被丢弃（退出存档、插件回滚） */
+} DDCombatResult;
+
+typedef uint64_t DDCombatOpId; /* 0 表示没有排队 */
+
+typedef enum DDCombatOpKind {
+    DD_COMBAT_OP_BUFF_ADD = 1,
+    DD_COMBAT_OP_BUFF_REMOVE = 2,
+    DD_COMBAT_OP_EFFECT_APPLY = 3,
+    DD_COMBAT_OP_BUFF_DEFINE = 4,
+    DD_COMBAT_OP_EFFECT_DEFINE = 5,
+} DDCombatOpKind;
+
+/*
+ * 写操作的结果。立即执行时由调用方提供（可为 NULL，size 由调用方写入），排队时 op 是操作号；
+ * 排队的操作执行后以同样的结构交给操作回调。
+ */
+typedef struct DDCombatOpResult {
+    uint32_t size;
+    uint32_t kind;        /* DDCombatOpKind */
+    DDCombatOpId op;      /* 操作号；立即执行时为 0 */
+    uint32_t result;      /* DDCombatResult：DD_COMBAT_OK 或失败原因（回调里不会是 QUEUED） */
+    uint32_t guid;        /* buff_add：新条目的组 guid */
+    uint32_t count;       /* buff_remove：删掉的条数；effect_apply：本次加上的 buff 条数；effect_define：定义的 effect 数 */
+    const char* message;  /* 失败原因的文字，成功时为空串 */
+} DDCombatOpResult;
+
+/* 排队的操作执行完（或被丢弃）时调用，在主线程的帧边界（安全点，回调里的写操作立即执行）。SEH 隔离，崩溃只写日志 */
+typedef void(DD_CALL* DDCombatOpFn)(const DDCombatOpResult* result, void* user);
+
+/* 枚举表（enum_* 的 table） */
+#define DD_ENUM_STAT 0u      /* Buff stat_type，0..101 */
+#define DD_ENUM_SOURCE 1u    /* Buff::Source，0..33；游戏里的名字带前缀 bsrc_，这里去掉，查找时两种写法都认 */
+#define DD_ENUM_DURATION 2u  /* Buff::Duration::Types，0..10 */
+#define DD_ENUM_RULE 3u      /* Buff::Rule::Types，0..54 */
+
+#define DD_COMBAT_TEXT 64 /* 游戏里 char[64] 的字段，最多 63 字节加结尾的 0 */
+
+/* 来源表（Buff::Source）的标志，source_flags 和 DDBuffInfo.source_flags（P4-0D，静态初始化 78500 的值） */
+#define DD_SOURCE_F_SAVED 0x1u      /* +0x44：这个来源的 buff 写进存档（Actor::Save 只存这些） */
+#define DD_SOURCE_F_TOWN_CLEAR 0x2u /* +0x46：回城时从刚回来的队伍英雄身上删掉（OnStartTownVisit 经槽位 14） */
+#define DD_SOURCE_F_TRAY 0x4u       /* +0x48：显示在探索中的 buff/debuff tray 里 */
+
+/* 一条 buff 的快照（buff_get）。字段含义见 knowledge/dd1/combat.md 的 Buff::Instance */
+typedef struct DDBuffInfo {
+    uint32_t size;        /* 调用方写入 sizeof(DDBuffInfo) */
+    uint32_t guid;        /* 组 guid */
+    char id[DD_COMBAT_TEXT];
+    int32_t stat_type;
+    char stat_sub_type[DD_COMBAT_TEXT];
+    float amount;
+    int32_t duration;     /* 剩余次数，-1 不计时 */
+    int32_t duration_type;
+    int32_t source;
+    uint32_t source_flags;  /* 来源的 DD_SOURCE_F_* */
+    int32_t sourcedata;
+    int32_t rule_type;
+    bool is_false_rule;
+    bool remove_if_not_active;
+    bool remove_on_battle_complete;
+    bool by_plugin;       /* 由插件经 buff_add 添加，并且 DDCore 还记着它（标签不随游戏存档保存） */
+    float rule_float;
+    char rule_string[DD_COMBAT_TEXT];
+    char plugin[DD_COMBAT_TEXT];  /* 添加它的插件名，by_plugin 为 false 时为空串 */
+    char tag[DD_COMBAT_TEXT];     /* 添加时给的标签 */
+} DDBuffInfo;
+
+/*
+ * buff 定义的 POD 字段（buff_def_get 的输出、buff_define 的输入）。只开放这些字段：附加效果、force_positive 之类
+ * 「只在定义里」的字段不开放，所以读档时游戏查不到运行时定义也不丢东西（combat.md「Buff 存档」）。
+ */
+typedef struct DDBuffDef {
+    uint32_t size;        /* sizeof(DDBuffDef) */
+    char id[DD_COMBAT_TEXT];
+    int32_t stat_type;    /* 0..101 */
+    char stat_sub_type[DD_COMBAT_TEXT];
+    float amount;
+    int32_t duration;     /* 默认持续次数，-1 不计时，0 不允许（游戏会在下一次持续时间结算时删掉） */
+    int32_t duration_type;  /* 0..10 */
+    int32_t source;       /* 0..33 */
+    int32_t sourcedata;
+    int32_t rule_type;    /* 0..54 */
+    bool is_false_rule;
+    bool remove_if_not_active;
+    bool remove_on_battle_complete;
+    float rule_float;
+    char rule_string[DD_COMBAT_TEXT];
+} DDBuffDef;
+
+/* buff_add 的选项，flags 标记哪些字段有效，其余沿用定义里的值 */
+#define DD_BUFF_ADD_DURATION 0x1u
+#define DD_BUFF_ADD_DURATION_TYPE 0x2u
+#define DD_BUFF_ADD_SOURCE 0x4u
+#define DD_BUFF_ADD_SOURCEDATA 0x8u
+#define DD_BUFF_ADD_NO_REFRESH 0x10u /* 不刷新属性（默认刷新：游戏的 refresh=true，UpdateBuffsInternal 重算） */
+
+typedef struct DDBuffAddOptions {
+    uint32_t size;        /* sizeof(DDBuffAddOptions) */
+    uint32_t flags;
+    int32_t duration;     /* -1 或大于 0 */
+    int32_t duration_type;
+    int32_t source;
+    int32_t sourcedata;
+    const char* tag;      /* 可为 NULL；最多 63 字节。DDCore 记下（actor，guid）→（插件，标签），可按标签移除 */
+} DDBuffAddOptions;
+
+typedef enum DDBuffMatch {
+    DD_BUFF_BY_GUID = 0,
+    DD_BUFF_BY_TAG = 1,     /* 只匹配本插件加的、标签相同的条目 */
+    DD_BUFF_BY_ID = 2,      /* 按 buff id，不管是谁加的 */
+    DD_BUFF_BY_SOURCE = 3,  /* 按来源（Buff::Source），不管是谁加的 */
+} DDBuffMatch;
+
+typedef struct DDBuffRemoveSpec {
+    uint32_t size;        /* sizeof(DDBuffRemoveSpec) */
+    uint32_t match;       /* DDBuffMatch */
+    uint32_t guid;        /* BY_GUID */
+    int32_t source;       /* BY_SOURCE */
+    const char* text;     /* BY_TAG：标签；BY_ID：buff id */
+} DDBuffRemoveSpec;
+
+/* effect 的只读字段（effect_get），偏移见 combat.md「Effect」的结构 */
+typedef struct DDEffectInfo {
+    uint32_t size;        /* sizeof(DDEffectInfo) */
+    char name[DD_COMBAT_TEXT];
+    int32_t target;       /* .target 枚举：0 performer、1 target、2 performer_group …（combat.md） */
+    float chance;
+    float stress;
+    float stun;
+    float heal;
+    float heal_percent;
+    int32_t combat_stat_buff;
+    int32_t dot_poison;
+    int32_t dot_bleed;
+    int32_t dot_burn;
+    int32_t dot_stress;
+    int32_t duration;
+    float buff_amount;
+    int32_t buff_duration_type;
+    uint32_t buff_id_count;  /* .buff_ids 的个数（游戏只存哈希） */
+    bool on_hit;
+    bool on_miss;
+    bool apply_once;
+    bool queue;
+    bool swap_source_and_target;
+    bool runtime;         /* 由插件经 effect_define 定义 */
+} DDEffectInfo;
+
+/* 技能句柄：执行者 + 技能 id + 等级，每次在执行者职业的技能表里重新解析（英雄 HeroClass+0xBD0/+0xBE8，怪物 MonsterClass+0xBA8） */
+typedef struct DDSkillRef {
+    uint32_t size;        /* sizeof(DDSkillRef) */
+    DDActorRef actor;     /* 执行者 */
+    char id[DD_COMBAT_TEXT];
+    int32_t level;        /* 怪物技能没有等级，为 0 */
+} DDSkillRef;
+
+#define DD_SKILL_MAX_EFFECTS 16
+
+typedef struct DDSkillInfo {
+    uint32_t size;        /* sizeof(DDSkillInfo) */
+    char id[DD_COMBAT_TEXT];
+    int32_t level;
+    char type[DD_COMBAT_TEXT];  /* .type，如 melee、ranged、move */
+    bool friendly;        /* 友方技能（技能 +0x90） */
+    uint32_t effect_count;  /* .effect 的个数（最多 16） */
+    char effects[DD_SKILL_MAX_EFFECTS][DD_COMBAT_TEXT];  /* effect 名字 */
+} DDSkillInfo;
+
+/*
+ * 规则扩展（D8）：数据层的 buff 写 rule_type "is_actor_status"（检查自己）或 "actorStatus"（检查 target），
+ * rule_data.string 填注册的规则名。游戏判定这条规则时调用回调，回调返回规则本身是否成立，DDCore 再按 is_false_rule 取反。
+ *
+ * 回调在游戏遍历 buff 表的过程中运行（判定非常频繁，主要在 UpdateBuffsInternal 收集生效 buff 时）：
+ *   - 只读：combat 服务的写操作一律返回 DD_COMBAT_E_IN_RULE；不要调用会改游戏状态的东西；
+ *   - 要快：只有 rule_data.string 的哈希命中注册表的判定才进入回调，其余直接交给游戏；
+ *   - 不在主线程、PvP 对局中、回调崩溃过（自动停用）时不调用回调，交给游戏原来的判定（认不出的字符串恒为假）；
+ *   - 回调返回 DDRuleResult：DD_RULE_TRUE / DD_RULE_FALSE 是规则本身是否成立（DDCore 再按 is_false_rule 取反），
+ *     DD_RULE_ORIGINAL 表示这次交还游戏原来的判定（等同没有注册：认不出的字符串原始结果为假，再由游戏按 is_false_rule 取反；
+ *     城镇里规则 42 在前置检查就返回假、不取反）。回调出错、超时、停用中都应返回它，其他值按 DD_RULE_ORIGINAL 处理；
+ *   - 指针只在回调期间有效。
+ */
+typedef struct DDRuleContext {
+    uint32_t size;
+    const char* rule;     /* 规则名（rule_data.string） */
+    void* actor;          /* 拥有这条 buff 的 actor（Hero/Monster） */
+    void* target;         /* 判定时的 target，可能为 NULL */
+    void* subject;        /* 要检查的角色：is_actor_status 是 actor，actorStatus 是 target */
+    const void* skill;    /* 判定时的技能，可能为 NULL */
+    int32_t rule_type;    /* 13 actorStatus 或 42 is_actor_status */
+    bool is_false_rule;   /* 回调不用自己取反，DDCore 会处理 */
+    float rule_float;     /* rule_data.float */
+    const char* buff_id;
+} DDRuleContext;
+
+typedef enum DDRuleResult {
+    DD_RULE_FALSE = 0,     /* 规则不成立 */
+    DD_RULE_TRUE = 1,      /* 规则成立 */
+    DD_RULE_ORIGINAL = 2,  /* 交还游戏原来的判定（等同这次没有注册） */
+} DDRuleResult;
+
+typedef uint32_t(DD_CALL* DDRuleFn)(const DDRuleContext* context, void* user); /* 返回 DDRuleResult */
+typedef uint64_t DDRuleId; /* 0 表示失败 */
+
+/* 命中脚本规则的判定的统计（从进程启动累计；frame 是单帧的峰值） */
+typedef struct DDRuleStats {
+    uint32_t size;
+    uint32_t rules;           /* 当前注册的规则数 */
+    uint64_t hits;            /* 进入回调的次数 */
+    uint64_t skipped;         /* 命中但没有调用回调（不在主线程、PvP、停用）的次数 */
+    uint64_t passed;          /* 回调返回 DD_RULE_ORIGINAL、交还原函数的次数（计入 hits） */
+    uint64_t errors;          /* 回调崩溃的次数 */
+    double total_us;          /* 回调累计耗时（微秒） */
+    double max_call_us;       /* 单次最长 */
+    double max_frame_us;      /* 单帧累计耗时的峰值 */
+    uint64_t max_frame_hits;  /* 单帧命中次数的峰值 */
+} DDRuleStats;
+
+typedef struct DDCombatService {
+    DDServiceHeader header;
+
+    /* 返回码的文字，静态字符串 */
+    const char*(DD_CALL* result_text)(uint32_t result);
+    /* 注册本插件的操作回调（排队的写操作执行后通知）。fn 为 NULL 时取消。主线程 */
+    bool(DD_CALL* set_op_handler)(DDPluginHandle plugin, DDCombatOpFn fn, void* user);
+    /* 现在调用写操作会不会立即执行（主线程、存档里、安全点、不在加载和 PvP 中） */
+    bool(DD_CALL* safe_point)(void);
+    /* 读接口（buff_list、buff_get、buff_def_get、effect_get）现在能不能用：主线程，并且没有加载线程在跑。
+       读接口返回 false 时用它区分「加载中，暂时读不到」和「条目、定义真的不在」（审核 R2A-S1）。任意线程 */
+    bool(DD_CALL* read_ready)(void);
+
+    /* 枚举表：名字和数值互查。找不到时 enum_name 返回 NULL，enum_value 返回 -1。任意线程 */
+    uint32_t(DD_CALL* enum_count)(uint32_t table);
+    const char*(DD_CALL* enum_name)(uint32_t table, int32_t value);
+    int32_t(DD_CALL* enum_value)(uint32_t table, const char* name);
+    /* 来源（0..33）的 DD_SOURCE_F_* 标志，超界返回 0。任意线程 */
+    uint32_t(DD_CALL* source_flags)(int32_t source);
+
+    /* buff 读取（buff_list、buff_get、buff_def_get、effect_get 都一样）：只在主线程，并且没有加载线程在跑时可用，
+       否则返回 false——加载线程（load_campaign、load_raid、load_town）会增删 buff 表（删除时条目前移、扩容时整张表搬家）、
+       重建 Buff 库和 effect map，这时读到的不可信（A-S3）。加载画面期间（读档进地牢的 as_raid_start、回城的
+       as_town_visit_start）的定时器、延迟事件回调里读会失败，read_ready 为假，等加载结束再读。
+       buff_list 把组 guid 按表里的顺序写进 guids（最多 capacity 个），*out_count 是总条数；
+       guids 可为 NULL（只取条数）。actor 解析失败、表读不出来（超过 4096 条）返回 false */
+    bool(DD_CALL* buff_list)(const DDActorRef* actor, uint32_t* guids, uint32_t capacity, uint32_t* out_count);
+    /* 按组 guid 读一条，条目不存在返回 false */
+    bool(DD_CALL* buff_get)(const DDActorRef* actor, uint32_t guid, DDBuffInfo* out);
+    /* Buff 库里的定义（游戏数据和插件注册的），不存在返回 false。只在存档里可用 */
+    bool(DD_CALL* buff_def_get)(const char* id, DDBuffDef* out);
+
+    /* buff 写入，时机见本节开头，返回 DDCombatResult。
+       buff_add：按 id 复制库里的定义，按 options 改字段（target 一律 0），经虚函数槽位 13 添加；同 id 重复添加按游戏的
+       语义叠加（两条），调用方要替换时自己先删。立即执行时 out->guid 是新条目的组 guid。options 可为 NULL。
+       城镇、走廊、战斗中都可以加。actor 的 buff 表已经有 1024 条以上时返回 DD_COMBAT_E_INVALID（读接口的上限是 4096 条）。 */
+    uint32_t(DD_CALL* buff_add)(DDPluginHandle plugin, const DDActorRef* actor, const char* id,
+        const DDBuffAddOptions* options, DDCombatOpResult* out);
+    /* 经虚函数槽位 14 删除匹配的条目（删到东西时游戏刷新属性），out->count 是删掉的条数（0 也算成功） */
+    uint32_t(DD_CALL* buff_remove)(DDPluginHandle plugin, const DDActorRef* actor, const DDBuffRemoveSpec* spec,
+        DDCombatOpResult* out);
+    /* 在 Buff 库里注册运行时定义（D4）。只在存档里；Buff 库每次读档重建，每次进存档要重新注册。
+       stat_sub_type 按 stat 校验（审核 C-Y3，游戏认不出时有的弹 assert、有的越界写到相邻的累加值）：combat_stat_add /
+       combat_stat_multiply 必须是 damage_low、damage_high、defense_rating、protection_rating、speed_rating、attack_rating、
+       crit_chance、max_hp、riposte_on_hit_chance、riposte_on_miss_chance 之一；resistance 是 stun、move、poison、bleed、
+       disease、debuff、death_blow、trap；activity_side_effect_chance、disable_combat_skill_attribute 也只认游戏表里的名字；
+       压力类（9、10、29、30）和治疗类（6、7、8、98）可以为空或是游戏认的来源名；其余 stat 不限。不合法时返回 DD_COMBAT_E_INVALID，
+       完整的表见 core/src/combat/logic.cpp 的 ValidateSubStat。
+       id 已经存在（游戏数据或别的插件注册的）返回 DD_COMBAT_E_EXISTS；同一个插件在本存档里重复注册同一个 id 时更新字段。 */
+    uint32_t(DD_CALL* buff_define)(DDPluginHandle plugin, const DDBuffDef* def, DDCombatOpResult* out);
+
+    /* effect：按名字读只读字段，不存在返回 false（不写游戏日志）。只在存档里可用 */
+    bool(DD_CALL* effect_get)(const char* name, DDEffectInfo* out);
+    /* 施加 effect（游戏的 ApplyEffect，4CB4D0）：按 effect 的 .target 从 performer、target 出发选目标，逐个结算。
+       需要 Raid::Current（走廊、战斗中），城镇里返回 DD_COMBAT_E_NO_RAID。target 可为 NULL（等于 performer）。
+       立即执行时 out->count 是本次加上的 buff 条数。会触发 effect.pre/post、buff.add 等主题 */
+    uint32_t(DD_CALL* effect_apply)(DDPluginHandle plugin, const char* name, const DDActorRef* performer,
+        const DDActorRef* target, DDCombatOpResult* out);
+    /* 用游戏自己的解析器定义 effect（D5）：text 是 .effects.darkest 的内容（一个或多个 effect: 块，每块都要有 .name），
+       DDCore 写成临时文件（DDModLoader\tmp\）后调用 4F02D0，用完删除。DDCore 先按游戏解析器的规则检查文本
+       （A-B1、A-S1）：去掉 // 行注释和块注释（斜杠星号到星号斜杠，引号里的也算）后按「标识符:」分块，块从标识符开始，到下一个冒号（# 到行尾之间的不算）前面
+       那个标识符为止，# 注释和空白都算在块里，所以值里的冒号（x:y）会开始一个新块；每块不能超过 1023 字节（达到 1024 时
+       游戏进程会被 CRT 直接终止）；每块都必须是 effect: 块；.name 取块里最后一次出现的（# 注释里的、紧跟引号的都算），
+       名字为空、超过 63 字节、和同一段文本里别的名字哈希相同都拒绝；.kill_enemy_types、.buff_ids、.summon_monsters、
+       .summon_ranks、.set_monster_class_ids 的列表项不能以块末尾的引号开头（游戏读这一项时进程会被终止）；
+       0 字节、标识符和 .name 的值周围的非 ASCII 字符（结果依赖区域设置）也拒绝；每块的 .target 必须是游戏认的 21 种之一
+       （performer、target、target_group、global……，缺少或认不出时游戏弹 assert「EffectTarget: Invalid type」）。名字的归属按游戏的哈希判断。
+       只在存档里；effect map 每次读档重建，
+       每次进存档要重新定义。CampaignLoad 时已经在表里的名字算游戏数据，和别的插件定义的名字一样返回 DD_COMBAT_E_EXISTS；
+       同一个插件可以重新定义自己的，但游戏的解析器复用原来的对象（4F02D0）：标量字段被新值覆盖，列表字段
+       （.buff_ids、.kill_enemy_types、.summon_monsters、.set_monster_class_id(s)）在原来的后面追加，不清空——重新定义带
+       .buff_ids 的 effect 之后施加时这些 buff 会加两遍（审核 R2A-N4）。要改列表就换一个名字。
+       运行时定义的 effect 能被 buff 的附加效果、effect 的 buff_ids 和 effect_apply 使用，
+       不能被技能引用（技能在职业加载时就解析好了）。out->count 是定义的 effect 数。
+       buff_define、effect_define 都没有个数上限：每条定义在游戏里常驻到退出存档（effect 每个约 0x618 字节），
+       不要每帧定义新名字（审核 R2A-N5）；DDCore 在退出存档时报个数 */
+    uint32_t(DD_CALL* effect_define)(DDPluginHandle plugin, const char* text, DDCombatOpResult* out);
+
+    /* 规则注册（D8），主线程，不能在规则回调里调用。名字最多 63 字节，已经注册（含哈希相同的不同名字）时返回 0。
+       游戏内置的状态名 stunned、tagged、poisoned、bleeding、burning、virtued、afflicted、dazed（规则 13/42 自己会判断的，
+       含哈希相同的）也返回 0：注册了就会接管原版数据里所有这类判定（审核 A-N3）。
+       注册后下一个帧边界装上 479CD0 的 hook（没有注册时不装），撤销最后一个后拆除。 */
+    DDRuleId(DD_CALL* rule_register)(DDPluginHandle plugin, const char* name, DDRuleFn fn, void* user);
+    bool(DD_CALL* rule_unregister)(DDPluginHandle plugin, DDRuleId id);
+    bool(DD_CALL* rule_stats)(DDRuleStats* out);
+
+    /* 技能句柄：从事件里的执行者和技能指针（skill.pre/post 的 performer、skill）得到。技能不在执行者职业的表里时返回 false */
+    bool(DD_CALL* skill_from_pointer)(const void* performer, const void* skill, DDSkillRef* out);
+    /* 重新解析并读字段，解析失败返回 false */
+    bool(DD_CALL* skill_info)(const DDSkillRef* ref, DDSkillInfo* out);
+} DDCombatService;
+
+/* ------------------------------------------------------------------ persist */
+
+#define DD_SERVICE_PERSIST "persist"
+#define DD_SERVICE_PERSIST_VERSION 1u
+
+/*
+ * 存档旁路（P4c）：插件的数据按存档保存在游戏存档旁边，读档时和游戏存档核对一致才交回。设计见 docs/02-architecture.md 的
+ * 「persist 服务」，依据见 knowledge/dd1/campaign.md 的「存档」。
+ *
+ * 位置：<游戏根目录>\DDModLoader\save\<账号>\<设备名>\<插件名>\<key>.ddsave。账号是 SteamID32（离线版、取不到 Steam 时是 local），
+ *   设备名是当前 profile（steam_profile_N、profile_N）。每次写入保留上一代 <key>.ddsave.prev。游戏选存档槽时把存档复制到
+ *   backup/，旁路同时把这个设备的目录复制到 <设备名>\backup\；游戏读 backup 时旁路也读 backup。
+ * 文件：文本头（格式版本、插件名、key、插件给的版本、设备名、账号、写入时间、是否在地牢和战斗中、快照时游戏文件的内容哈希）
+ *   加插件的数据（字节串，带长度和校验和）。
+ *
+ * 声明：插件在 DDPlugin_Load 里调用 declare。插件名就是旁路的子目录名：不能以点结尾，不能是 backup、DDCore，和已经声明的插件
+ *   不能只差大小写，否则返回 DD_PERSIST_E_INVALID。有插件声明时 DDCore 在 AppReady 装 4 个观察 hook（StorageManager 的排队写文件
+ *   2487E0、读文件 248D60、选存档槽复制 backup 2923A0、退到桌面 3D1CC0），只读内存、算哈希、记录，不改游戏行为；没有插件声明时
+ *   一个都不装。存档的读取早于 CAMPAIGN_LOAD，所以这些 hook 不能按需安装。
+ *
+ * 写：每次 campaign.save（见 events 一节）派发完所有订阅之后，DDCore 按插件加载顺序调用 on_save，插件在 on_save 或 campaign.save
+ *   的回调里调用 save 交出数据（只有这两处能调用）。DDCore 在主线程记下数据和当时的游戏文件哈希（名册，在地牢里加 raid），
+ *   后台线程写盘：同一个文件还没写的被新的替换（只写最新的），先写临时文件、FlushFileBuffers，再 ReplaceFileW。写失败（别的程序
+ *   正占着文件）按退避重试，最多写 5 次（约 4 秒），重试用完才放弃并写 ERROR。退出存档时等 3 秒、退到桌面时等 10 秒，没写完或
+ *   有放弃的写 WARN 并列出路径。某一次没有调用 save 的 key 保持原来的文件（下次读档多半不一致）。同一插件只差大小写的两个 key
+ *   是同一个文件，后交的拒绝。
+ *   这次进存档第一次写某个 key 之前，读档时判成 MISMATCH（或新战役）的，旁路里原来的两代先改名为 <key>.ddsave.mismatch-<时间>、
+ *   <key>.ddsave.prev.mismatch-<时间>（新战役是 oldcampaign-<时间>），不再参与读档判断，每种留最近 2 份，要找回时手动改回名字。
+ *   on_save 里不要做 combat 的写操作（按事件回调处理，排队到下一帧，和刚写的存档对不上）。
+ * 读：CAMPAIGN_LOAD 回调里及之后（到 CAMPAIGN_UNLOAD 为止）调用 load。名册在 CAMPAIGN_LOAD 之前已经读完，DDCore 比较这次读到的
+ *   名册哈希和旁路记录的：当前一代一致是 LOADED，否则上一代一致是 PREV，都不一致是 MISMATCH（不给数据，reason 写原因），没有文件
+ *   是 EMPTY。还要求文件头里的插件名、key 和请求的完全相同，旁路的「地牢/城镇」和存档一致（CAMPAIGN_LOAD 时状态机的下一个状态是
+ *   as_raid_start 就是地牢里的存档）。新战役（这次读到的名册就是 scripts/starting_save 的初始名册）两代都不一致时是 EMPTY，
+ *   不是 MISMATCH。
+ *   地牢里的存档：游戏在 CAMPAIGN_LOAD 之前（状态 1）已经读过一次探索存档 persist.raid.json，DDCore 拿它和名册一起判断两代，
+ *   raid 不一致的一代不用（可能因此是 PREV）。数据照样带 raid_pending = 1：as_raid_start 加载结束后的帧边界拿 load_raid 读到的
+ *   raid 再确认一次，结果经 on_verify 通知（怪物的数据这时才能恢复）。读档前没有读到 raid 时只按名册判断，raid 只在这一步核对。
+ *   这一步不一致时已经给出的数据收不回来，DDCore 改为 MISMATCH，这次进存档里这个 key 的 save 返回 DD_PERSIST_E_INCONSISTENT、
+ *   不再写，原来的两代保留（否则下一次存档会把来自不一致那一代的数据连同新的哈希写回去）。
+ *   一次进存档里同一个 key 只判断一次，之后的 load 返回同样的结果。
+ *
+ * 线程：全部只在主线程调用。回调（on_save、on_verify）都在主线程，SEH 隔离，崩溃只写日志。
+ */
+
+typedef enum DDPersistStatus {
+    DD_PERSIST_LOADED = 0,      /* 当前一代和存档一致 */
+    DD_PERSIST_PREV = 1,        /* 当前一代不一致，上一代一致 */
+    DD_PERSIST_EMPTY = 2,       /* 没有旁路文件（新战役、从没写过） */
+    DD_PERSIST_MISMATCH = 3,    /* 有旁路文件但和存档不一致（或文件损坏），不给数据 */
+    DD_PERSIST_UNAVAILABLE = 4, /* 这次读档不能判断（观察 hook 没装上、没观察到名册的读取、取不到账号或设备） */
+} DDPersistStatus;
+
+typedef enum DDPersistResult {
+    DD_PERSIST_OK = 0,
+    DD_PERSIST_E_INVALID = 1,       /* 参数无效（key 不合法、数据太大） */
+    DD_PERSIST_E_NOT_DECLARED = 2,  /* 插件没有在 Load 里 declare */
+    DD_PERSIST_E_TIMING = 3,        /* 时机不对：save 只在 campaign.save 回调和 on_save 里，declare 只在 AppReady 之前 */
+    DD_PERSIST_E_THREAD = 4,        /* 不在主线程 */
+    DD_PERSIST_E_NO_CAMPAIGN = 5,   /* 不在存档里 */
+    DD_PERSIST_E_UNAVAILABLE = 6,   /* 持久化不可用（特征码缺失、hook 没装上） */
+    DD_PERSIST_E_INCONSISTENT = 7,  /* save：这个 key 这次进存档的 raid 核对不一致（或归档失败），这次进存档不再写，原来的两代保留 */
+} DDPersistResult;
+
+#define DD_PERSIST_MAX_KEY 63                       /* key：字母数字和 _ . -，不能以点开头 */
+#define DD_PERSIST_MAX_DATA (16u * 1024u * 1024u)   /* 一个 key 的数据上限 */
+
+/* load 的输出。data 和 version 在 CAMPAIGN_UNLOAD 之前有效；reason 在 raid 核对时会更新，要保存就复制 */
+typedef struct DDPersistData {
+    uint32_t size;          /* 调用方写入 sizeof(DDPersistData) */
+    uint32_t status;        /* DDPersistStatus */
+    const char* reason;     /* 说明：不一致的原因、地牢里待核对等；没有时为空串 */
+    const void* data;       /* LOADED / PREV 时是数据，否则为 NULL */
+    uint32_t data_size;
+    const char* version;    /* 写入时插件给的版本文字 */
+    uint64_t written_ms;    /* 写入时间（Unix 毫秒） */
+    bool in_raid;           /* 写入时在地牢里 */
+    bool raid_pending;      /* 地牢里的存档：raid 还要等探索存档读完再核对，结果经 on_verify 通知 */
+    bool from_backup;       /* 游戏这次读的是 backup/，旁路也读了 backup */
+} DDPersistData;
+
+/* on_save 的参数，和 campaign.save 的字段相同。字符串只在回调期间有效 */
+typedef struct DDPersistSaveInfo {
+    uint32_t size;
+    const char* files;      /* 这组写了哪些文件，逗号分隔 */
+    bool in_raid;
+    bool in_battle;
+    bool main_thread;
+    uint32_t campaign_serial;
+    uint32_t index;         /* 本次进存档的第几次 campaign.save，从 1 开始 */
+} DDPersistSaveInfo;
+
+/* on_verify 的参数：地牢存档的 raid 核对结果，每个 load 过、raid_pending 为 1 的 key 一次。字符串只在回调期间有效 */
+typedef struct DDPersistVerify {
+    uint32_t size;
+    const char* key;
+    uint32_t status;        /* 核对通过时是 load 时的结果（LOADED / PREV），不通过是 MISMATCH */
+    const char* reason;
+} DDPersistVerify;
+
+typedef void(DD_CALL* DDPersistSaveFn)(const DDPersistSaveInfo* info, void* user);
+typedef void(DD_CALL* DDPersistVerifyFn)(const DDPersistVerify* verify, void* user);
+
+/* 诊断信息。字符串在下一次调用 info 之前有效 */
+typedef struct DDPersistInfo {
+    uint32_t size;          /* 调用方写入 sizeof(DDPersistInfo) */
+    bool hooks;             /* 观察 hook 已装上 */
+    uint32_t hook_count;
+    const char* account;    /* SteamID32 或 local；还没取到时为空串 */
+    const char* device;     /* 当前 profile 的设备名，存档外为空串 */
+    const char* directory;  /* 当前旁路目录（这次读档用的，读 backup 时是 backup 目录），存档外为空串 */
+    uint32_t saves;         /* 本次运行派发 campaign.save 的次数 */
+    uint64_t written;       /* 写盘成功的文件数 */
+    uint64_t merged;        /* 被后来的写入替换、没有写盘的次数 */
+    uint64_t failed;        /* 重试用完放弃的次数（那份数据没写进去） */
+    uint64_t retries;       /* 写失败后安排重试的次数 */
+} DDPersistInfo;
+
+typedef struct DDPersistService {
+    DDServiceHeader header;
+    /* DDPersistStatus 的文字，静态字符串 */
+    const char*(DD_CALL* status_text)(uint32_t status);
+    /* 声明本插件使用持久化，只在 AppReady 之前（DDPlugin_Load、EARLY）调用。on_save 不能为 NULL，on_verify 可为 NULL。
+       重复调用替换回调。返回 DDPersistResult */
+    uint32_t(DD_CALL* declare)(DDPluginHandle plugin, DDPersistSaveFn on_save, DDPersistVerifyFn on_verify, void* user);
+    /* 读本插件 key 的旁路，结果写 out（out->status 等）。返回 DDPersistResult */
+    uint32_t(DD_CALL* load)(DDPluginHandle plugin, const char* key, DDPersistData* out);
+    /* 交出本插件 key 的数据（复制），同一次 campaign.save 里重复调用时后一次替换前一次。version 可为 NULL，最多 63 字节。
+       返回 DDPersistResult */
+    uint32_t(DD_CALL* save)(DDPluginHandle plugin, const char* key, const void* data, uint32_t size, const char* version);
+    bool(DD_CALL* info)(DDPersistInfo* out);
+} DDPersistService;
 
 #ifdef __cplusplus
 }

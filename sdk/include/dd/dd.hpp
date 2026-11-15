@@ -9,6 +9,7 @@
 
 #include "dd_api.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <format>
 #include <functional>
@@ -315,6 +316,187 @@ private:
 	DDPluginHandle plugin_ = nullptr;
 };
 
+// combat 服务的封装（P4）。时机、线程、失败原因见 dd_api.h 的 combat 一节
+class Combat
+{
+public:
+	// 返回 DD_RULE_TRUE / DD_RULE_FALSE（规则本身是否成立），或 DD_RULE_ORIGINAL（这次交还游戏原来的判定）
+	using RuleCallback = std::function<DDRuleResult(const DDRuleContext&)>;
+	using ResultCallback = std::function<void(const DDCombatOpResult&)>;
+
+	void init(const DDCombatService* service, DDPluginHandle plugin)
+	{
+		service_ = service;
+		plugin_ = plugin;
+	}
+
+	const DDCombatService* service() const { return service_; }
+	explicit operator bool() const { return service_ != nullptr; }
+	const char* text(std::uint32_t result) const { return service_ ? service_->result_text(result) : "no service"; }
+	bool safe_point() const { return service_ && service_->safe_point(); }
+
+	// 排队的写操作执行后的回调，对象常驻到进程结束
+	bool on_result(ResultCallback fn) const
+	{
+		if (!service_) {
+			return false;
+		}
+		auto* holder = new ResultCallback(std::move(fn));
+		if (!service_->set_op_handler(plugin_, &ResultThunk, holder)) {
+			delete holder;
+			return false;
+		}
+		return true;
+	}
+
+	std::vector<std::uint32_t> buff_guids(const DDActorRef& actor) const
+	{
+		std::vector<std::uint32_t> out;
+		std::uint32_t count = 0;
+		if (!service_ || !service_->buff_list(&actor, nullptr, 0, &count)) {
+			return out;
+		}
+		out.resize(count);
+		if (count && !service_->buff_list(&actor, out.data(), count, &count)) {
+			out.clear();
+		}
+		out.resize((std::min)(out.size(), static_cast<std::size_t>(count)));
+		return out;
+	}
+
+	bool buff_get(const DDActorRef& actor, std::uint32_t guid, DDBuffInfo& out) const
+	{
+		out.size = sizeof(DDBuffInfo);
+		return service_ && service_->buff_get(&actor, guid, &out);
+	}
+
+	std::uint32_t buff_add(const DDActorRef& actor, const char* id, const DDBuffAddOptions* options = nullptr,
+		DDCombatOpResult* out = nullptr) const
+	{
+		return service_ ? service_->buff_add(plugin_, &actor, id, options, Prepare(out)) : DD_COMBAT_E_UNAVAILABLE;
+	}
+
+	std::uint32_t buff_remove(const DDActorRef& actor, DDBuffMatch match, std::uint32_t guid, std::int32_t source, const char* text,
+		DDCombatOpResult* out = nullptr) const
+	{
+		DDBuffRemoveSpec spec{ sizeof(DDBuffRemoveSpec), static_cast<std::uint32_t>(match), guid, source, text };
+		return service_ ? service_->buff_remove(plugin_, &actor, &spec, Prepare(out)) : DD_COMBAT_E_UNAVAILABLE;
+	}
+
+	std::uint32_t buff_define(const DDBuffDef& def, DDCombatOpResult* out = nullptr) const
+	{
+		return service_ ? service_->buff_define(plugin_, &def, Prepare(out)) : DD_COMBAT_E_UNAVAILABLE;
+	}
+
+	std::uint32_t effect_apply(const char* name, const DDActorRef& performer, const DDActorRef* target = nullptr,
+		DDCombatOpResult* out = nullptr) const
+	{
+		return service_ ? service_->effect_apply(plugin_, name, &performer, target, Prepare(out)) : DD_COMBAT_E_UNAVAILABLE;
+	}
+
+	std::uint32_t effect_define(const char* text, DDCombatOpResult* out = nullptr) const
+	{
+		return service_ ? service_->effect_define(plugin_, text, Prepare(out)) : DD_COMBAT_E_UNAVAILABLE;
+	}
+
+	// 回调对象常驻到进程结束；撤销用 service()->rule_unregister
+	DDRuleId rule(const char* name, RuleCallback fn) const
+	{
+		if (!service_) {
+			return 0;
+		}
+		auto* holder = new RuleCallback(std::move(fn));
+		const DDRuleId id = service_->rule_register(plugin_, name, &RuleThunk, holder);
+		if (id == 0) {
+			delete holder;
+		}
+		return id;
+	}
+
+private:
+	static DDCombatOpResult* Prepare(DDCombatOpResult* out)
+	{
+		if (out) {
+			out->size = sizeof(DDCombatOpResult);
+		}
+		return out;
+	}
+	static void DD_CALL ResultThunk(const DDCombatOpResult* result, void* user) { (*static_cast<ResultCallback*>(user))(*result); }
+	static uint32_t DD_CALL RuleThunk(const DDRuleContext* context, void* user)
+	{
+		return static_cast<uint32_t>((*static_cast<RuleCallback*>(user))(*context));
+	}
+
+	const DDCombatService* service_ = nullptr;
+	DDPluginHandle plugin_ = nullptr;
+};
+
+// persist 服务的封装（P4c）。时机和语义见 dd_api.h 的 persist 一节
+class Persist
+{
+public:
+	using SaveCallback = std::function<void(const DDPersistSaveInfo&)>;
+	using VerifyCallback = std::function<void(const DDPersistVerify&)>;
+
+	void init(const DDPersistService* service, DDPluginHandle plugin)
+	{
+		service_ = service;
+		plugin_ = plugin;
+	}
+
+	const DDPersistService* service() const { return service_; }
+	explicit operator bool() const { return service_ != nullptr; }
+
+	// 只在 DDPlugin_Load 里调用一次，回调对象常驻到进程结束
+	bool declare(SaveCallback onSave, VerifyCallback onVerify = {}) const
+	{
+		if (!service_) {
+			return false;
+		}
+		auto* holder = new Holder{ std::move(onSave), std::move(onVerify) };
+		if (service_->declare(plugin_, &SaveThunk, &VerifyThunk, holder) != DD_PERSIST_OK) {
+			delete holder;
+			return false;
+		}
+		return true;
+	}
+
+	// 读 key 的旁路；status 不是 LOADED / PREV 时 data 为空
+	bool load(const char* key, DDPersistData& out) const
+	{
+		out.size = sizeof(DDPersistData);
+		return service_ && service_->load(plugin_, key, &out) == DD_PERSIST_OK;
+	}
+
+	bool save(const char* key, std::string_view data, const char* version = nullptr) const
+	{
+		return service_ && service_->save(plugin_, key, data.data(), static_cast<uint32_t>(data.size()), version) == DD_PERSIST_OK;
+	}
+
+private:
+	struct Holder {
+		SaveCallback save;
+		VerifyCallback verify;
+	};
+	static void DD_CALL SaveThunk(const DDPersistSaveInfo* info, void* user)
+	{
+		auto* h = static_cast<Holder*>(user);
+		if (h->save) {
+			h->save(*info);
+		}
+	}
+	static void DD_CALL VerifyThunk(const DDPersistVerify* verify, void* user)
+	{
+		auto* h = static_cast<Holder*>(user);
+		if (h->verify) {
+			h->verify(*verify);
+		}
+	}
+
+	const DDPersistService* service_ = nullptr;
+	DDPluginHandle plugin_ = nullptr;
+};
+
 // 把一次 Load 拿到的全部服务收在一处
 class Runtime
 {
@@ -338,6 +520,10 @@ public:
 		// events 服务是 P2 才有的，老 DDCore 上为空，Events 对象变成无操作
 		events_.init(static_cast<const DDEventsService*>(api->query(DD_SERVICE_EVENTS, DD_SERVICE_EVENTS_VERSION)),
 			plugin_);
+		// combat 服务是 P4 才有的，不可用时 Combat 对象变成无操作
+		combat_.init(static_cast<const DDCombatService*>(api->query(DD_SERVICE_COMBAT, DD_SERVICE_COMBAT_VERSION)), plugin_);
+		// persist 服务是 P4c 才有的
+		persist_.init(static_cast<const DDPersistService*>(api->query(DD_SERVICE_PERSIST, DD_SERVICE_PERSIST_VERSION)), plugin_);
 		return true;
 	}
 
@@ -349,6 +535,8 @@ public:
 	const Hooks& hooks() const { return hooks_; }
 	const GameInfo& game() const { return gameInfo_; }
 	const Events& events() const { return events_; }
+	const Combat& combat() const { return combat_; }
+	const Persist& persist() const { return persist_; }
 
 private:
 	const DDApi* api_ = nullptr;
@@ -359,6 +547,8 @@ private:
 	Hooks hooks_;
 	GameInfo gameInfo_;
 	Events events_;
+	Combat combat_;
+	Persist persist_;
 };
 
 }  // namespace dd
