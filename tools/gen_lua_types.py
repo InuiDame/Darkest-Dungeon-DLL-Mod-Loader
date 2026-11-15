@@ -24,18 +24,33 @@ RIG = Path(r"D:\Program Files (x86)\Steam\steamapps\common") / os.environ.get("D
 RIG_DUMP = RIG / "DDModLoader" / "log" / "topics.json"
 
 # 指向 Hero / Monster 的指针字段：DDLua 把它们转成 actor 句柄（不是 actor 的指针读出 nil）。
-# 其余指针字段（skill、effect、raid、inventory……）在 Lua 里恒为 nil
+# P4b：effect.* 的 effect（按 effect_name）是 effect 句柄，skill.* 的 skill（按 performer 和技能指针）是技能句柄。
+# 其余指针字段（raid、inventory、item……）在 Lua 里恒为 nil
 ACTOR_FIELDS = {"target", "attacker", "performer", "healer", "source", "actor", "hero"}
+
+
+def handle_type(topic, field):
+    """effect / skill 字段的句柄类型，不是这两种时返回 None"""
+    names = {f["name"] for f in topic["fields"]}
+    if field["name"] == "effect" and "effect_name" in names:
+        return "dd.Effect"
+    if field["name"] == "skill" and "performer" in names:
+        return "dd.Skill"
+    return None
 
 # 语义主题和应用主题的说明（native.* 和 query.* 按类名统一说明）。依据 sdk/include/dd/dd_api.h 和
 # docs/07-event-coverage.md；没写的主题只有字段注解
 DESCRIPTIONS = {
     "damage.pre": "伤害结算前（Hero/Monster 受到伤害）。可写 damage，可取消：取消后伤害按 0 结算，不扣血、不进死门",
     "damage.post": "伤害结算后。damage 是实际传给游戏的伤害（被取消时为 0），hp_after 是结算后的生命",
-    "effect.pre": "Effect 应用到一个目标之前。可取消：跳过这一个目标。performer、target 是实际生效的双方",
+    "effect.pre": "Effect 应用到一个目标之前。可取消：跳过这一个目标。performer、target 是实际生效的双方，effect 是 effect 句柄。dd.effect.register 建在它上面",
     "effect.post": "Effect 应用到一个目标之后",
-    "skill.pre": "技能执行前。skill、target 可写但都是指针，Lua 不能写；Lua 只能读",
+    "skill.pre": "技能执行前（游戏分派之后），只读。skill 是技能句柄（dd.Skill）",
     "skill.post": "技能执行后",
+    "damage.final": "最终伤害（护体、格挡之后，扣血之前），每次命中一次。可写 absorb（0 到 damage）：全部吸收按格挡处理，部分吸收补回生命；PvP 中不派发",
+    "buff.add": "buff 条目追加进表之后（游戏的添加、叠灼烧、怪物同伴、combat 服务的添加）。读档恢复的不派发，只在存档里派发。Lua Mod 加的条目 plugin 是 DDLua、tag 是 <mod id>:<tag>",
+    "buff.remove": "buff 条目删除之前，字段是删除前的值。reason 是删除原因（expired、plugin、refresh、town_visit 等）",
+    "buff.tick": "持续时间结算之后，每条 duration 变了且还在表里的条目一次；减到 0 被删的只有 buff.remove（expired）",
     "hit.pre": "命中结算前。可写 hit（false 走未命中路径）、crit、damage",
     "hit.post": "命中结算后，hit、crit、damage 是最终值",
     "battle.round.start": "回合开始（含第一回合）",
@@ -50,6 +65,7 @@ DESCRIPTIONS = {
     "app.state": "游戏状态机切换（from/to 是状态号，*_name 是状态名）",
     "campaign.load": "进入存档后。Lua Mod 在 main.lua 里订阅能收到这一次",
     "campaign.unload": "退出存档。按存档加载的 Lua Mod 收不到：DDLua 在这之前已经拆除了它们",
+    "campaign.save": "游戏在当前存档位上写完一组存档文件（城镇的名册或庄园、城镇文件，地牢的一次探索存档）之后的帧边界，只读。回调都返回之后 DDLua 才取 dd.store 和脚本 Buff 状态的快照写进存档旁路",
     "battle.start": "战斗创建（BattleCreatedEvent）。从存档恢复的战斗（撤退后重进同一格等）游戏不派发它 [静态]，见 03 的「战斗序号和 battle.start」",
     "battle.end": "战斗销毁（BattleDestroyedEvent）。这时怪物已移出战斗，怪物句柄已失效",
     "actor.deathsdoor": "英雄进入死门",
@@ -81,6 +97,9 @@ LUA_TYPES = {"int": "integer", "float": "number", "bool": "boolean", "string": "
 
 def field_type(topic, field):
     if field["type"] == "pointer":
+        handle = handle_type(topic, field)
+        if handle:
+            return handle + "?"
         return "dd.Actor?" if field["name"] in ACTOR_FIELDS else "nil"
     return LUA_TYPES.get(field["type"], "any")
 
@@ -88,7 +107,14 @@ def field_type(topic, field):
 def field_note(topic, field):
     notes = []
     if field["type"] == "pointer":
-        if field["name"] in ACTOR_FIELDS:
+        handle = handle_type(topic, field)
+        if handle == "dd.Effect":
+            notes.append("effect 句柄（按 effect_name），延迟事件为 nil")
+        elif handle == "dd.Skill":
+            notes.append("技能句柄（combat.skill_from_pointer），不在执行者职业的技能表里时为 nil")
+        elif field["name"] == "actor" and topic["name"].startswith("buff."):
+            notes.append("actor 句柄；延迟事件按 actor_kind、actor_id 找回句柄")
+        elif field["name"] in ACTOR_FIELDS:
             notes.append("Hero/Monster 转成 actor 句柄，其他指针和延迟事件为 nil")
         else:
             notes.append("游戏指针，Lua 里恒为 nil")

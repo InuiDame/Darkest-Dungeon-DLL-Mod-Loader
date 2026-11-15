@@ -245,9 +245,11 @@ class LogSet:
         return problems
 
     def hook_reports(self):
-        """{"AppReady"/"AssetsReady": 报告, ("CampaignLoad", 序号): 报告}，报告是 (目标数, listener, 语义 hook, 订阅, 原文)。"""
+        """{"AppReady"/"AssetsReady": 报告, ("CampaignLoad", 序号): 报告}，报告是 (目标数, listener, 语义 hook, 订阅, 原文, 持久化观察 hook 数)。
+        持久化观察 hook 数取自同一份报告里的「persist：观察 hook N 个」（P4c1 起），没有这一行（P4c1 之前的日志）时是 None。"""
         reports = {}
         current = None
+        key = None
         serial = None
         for l in self.core or []:
             m = re.match(r"阶段 CampaignLoad，帧 \d+，存档序号 (\d+)", l.text)
@@ -256,11 +258,17 @@ class LogSet:
             m = re.match(r"======== hook 报告（(\w+)），共 (\d+) 个目标", l.text)
             if m:
                 current = (m.group(1), int(m.group(2)))
+                key = None
             m = re.match(r"事件系统：已注册 listener (\d+) 个，语义 hook (\d+) 个，订阅 (\d+) 个", l.text)
             if m and current:
                 key = current[0] if current[0] != "CampaignLoad" else ("CampaignLoad", serial)
-                reports[key] = (current[1], int(m.group(1)), int(m.group(2)), int(m.group(3)), l.text)
+                reports[key] = (current[1], int(m.group(1)), int(m.group(2)), int(m.group(3)), l.text, None)
                 current = None
+            m = re.match(r"persist：观察 hook (\d+) 个", l.text)
+            if m and key in reports:
+                reports[key] = reports[key][:5] + (int(m.group(1)),)
+            if l.text.startswith("======== 报告结束"):
+                key = None
         return reports
 
 
@@ -907,8 +915,10 @@ class Checker:
             self.add("hooks.nolua", nolua_title, MISS, "这次运行里没有进过不带 Lua Mod 的存档", required=False, acceptance="#7 辅助")
 
     def check_lua_profile(self):
-        """验收 #7：lua 方案（DDCore + DDLua），进一个没有 Lua Mod 的存档，CampaignLoad 的 hook 报告是 1 个目标、语义 hook 0、订阅 0。"""
-        title = "lua 方案、没有 Lua Mod 的存档：CampaignLoad 的 hook 报告 1 个目标、语义 hook 0、订阅 0"
+        """验收 #7：lua 方案（DDCore + DDLua），进一个没有 Lua Mod 的存档，CampaignLoad 的 hook 报告是 1 + 持久化观察 hook 的个数（4）个目标、
+        语义 hook 0、订阅 0。P4c1 起 DDLua 总是声明持久化，DDCore 在 AppReady 装 4 个只读的观察 hook（存档的读取早于 CampaignLoad，
+        不能按需安装），报告里另有一行「persist：观察 hook 4 个」；P4c1 之前的日志没有这一行，按原来的 1 个目标判断。"""
+        title = "lua 方案、没有 Lua Mod 的存档：CampaignLoad 的 hook 报告 1 + 持久化观察 hook（4）个目标、语义 hook 0、订阅 0"
         run = self.lua_run
         if run is None:
             self.add("hooks.lua", title, MISS, "没有给 --lua-log-dir：场景最后一步（rig.py deploy lua，进一个没有勾选测试 Mod 的存档，"
@@ -922,20 +932,29 @@ class Checker:
         problems += id_problems + run.serial_problems()
         detail = [config.text if config else "没有配置行"] + id_detail
         reports = run.hook_reports()
-        want = lambda rep: rep[0] == 1 and rep[2] == 0 and rep[3] == 0
+
+        def want(rep):
+            persist = rep[5]
+            targets_ok = rep[0] == 1 if persist is None else (persist == PERSIST_OBSERVE_HOOKS and rep[0] == 1 + persist)
+            return targets_ok and rep[2] == 0 and rep[3] == 0
+
+        def shape(rep):
+            return f"共 {rep[0]} 个目标（持久化观察 hook {'没有记录' if rep[5] is None else rep[5]} 个），{rep[4]}"
+
+        expect_text = f"1 + {PERSIST_OBSERVE_HOOKS} 个目标（P4c1 之前的日志 1 个）、语义 hook 0、订阅 0"
         base = reports.get("AssetsReady")
         if not base:
             problems.append("DDCore.log 里没有 AssetsReady 的 hook 报告")
         else:
-            detail.append(f"AssetsReady：{base[4]}，共 {base[0]} 个目标")
+            detail.append(f"AssetsReady：{shape(base)}")
             if not want(base):
-                problems.append(f"主菜单（AssetsReady）的报告不是 1 个目标、语义 hook 0、订阅 0：共 {base[0]} 个目标，{base[4]}")
+                problems.append(f"主菜单（AssetsReady）的报告不是 {expect_text}：{shape(base)}")
         loads = {k[1]: v for k, v in reports.items() if isinstance(k, tuple)}
         sessions = {s["serial"]: s for s in split_sessions(run.lua)}
         for serial, rep in sorted(loads.items()):
-            detail.append(f"CampaignLoad（存档#{serial}）：共 {rep[0]} 个目标，{rep[4]}")
+            detail.append(f"CampaignLoad（存档#{serial}）：{shape(rep)}")
             if not want(rep) or (base and rep[1] != base[1]):
-                problems.append(f"存档#{serial} 的 CampaignLoad 报告不是 1 个目标、语义 hook 0、订阅 0（listener 和主菜单相同）：共 {rep[0]} 个目标，{rep[4]}")
+                problems.append(f"存档#{serial} 的 CampaignLoad 报告不是 {expect_text}（listener 和主菜单相同）：{shape(rep)}")
             s = sessions.get(serial)
             if s:
                 detail.append("  " + s["start"].text)
@@ -1054,6 +1073,9 @@ PROBE_SAMPLE = """\ufeff[10:00:00.000] [INFO] 日志开始，DDCore 1.0.0，运�
 [10:00:15.600] [INFO] .post 结算值和句柄读数一致 9/9；治疗后不超过最大生命 3/3；战斗 3 场，本存档英雄句柄 0 个
 """
 
+# P4c1：DDLua 声明持久化以后 DDCore 装的观察 hook 数（排队写文件、读文件、选槽复制 backup、退到桌面），lua 方案的 hook 报告是 1 + 它
+PERSIST_OBSERVE_HOOKS = 4
+
 # 旧的离线预演样本没有插件加载行，自测时补上（格式照 core.cpp）；F2 之后的预演样本自己带
 CORE_PLUGIN_LINES = "[10:00:00.000] [INFO] 插件 DDLua 加载成功（版本 1.0.0）\n[10:00:00.000] [INFO] 插件 probe_p3c 加载成功（版本 1.0.0）\n"
 
@@ -1062,24 +1084,54 @@ LUA_RUN_CORE = """\ufeff[11:00:00.000] [INFO] DDCore 1.0.0 启动，运行标识
 [11:00:01.000] [INFO] 发现新协议插件 -> {root}\\mods\\DD Mod Lib\\DDLua.dll
 [11:00:01.500] [INFO] 插件 DDLua 加载成功（版本 1.0.0）
 [11:00:01.500] [INFO] 阶段 Early，1 个插件已加载
-[11:00:01.510] [INFO] ======== hook 报告（AppReady），共 1 个目标 ========
+[11:00:01.510] [INFO] ======== hook 报告（AppReady），共 5 个目标 ========
 [11:00:01.510] [INFO] #1 内联 Darkest.exe+0x3DCE10 偷取 5 字节，状态 正常
 [11:00:01.510] [INFO]     DDCore: per_frame(UpdateStateInternal)（优先级 -1000）
+[11:00:01.510] [INFO] #2 内联 Darkest.exe+0x2487E0 偷取 5 字节，状态 正常
+[11:00:01.510] [INFO]     DDCore: persist.write(StorageQueueWrite)（优先级 0）
+[11:00:01.510] [INFO] #3 内联 Darkest.exe+0x248D60 偷取 5 字节，状态 正常
+[11:00:01.510] [INFO]     DDCore: persist.read(StorageReadFile)（优先级 0）
+[11:00:01.510] [INFO] #4 内联 Darkest.exe+0x2923A0 偷取 5 字节，状态 正常
+[11:00:01.510] [INFO]     DDCore: persist.backup(SaveSlotBackup)（优先级 0）
+[11:00:01.510] [INFO] #5 内联 Darkest.exe+0x3D1CC0 偷取 5 字节，状态 正常
+[11:00:01.510] [INFO]     DDCore: persist.exit(AppShutdown)（优先级 0）
 [11:00:01.510] [INFO] 事件系统：已注册 listener 0 个，语义 hook 0 个，订阅 0 个
+[11:00:01.510] [INFO] combat：规则 0 条（hook 未装），标签 0 条，排队 0 个，已执行写操作 0 个（失败 0），运行时定义 buff 0 个、effect 0 个
+[11:00:01.510] [INFO] persist：观察 hook 4 个（已装），声明的插件 1 个，观察到存档读 0 次、写 0 次，campaign.save 派发 0 次，旁路写盘 0 个（合并 0 次，失败 0 次）
 [11:00:01.510] [INFO] ======== 报告结束 ========
 [11:00:02.000] [INFO] 阶段 AssetsReady，帧 2，线程 9680
-[11:00:02.000] [INFO] ======== hook 报告（AssetsReady），共 1 个目标 ========
+[11:00:02.000] [INFO] ======== hook 报告（AssetsReady），共 5 个目标 ========
 [11:00:02.000] [INFO] #1 内联 Darkest.exe+0x3DCE10 偷取 5 字节，状态 正常
 [11:00:02.000] [INFO]     DDCore: per_frame(UpdateStateInternal)（优先级 -1000）
+[11:00:02.000] [INFO] #2 内联 Darkest.exe+0x2487E0 偷取 5 字节，状态 正常
+[11:00:02.000] [INFO]     DDCore: persist.write(StorageQueueWrite)（优先级 0）
+[11:00:02.000] [INFO] #3 内联 Darkest.exe+0x248D60 偷取 5 字节，状态 正常
+[11:00:02.000] [INFO]     DDCore: persist.read(StorageReadFile)（优先级 0）
+[11:00:02.000] [INFO] #4 内联 Darkest.exe+0x2923A0 偷取 5 字节，状态 正常
+[11:00:02.000] [INFO]     DDCore: persist.backup(SaveSlotBackup)（优先级 0）
+[11:00:02.000] [INFO] #5 内联 Darkest.exe+0x3D1CC0 偷取 5 字节，状态 正常
+[11:00:02.000] [INFO]     DDCore: persist.exit(AppShutdown)（优先级 0）
 [11:00:02.000] [INFO] 事件系统：已注册 listener 0 个，语义 hook 0 个，订阅 0 个
+[11:00:02.000] [INFO] combat：规则 0 条（hook 未装），标签 0 条，排队 0 个，已执行写操作 0 个（失败 0），运行时定义 buff 0 个、effect 0 个
+[11:00:02.000] [INFO] persist：观察 hook 4 个（已装），声明的插件 1 个，观察到存档读 0 次、写 0 次，campaign.save 派发 0 次，旁路写盘 0 个（合并 0 次，失败 0 次）
 [11:00:02.000] [INFO] ======== 报告结束 ========
 [11:01:00.000] [INFO] 阶段 CampaignLoad，帧 3000，存档序号 1，线程 9680，Campaign=0000000000070000，Buff::Library=0000000000071000，状态 last=2 next=19
 [11:01:00.000] [INFO] 启用 Mod 列表 0 项（已安装 300 个），找到目录 0 项
 [11:01:00.000] [INFO] actor 句柄：英雄可用，怪物可用，最大生命可用；探索序号 0，战斗序号 0
-[11:01:00.001] [INFO] ======== hook 报告（CampaignLoad），共 1 个目标 ========
+[11:01:00.001] [INFO] ======== hook 报告（CampaignLoad），共 5 个目标 ========
 [11:01:00.001] [INFO] #1 内联 Darkest.exe+0x3DCE10 偷取 5 字节，状态 正常
 [11:01:00.001] [INFO]     DDCore: per_frame(UpdateStateInternal)（优先级 -1000）
+[11:01:00.001] [INFO] #2 内联 Darkest.exe+0x2487E0 偷取 5 字节，状态 正常
+[11:01:00.001] [INFO]     DDCore: persist.write(StorageQueueWrite)（优先级 0）
+[11:01:00.001] [INFO] #3 内联 Darkest.exe+0x248D60 偷取 5 字节，状态 正常
+[11:01:00.001] [INFO]     DDCore: persist.read(StorageReadFile)（优先级 0）
+[11:01:00.001] [INFO] #4 内联 Darkest.exe+0x2923A0 偷取 5 字节，状态 正常
+[11:01:00.001] [INFO]     DDCore: persist.backup(SaveSlotBackup)（优先级 0）
+[11:01:00.001] [INFO] #5 内联 Darkest.exe+0x3D1CC0 偷取 5 字节，状态 正常
+[11:01:00.001] [INFO]     DDCore: persist.exit(AppShutdown)（优先级 0）
 [11:01:00.001] [INFO] 事件系统：已注册 listener 0 个，语义 hook 0 个，订阅 0 个
+[11:01:00.001] [INFO] combat：规则 0 条（hook 未装），标签 0 条，排队 0 个，已执行写操作 0 个（失败 0），运行时定义 buff 0 个、effect 0 个
+[11:01:00.001] [INFO] persist：观察 hook 4 个（已装），声明的插件 1 个，观察到存档读 0 次、写 0 次，campaign.save 派发 0 次，旁路写盘 0 个（合并 0 次，失败 0 次）
 [11:01:00.001] [INFO] ======== 报告结束 ========
 [11:02:00.000] [INFO] 阶段 CampaignUnload，帧 6000，存档序号 1，线程 9680
 """
@@ -1087,6 +1139,7 @@ LUA_RUN_LUA = """\ufeff[11:00:01.500] [INFO] 日志开始，DDCore 1.0.0，运�
 [11:00:01.500] [INFO] [DDLua] DDLua 1.0.0（Lua 5.4.9，按 C++ 编译；Lua API 1）加载，DDCore 1.0.0
 [11:00:01.500] [INFO] [DDLua] 配置（没有 DDLua.cfg，用默认值）：memory_limit_mb=128 budget_ms=50 load_budget_ms=500 max_failures=3 max_per_mod=1000 frame_budget_ms=20 log_lines_per_sec=200 log_max_mb=32 teardown_budget_ms=200 dev_mode=0 dev_global_dirs=（关闭）
 [11:00:01.500] [INFO] [DDLua] 只订阅了 lifecycle（CampaignLoad、CampaignUnload），没有订阅事件主题，没有安装 hook
+[11:00:01.500] [INFO] [DDLua] 声明使用存档旁路（dd.store、脚本 Buff 状态随存档保存；DDCore 在 AppReady 装只读的观察 hook）
 [11:01:00.000] [INFO] [存档#1] 进入存档：启用 0 个 Mod，0 个没有找到目录（见 DDCore.log）
 [11:01:00.000] [INFO] [存档#1] 检查了 0 个 Mod 目录，发现 0 个 Lua Mod
 [11:01:00.000] [INFO] [存档#1] 没有可加载的 Lua Mod，不创建 VM
@@ -1290,6 +1343,15 @@ def selftest(sample_dir):
         expect("lua 方案没进存档", run_dir(base, bad), {"hooks.lua": MISS})
         bad = mutated("lua-cfg", "DDLua.log", "dev_mode=0", "dev_mode=1", src=lua_run)
         expect("lua 方案不是默认配置", run_dir(base, bad), {"hooks.lua": FAIL})
+        # P4c1 的新口径：目标数 = 1 + 持久化观察 hook 数（4）；P4c1 之前的日志（没有 persist 行）按 1 个目标
+        bad = mutated("lua-persist-count", "DDCore.log", "persist：观察 hook 4 个", "persist：观察 hook 3 个", 3, src=lua_run)
+        expect("持久化观察 hook 不是 4 个", run_dir(base, bad), {"hooks.lua": FAIL})
+        bad = mutated("lua-persist-targets", "DDCore.log", "共 5 个目标", "共 6 个目标", 3, src=lua_run)
+        expect("目标数不是 1 + 4", run_dir(base, bad), {"hooks.lua": FAIL})
+        old = edit(variant("lua-old", lua_run), "DDCore.log", lambda t: re.sub(r"[^\n]*persist[^\n]*\n|[^\n]*#[2-5] 内联[^\n]*\n", "", t).replace("共 5 个目标", "共 1 个目标"))
+        expect("P4c1 之前的日志（1 个目标，没有 persist 行）", run_dir(base, old), {"hooks.lua": PASS})
+        bad = mutated("lua-old-5", "DDCore.log", "共 1 个目标", "共 5 个目标", 3, src=old)
+        expect("没有 persist 行却有 5 个目标", run_dir(base, bad), {"hooks.lua": FAIL})
 
         print("== 新增的判定")
         expect("同一探索只有一场", run_dir(mutated("one-battle", "probe_p3c.log", "battle.start 第 2 场：探索序号 2", "battle.start 第 2 场：探索序号 3"), lua_run),
