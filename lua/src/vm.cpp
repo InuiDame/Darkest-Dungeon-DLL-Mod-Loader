@@ -308,6 +308,74 @@ double Vm::GcPauseCreditedMs() const
     return static_cast<double>(gcPauseCreditedTotal_) * 1000.0 / static_cast<double>(QpcFrequency());
 }
 
+// P4b：嵌套入口用掉的时间补给外层，上限同 GC 停顿：每个入口最多补 max(一份预算, 最长的一次嵌套)。外层在一个入口里反复触发
+// 嵌套回调（比如循环里立即执行的 add_buff 每次都同步派发 buff.add）只补得上一份，之后照常超时，外层入口的总时间仍然有界
+void Vm::CreditNested(std::int64_t ticks)
+{
+    if (depth_ == 0 || ticks <= 0) {
+        return;
+    }
+    nestMax_ = (std::max)(nestMax_, ticks);
+    const std::int64_t budgetTicks = static_cast<std::int64_t>(budgetMs_) * QpcFrequency() / 1000;
+    const std::int64_t allowance = (std::max)(budgetTicks, nestMax_) - nestCredit_;
+    const std::int64_t credit = (std::min)(ticks, allowance);
+    if (credit < ticks) {
+        ++nestCapped_;
+    }
+    if (credit > 0) {
+        deadline_ += credit;
+        nestCredit_ += credit;
+        ++nestCredits_;
+        nestCreditedTotal_ += credit;
+    }
+}
+
+double Vm::NestCreditedMs() const
+{
+    return static_cast<double>(nestCreditedTotal_) * 1000.0 / static_cast<double>(QpcFrequency());
+}
+
+void Vm::MarkBroken()
+{
+    broken_ = true;
+    RemoveAllEntries(this);  // 原生异常展开栈时不会出栈；损坏的 VM 不能再被没有 lua_State 的进度回调选中
+}
+
+Vm::EntryTiming Vm::SaveTiming() const
+{
+    EntryTiming t;
+    t.deadline = deadline_;
+    t.exceeded = exceeded_;
+    t.budgetMs = budgetMs_;
+    t.gcCredit = gcCredit_;
+    t.gcPauseMax = gcPauseMax_;
+    t.nestCredit = nestCredit_;
+    t.nestMax = nestMax_;
+    return t;
+}
+
+void Vm::RestoreTiming(const EntryTiming& t)
+{
+    deadline_ = t.deadline;
+    exceeded_ = t.exceeded;
+    budgetMs_ = t.budgetMs;
+    gcCredit_ = t.gcCredit;
+    gcPauseMax_ = t.gcPauseMax;
+    nestCredit_ = t.nestCredit;
+    nestMax_ = t.nestMax;
+}
+
+void Vm::StartTiming(std::uint32_t budgetMs)
+{
+    exceeded_ = false;
+    gcCredit_ = 0;
+    gcPauseMax_ = 0;
+    nestCredit_ = 0;
+    nestMax_ = 0;
+    budgetMs_ = budgetMs;
+    deadline_ = QpcNow() + static_cast<std::int64_t>(budgetMs) * QpcFrequency() / 1000;
+}
+
 // 没有 lua_State 的进度回调（lddstep.h 的 lua_ddstep_nol_fn）：不能报错、不能碰任何栈。超时后置粘滞标记，
 // 让正在运行的线程在下一条指令进入计数 hook（lua_sethook 可以在任何时候调用）
 void Vm::StepNoState()
@@ -435,17 +503,15 @@ int Vm::MessageHandler(lua_State* L)
     return 1;
 }
 
-void Vm::BeginEntry(std::uint32_t budgetMs)
+void Vm::BeginEntry(std::uint32_t budgetMs, bool fresh)
 {
     if (depth_++ == 0) {
-        exceeded_ = false;
         emergencyFailedInEntry_ = false;
         entryAllocated_ = 0;
-        gcCredit_ = 0;
-        gcPauseMax_ = 0;
-        budgetMs_ = budgetMs;
-        deadline_ = QpcNow() + static_cast<std::int64_t>(budgetMs) * QpcFrequency() / 1000;
+        StartTiming(budgetMs);
         lua_ddstep_work = 0;
+    } else if (fresh) {
+        StartTiming(budgetMs);  // 隔离的嵌套入口（Call），外层的状态由调用方保存、恢复
     }
     Entries().push_back(this);
 }
@@ -532,7 +598,13 @@ bool Vm::Call(int nargs, int nresults, std::uint32_t budgetMs, std::string* erro
     }
     lua_pushcfunction(L_, &Vm::MessageHandler);
     lua_insert(L_, base);
-    BeginEntry(budgetMs);
+    // P4b：已有入口时是隔离的嵌套入口（见 vm.h 开头）。parent 是要补时间的外层：同一个 VM 嵌套时是自己（恢复之后补），
+    // 从别的 VM 的入口里进来时是入口栈的栈顶
+    const bool nested = depth_ > 0;
+    const EntryTiming outerTiming = nested ? SaveTiming() : EntryTiming{};
+    Vm* const parent = nested ? this : (Entries().empty() ? nullptr : Entries().back());
+    const std::int64_t started = QpcNow();
+    BeginEntry(budgetMs, true);
     // 嵌套时（协程里的 C 函数同步调用回 Lua）主线程上的这段代码才是正在运行的
     lua_State* const outer = running_;
     running_ = L_;
@@ -541,6 +613,12 @@ bool Vm::Call(int nargs, int nresults, std::uint32_t budgetMs, std::string* erro
     const bool exceeded = ExceededAtEnd();
     const std::string late = status == LUA_OK && exceeded ? LateBudgetText() : std::string();
     EndEntry();
+    if (nested) {
+        RestoreTiming(outerTiming);
+    }
+    if (parent && parent->depth_ > 0 && std::find(Entries().begin(), Entries().end(), parent) != Entries().end()) {
+        parent->CreditNested(QpcNow() - started);
+    }
     if (status == LUA_OK && exceeded) {
         // 第三轮 R3A-备注1：入口在下一个检查点之前就结束了，同样算超预算（回调停用、main.lua 加载失败）
         if (error) {

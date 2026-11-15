@@ -7,6 +7,9 @@ target("DDLua")
     set_version("1.0.0")
 
     add_files("src/*.cpp")
+    -- 不依赖游戏的 combat 逻辑（effect 文本的分块和取名、参数校验）和 DDCore 用同一份源码，两边的判断才一致
+    add_files("../core/src/combat/logic.cpp")
+    add_includedirs("../core/src")
     add_headerfiles("src/*.h")
     add_packages("lua", "nlohmann_json")
 target_end()

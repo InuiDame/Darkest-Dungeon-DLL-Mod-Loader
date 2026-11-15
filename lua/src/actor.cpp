@@ -1,5 +1,6 @@
 #include "actor.h"
 
+#include "combat.h"
 #include "host.h"
 #include "sandbox.h"
 #include "session.h"
@@ -59,7 +60,10 @@ bool ReadInfo(lua_State* L, const DDActorRef& ref, DDActorInfo* info)
     }
     *info = {};
     info->size = sizeof(DDActorInfo);
-    return game->actor_info(&ref, info);
+    const bool ok = game->actor_info(&ref, info);
+    AfterReentry(L);  // 最大生命由游戏的合计函数算，可能判定规则、进入嵌套的规则回调（P4b）
+    Vm::From(L)->CheckBudget(L);  // 嵌套的回调用掉的时间可能让外层过了截止时间
+    return ok;
 }
 
 bool IsField(const char* key)
@@ -91,6 +95,14 @@ int ActorIndex(lua_State* L)
         lua_pushboolean(L, ref.kind == DD_ACTOR_MONSTER);
     } else if (std::strcmp(key, "valid") == 0) {
         lua_pushcfunction(L, ActorValid);
+    } else if (std::strcmp(key, "buffs") == 0) {
+        lua_pushcfunction(L, combat::ActorBuffs);
+    } else if (std::strcmp(key, "buff") == 0) {
+        lua_pushcfunction(L, combat::ActorBuff);
+    } else if (std::strcmp(key, "add_buff") == 0) {
+        lua_pushcfunction(L, combat::ActorAddBuff);
+    } else if (std::strcmp(key, "remove_buffs") == 0) {
+        lua_pushcfunction(L, combat::ActorRemoveBuffs);
     } else if (IsField(key)) {
         DDActorInfo info{};
         if (!ReadInfo(L, ref, &info)) {
@@ -105,7 +117,8 @@ int ActorIndex(lua_State* L)
             info.class_id[0] ? (void)lua_pushstring(L, info.class_id) : lua_pushnil(L);
         }
     } else {
-        return luaL_error(L, "actor 句柄没有字段 %s（可用：kind、id、is_hero、is_monster、hp、max_hp、stress、class、valid）", key);
+        return luaL_error(L,
+            "actor 句柄没有字段 %s（可用：kind、id、is_hero、is_monster、hp、max_hp、stress、class、valid、buffs、buff、add_buff、remove_buffs）", key);
     }
     return 1;
 }
@@ -113,7 +126,7 @@ int ActorIndex(lua_State* L)
 int ActorNewIndex(lua_State* L)
 {
     Check(L, 1);
-    return luaL_error(L, "actor 句柄只读（P3 不开放写入）");
+    return luaL_error(L, "actor 句柄只读（字段不能赋值；buff 用 add_buff / remove_buffs）");
 }
 
 int ActorEq(lua_State* L)
@@ -166,6 +179,68 @@ int LuaIs(lua_State* L)
     CheckMod(L);
     lua_pushboolean(L, Test(L, 1, nullptr));
     return 1;
+}
+
+// 暂时读不到：加载线程在跑时的原因以「加载中」开头（和 dd.buff、actor:buffs 一样，审核 R2A-S1），其余是存档外、DDCore 太旧
+int PushUnreadable(lua_State* L, const char* fallback)
+{
+    const char* loading = combat::LoadingReason(HostOf(L));
+    lua_pushnil(L);
+    lua_pushstring(L, loading ? loading : fallback);
+    return 2;
+}
+
+constexpr std::uint32_t kListCapacity = 64;  // 和 DDCore 的怪物表上限相同（队伍最多 16）
+
+// dd.actor.party() / dd.actor.monsters()（F5）：DDCore 枚举出的句柄数组，顺序同游戏的表（队伍按站位，怪物按站位）
+int List(lua_State* L, bool party)
+{
+    CheckMod(L);
+    const DDGameService* game = Service(HostOf(L));
+    const auto fn = game ? (party ? game->party_heroes : game->battle_monsters) : nullptr;
+    if (!fn) {
+        return PushUnreadable(L, "DDCore 没有提供枚举（game 服务太旧）");
+    }
+    DDActorRef refs[kListCapacity] = {};
+    std::uint32_t count = 0;
+    if (!fn(refs, kListCapacity, &count)) {
+        return PushUnreadable(L, "现在读不到（不在主线程、不在存档里，或者加载线程在跑）");
+    }
+    const std::uint32_t n = count < kListCapacity ? count : kListCapacity;
+    lua_createtable(L, static_cast<int>(n), 0);
+    for (std::uint32_t i = 0; i < n; ++i) {
+        Push(L, refs[i]);
+        lua_rawseti(L, -2, static_cast<lua_Integer>(i) + 1);
+    }
+    return 1;
+}
+
+int LuaParty(lua_State* L)
+{
+    return List(L, true);
+}
+
+int LuaMonsters(lua_State* L)
+{
+    return List(L, false);
+}
+
+// dd.actor.in_battle()（F5）：战斗中（含从存档恢复、没有派发 battle.start 的战斗）返回 true 和战斗状态（Battle+0x288），
+// 不在战斗中返回 false, 0
+int LuaInBattle(lua_State* L)
+{
+    CheckMod(L);
+    const DDGameService* game = Service(HostOf(L));
+    if (!game || !game->battle_state) {
+        return PushUnreadable(L, "DDCore 没有提供战斗状态（game 服务太旧）");
+    }
+    const std::int32_t state = game->battle_state();
+    if (state < 0) {
+        return PushUnreadable(L, "现在读不到（不在主线程、不在存档里，或者加载线程在跑）");
+    }
+    lua_pushboolean(L, state != 0);
+    lua_pushinteger(L, state);
+    return 2;
 }
 
 }  // namespace
@@ -225,11 +300,14 @@ void RegisterMetatables(lua_State* L)
 
 void AddFunctions(lua_State* L, int dd, std::uint64_t token)
 {
-    lua_createtable(L, 0, 3);
+    lua_createtable(L, 0, 6);
     const int table = lua_gettop(L);
     SetClosure(L, table, "hero", LuaHero, token);
     SetClosure(L, table, "monster", LuaMonster, token);
     SetClosure(L, table, "is", LuaIs, token);
+    SetClosure(L, table, "party", LuaParty, token);
+    SetClosure(L, table, "monsters", LuaMonsters, token);
+    SetClosure(L, table, "in_battle", LuaInBattle, token);
     lua_setfield(L, dd, "actor");
 }
 

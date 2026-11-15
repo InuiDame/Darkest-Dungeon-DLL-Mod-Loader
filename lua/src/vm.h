@@ -26,6 +26,19 @@
 //   （活对象的 2 倍）超过上限，增量 GC 不再启动，每次都撞上上限做一次完整的紧急 GC。「活对象 + 1/16」保证一轮增量 GC 有足够
 //   的余量做完，不会变成连续不停的 GC；活对象超过上限的 15/16 时阈值又到了上限以上，退回紧急 GC。
 //
+// P4b 嵌套入口：写操作在安全点立即执行时，游戏同步派发 buff.add / buff.remove 等，DDLua 的回调在外层入口的 C 函数里
+// 再次进入 Lua（同一个 VM 嵌套，或者从开发会话的 VM 进入存档会话的 VM）。规则回调也可能嵌在任何入口里（游戏读属性时判定规则）。
+// - Call() 在已有入口里调用时是一个隔离的入口：保存外层的截止时间、粘滞标记、预算和补偿计数，按自己的预算重新计时；
+//   结束后恢复外层的状态。外层超时（含已置粘滞标记）不连累嵌套的回调，嵌套的回调超时也不连累外层。
+// - 嵌套入口用掉的时间补到外层的截止时间上（和 GC 停顿一样有上限：每个入口最多补 max(一份预算, 最长的一次嵌套)），
+//   外层不为别的回调的耗时负责；反复触发嵌套入口的外层补不了更多，照样超时，所以外层入口的总时间仍然有界。
+//   跨 VM 的嵌套同样补到外层 VM 的入口上（Entries() 的栈顶是外层）。
+// - Resume()、CloseThread() 嵌套时仍然沿用外层的截止时间：dd.spawn 立即运行到第一次挂起、task:cancel() 运行 <close>，
+//   都是调用者自己的工作。
+// - 嵌套的回调里发生原生异常时，DDCore（或测试的假中枢）的隔离只把栈展开到派发处，外层入口的 C 函数还在 Lua 的栈帧里，
+//   lua_State 的调用信息已经乱了。调用可能同步回到 Lua 的 SDK 函数之后要检查 ok()，VM 已损坏就不能再回到 Lua（combat.cpp 的
+//   AfterReentry：抛一个 SEH 异常，把外层入口也交给它自己的隔离）。损坏的 VM 从入口栈里移除，不再被没有 lua_State 的进度回调选中。
+//
 // 所有可能报错的 Lua API 调用都放在 Protected() 或 Call() 里，保护模式之外的错误会走 panic。
 //
 // 损坏（审核 B-Y3）：Lua 代码执行期间发生原生异常（SEH，比如访问违例）时，DDCore 的 SEH 隔离把栈展开到它自己，
@@ -68,8 +81,8 @@ public:
     void* owner() const { return owner_; }
     bool ok() const { return L_ != nullptr && !broken_; }
     bool broken() const { return broken_; }
-    // 标记为损坏：只置标记，不分配、不碰 lua_State（可以在 SEH 过滤器里调用）
-    void MarkBroken() { broken_ = true; }
+    // 标记为损坏：置标记并从入口栈里移除（不分配、不碰 lua_State，可以在 SEH 过滤器里调用）
+    void MarkBroken();
     // DDLua 发起的 Lua 调用（Protected、Call、Resume、CloseThread）还没有返回。在帧边界（每帧 Tick、拆除）上为真，
     // 说明上一次调用被原生异常打断、栈已经被展开，VM 应当视为损坏
     bool Abandoned() const { return depth_ > 0 || protected_ > 0; }
@@ -83,8 +96,10 @@ public:
 
     // 调用栈顶的函数（下面是 nargs 个参数），带 traceback 的错误处理，执行预算 budgetMs。
     // 成功时留下 nresults 个结果；失败时栈上不留东西，error 写入「消息 + traceback」，
-    // budgetExceeded（可为空）指出是不是因为超预算
+    // budgetExceeded（可为空）指出是不是因为超预算。已有入口时是隔离的嵌套入口（见文件开头）
     bool Call(int nargs, int nresults, std::uint32_t budgetMs, std::string* error, bool* budgetExceeded = nullptr);
+    // 现在在不在入口里（含嵌套），离线测试和诊断用
+    int EntryDepth() const { return depth_; }
 
     // 恢复协程 co（co 的栈顶是 nargs 个参数）。from 是当前正在运行的线程：在 Lua 调用的 C 函数里是那个线程，
     // 从 C++ 顶层调用时是 L()。开一个预算入口（嵌套时沿用外层的截止时间）。
@@ -116,6 +131,10 @@ public:
     std::uint64_t GcPauseCredits() const { return gcPauseCredits_; }
     double GcPauseCreditedMs() const;
     std::uint64_t GcPauseCapped() const { return gcPauseCapped_; }
+    // 嵌套入口（同一个 VM 或别的 VM）补到外层截止时间上的时间：次数、累计毫秒、超过上限没补全的次数
+    std::uint64_t NestCredits() const { return nestCredits_; }
+    double NestCreditedMs() const;
+    std::uint64_t NestCapped() const { return nestCapped_; }
 
     // 完整 GC，重复到内存不再下降（不受预算约束，只在 Lua 代码之外调用）
     void FullGc();
@@ -140,9 +159,26 @@ private:
     static void Atomic(lua_State* L, int phase);
     // 一段整段的 GC 停顿（QPC 计数），在入口里时按上限补到截止时间上
     void CreditGcPause(std::int64_t ticks);
+    // 一个嵌套入口用掉的时间（QPC 计数），在入口里时按上限补到截止时间上
+    void CreditNested(std::int64_t ticks);
+
+    // 嵌套入口隔离时保存的外层计时状态
+    struct EntryTiming {
+        std::int64_t deadline = 0;
+        bool exceeded = false;
+        std::uint32_t budgetMs = 0;
+        std::int64_t gcCredit = 0;
+        std::int64_t gcPauseMax = 0;
+        std::int64_t nestCredit = 0;
+        std::int64_t nestMax = 0;
+    };
+    EntryTiming SaveTiming() const;
+    void RestoreTiming(const EntryTiming& timing);
+    // 新的计时（最外层入口和隔离的嵌套入口）
+    void StartTiming(std::uint32_t budgetMs);
 
     bool DeadlinePassed() const;
-    void BeginEntry(std::uint32_t budgetMs);
+    void BeginEntry(std::uint32_t budgetMs, bool fresh = false);
     void EndEntry();
     // 入口结束前调用：已经超预算（粘滞标记），或者截止时间已过（检查点之间跨过、入口在下一个检查点之前结束）。
     // 为真时置粘滞标记，嵌套的外层入口随后照样报错
@@ -171,6 +207,11 @@ private:
     std::uint64_t gcPauseCredits_ = 0;
     std::int64_t gcPauseCreditedTotal_ = 0;
     std::uint64_t gcPauseCapped_ = 0;
+    std::int64_t nestCredit_ = 0;          // 这个入口已经补上的嵌套入口时间（QPC 计数）
+    std::int64_t nestMax_ = 0;             // 这个入口里最长的一次嵌套入口（QPC 计数）
+    std::uint64_t nestCredits_ = 0;
+    std::int64_t nestCreditedTotal_ = 0;
+    std::uint64_t nestCapped_ = 0;
 
     int depth_ = 0;
     int protected_ = 0;  // 正在进行的 ProtectedOn

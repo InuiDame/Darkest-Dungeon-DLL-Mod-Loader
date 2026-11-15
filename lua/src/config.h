@@ -14,12 +14,24 @@ struct Config {
     std::uint32_t budgetMs = 50;        // budget_ms：每次从 C++ 进入 Lua（回调、定时器、协程恢复）的执行预算
     std::uint32_t loadBudgetMs = 500;   // load_budget_ms：执行 main.lua（含其中的 require）的预算
     std::uint32_t maxFailures = 3;      // max_failures：订阅、定时器的回调连续出错这么多次后停用（超预算立即停用）
-    std::uint32_t maxPerMod = 1000;     // max_per_mod：每个 Mod 的订阅（含 wait_event）、定时器、协程各自的上限
+    std::uint32_t maxPerMod = 1000;     // max_per_mod：每个 Mod 的订阅（含 wait_event、规则）、定时器、协程、脚本 Buff 的状态条数各自的上限
     std::uint32_t frameBudgetMs = 20;   // frame_budget_ms：一帧里调度器工作（重载、定时器、协程恢复）的总时间，超出的顺延到下一帧
     std::uint32_t logLinesPerSec = 200; // log_lines_per_sec：每个 Mod 每秒最多写这么多行日志（print、warn、dd.log，以及 DDLua
                                         // 替这个 Mod 写的错误、失败原因等），超出的丢弃
     std::uint32_t logMaxMb = 32;        // log_max_mb：一个会话（一次进存档）里和 Mod 有关的日志总量上限，超出后不再写入
     std::uint32_t teardownBudgetMs = 200;  // teardown_budget_ms：一次拆除或重载里关闭协程（<close>）的总时间，超出后剩下的协程直接丢弃
+    // rule_budget_ms：dd.buff.rule 的回调每次的预算。规则在游戏遍历 buff 表时判定，一帧可能几十次，回调应该只读几个字段、
+    // 查一张表（微秒级）；2 毫秒足够这类工作，又能让死循环最多卡 2 毫秒（加上检查点的间隔）就被打断、停用
+    std::uint32_t ruleBudgetMs = 2;
+    // combat_frame_ms：每个 Mod 每帧的 combat 回调（规则、脚本 Buff 的 on_apply/on_remove/on_tick/on_damage、写操作的 done）
+    // 总时间上限。规则按判定次数调用、脚本 Buff 按载体条数调用，单次预算管不住总量；超出后这一帧余下的规则交还游戏原来的判定、
+    // 脚本 Buff 的回调跳过，写 WARN（C-Y7）。10 毫秒：60 帧时一帧的六成，正常的 Mod 每帧用不到 1 毫秒
+    std::uint32_t combatFrameMs = 10;
+    std::uint32_t dataMaxMb = 16;       // data_max_mb：每个 Mod 的数据目录（dd.fs.write）总大小上限
+    std::uint32_t dataMaxFiles = 256;   // data_max_files：每个 Mod 的数据目录里的条目数上限（文件和目录都算，C-Y1）
+    // store_max_kb：每个 Mod 每次随存档写出的数据（dd.store 加脚本 Buff 的状态）的上限。走廊几乎每步、战斗每回合都存档，
+    // 写出的数据要小；超出时这次不写、写 ERROR 日志，旁路保留上一次写的（下次读档多半不一致）。最大 1024（state_json 的上限）
+    std::uint32_t storeMaxKb = 256;
     bool devMode = false;               // dev_mode：开发模式（dd.reload、文件监视）
     std::vector<std::string> devGlobalDirs;  // dev_global_dirs：开发用全局加载的 Mod 目录，分号分隔，ASSETS_READY 时加载
 };

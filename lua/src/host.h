@@ -17,6 +17,8 @@ struct Host {
     const DDLifecycleService* lifecycle = nullptr;
     const DDEventsService* events = nullptr;        // P3b
     const DDTaskService* task = nullptr;            // P3b
+    const DDCombatService* combat = nullptr;        // P4b：dd.buff、dd.effect、actor 的 buff 方法；没有时这些 API 返回「不可用」
+    const DDPersistService* persist = nullptr;      // P4c1：dd.store 和脚本 Buff 状态随存档保存；没有时 dd.store 只在内存里
 
     void Log(int level, std::string_view text) const
     {

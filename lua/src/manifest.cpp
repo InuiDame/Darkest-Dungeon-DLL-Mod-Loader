@@ -138,12 +138,32 @@ LoadOrder ResolveLoadOrder(const std::vector<Manifest>& mods, std::int64_t apiVe
     };
 
     std::unordered_map<std::string, std::vector<std::size_t>> byId;
+    // 只差大小写的 id 也算重复：Mod id 是数据目录 data\<id> 和存档旁路 DDLua\<id>.ddsave 的名字，NTFS 上是同一个文件（审核 B-S5、C-Y2）
+    std::unordered_map<std::string, std::vector<std::size_t>> byFolded;
+    const auto fold = [](std::string id) {
+        for (char& ch : id) {
+            if (ch >= 'A' && ch <= 'Z') {
+                ch = static_cast<char>(ch - 'A' + 'a');
+            }
+        }
+        return id;
+    };
     for (std::size_t i = 0; i < n; ++i) {
         byId[mods[i].id].push_back(i);
+        byFolded[fold(mods[i].id)].push_back(i);
     }
     for (std::size_t i = 0; i < n; ++i) {
         const auto& same = byId[mods[i].id];
-        if (same.size() > 1) {
+        const auto& folded = byFolded[fold(mods[i].id)];
+        if (same.size() == 1 && folded.size() > 1) {
+            std::string others;
+            for (const auto j : folded) {
+                if (j != i) {
+                    others += (others.empty() ? "" : "、") + mods[j].id;
+                }
+            }
+            reject(i, "id " + mods[i].id + " 和启用列表里的 " + others + " 只差大小写（数据目录、存档旁路是同一个文件），全部不加载");
+        } else if (same.size() > 1) {
             std::string others;
             for (const auto j : same) {
                 if (j != i) {

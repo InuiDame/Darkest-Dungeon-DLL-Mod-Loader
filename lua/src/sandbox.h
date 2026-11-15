@@ -28,8 +28,15 @@ class Vm;
 Session& SessionOf(lua_State* L);
 // 闭包的第 1 个上值是 Mod 的 token。Mod 已经拆除时报错（别的 Mod 可能还拿着它的函数）
 Mod& CheckMod(lua_State* L);
-// 同上，Mod 正在拆除（清理项、协程的 <close> 运行期间）时也报错：注册订阅、定时器、协程的函数用它
+// 同上，Mod 正在拆除（清理项、协程的 <close> 运行期间）时也报错：注册订阅、定时器、协程的函数用它。
+// P4b：规则回调（dd.buff.rule）里也报错（规则回调只读）
 Mod& CheckLiveMod(lua_State* L, const char* what);
+
+// P4b：调用可能同步回到 Lua 的 SDK 函数（立即执行的写操作、读 actor 字段）之后调用。嵌套的回调里发生了原生异常时，
+// DDCore 的隔离只把栈展开到派发处，当前这个 C 函数所在的 lua_State 已经乱了（调用信息、errorJmp 停在异常发生时），
+// 不能再回到 Lua：抛一个 SEH 异常（kReentryAbandoned），把外层入口也交给它自己的隔离（DDCore 的事件隔离、DDLua 的 RunMarked）
+constexpr unsigned long kReentryAbandoned = 0xE0444C52;
+void AfterReentry(lua_State* L);
 // 已超预算时重新抛出预算错误（捕获 Lua 错误的 C 函数用）
 void RethrowIfBudget(lua_State* L);
 // 撤销订阅、定时器、协程（:off、dd.off、:cancel）只能由所属 Mod 自己的代码进行：现在代表执行的 Mod

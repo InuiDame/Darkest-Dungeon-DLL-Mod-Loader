@@ -1,15 +1,15 @@
 ---@meta dd_topics
 -- 本文件由 tools/gen_lua_types.py 从 sdk/lua/topics.json 生成，不要手改。
--- 主题表：DDCore 1.0.0，Darkest.exe SHA1 9db2d73b89aa034e2055df65a139403e18df641f（Steam 版），主题 146 个。
+-- 主题表：DDCore 1.0.0，Darkest.exe SHA1 9db2d73b89aa034e2055df65a139403e18df641f（Steam 版），主题 151 个。
 -- 离线版缺特征码时部分主题不可用，dd.on 返回 nil 和原因；运行时以 dd.on 的返回值为准。
 
 ---主题名。native 插件自定义的主题也可以订阅，所以参数类型是 dd.Topic|string。
 ---@alias dd.Topic
 ---| "damage.pre" # 伤害结算前（Hero/Monster 受到伤害）。可写 damage，可取消：取消后伤害按 0 结算，不扣血、不进死门
 ---| "damage.post" # 伤害结算后。damage 是实际传给游戏的伤害（被取消时为 0），hp_after 是结算后的生命
----| "effect.pre" # Effect 应用到一个目标之前。可取消：跳过这一个目标。performer、target 是实际生效的双方
+---| "effect.pre" # Effect 应用到一个目标之前。可取消：跳过这一个目标。performer、target 是实际生效的双方，effect 是 effect 句柄。dd.effect.register 建在它上面
 ---| "effect.post" # Effect 应用到一个目标之后
----| "skill.pre" # 技能执行前。skill、target 可写但都是指针，Lua 不能写；Lua 只能读
+---| "skill.pre" # 技能执行前（游戏分派之后），只读。skill 是技能句柄（dd.Skill）
 ---| "skill.post" # 技能执行后
 ---| "hit.pre" # 命中结算前。可写 hit（false 走未命中路径）、crit、damage
 ---| "hit.post" # 命中结算后，hit、crit、damage 是最终值
@@ -21,6 +21,7 @@
 ---| "stress.post" # 压力变化后。amount 是传给游戏的值，applied 是游戏返回的实际变化
 ---| "heal.pre" # 治疗前。可写 amount
 ---| "heal.post" # 治疗后。amount 是传给游戏的值，applied 是实际治疗量
+---| "damage.final" # 最终伤害（护体、格挡之后，扣血之前），每次命中一次。可写 absorb（0 到 damage）：全部吸收按格挡处理，部分吸收补回生命；PvP 中不派发
 ---| "app.tick" # 每帧一次（帧边界）
 ---| "app.state" # 游戏状态机切换（from/to 是状态号，*_name 是状态名）
 ---| "campaign.load" # 进入存档后。Lua Mod 在 main.lua 里订阅能收到这一次
@@ -151,6 +152,10 @@
 ---| "query.ProvisionSupplyBuffQuery" # 游戏询问 ProvisionSupplyBuffQuery：可写结果字段，不能取消
 ---| "query.ProvisionIsItemTooltipsEnabledQuery" # 游戏询问 ProvisionIsItemTooltipsEnabledQuery：可写结果字段，不能取消
 ---| "query.FindNonRosterHeroesQuery" # 游戏询问 FindNonRosterHeroesQuery：可写结果字段，不能取消
+---| "buff.add" # buff 条目追加进表之后（游戏的添加、叠灼烧、怪物同伴、combat 服务的添加）。读档恢复的不派发，只在存档里派发。Lua Mod 加的条目 plugin 是 DDLua、tag 是 <mod id>:<tag>
+---| "buff.remove" # buff 条目删除之前，字段是删除前的值。reason 是删除原因（expired、plugin、refresh、town_visit 等）
+---| "buff.tick" # 持续时间结算之后，每条 duration 变了且还在表里的条目一次；减到 0 被删的只有 buff.remove（expired）
+---| "campaign.save" # 游戏在当前存档位上写完一组存档文件（城镇的名册或庄园、城镇文件，地牢的一次探索存档）之后的帧边界，只读。回调都返回之后 DDLua 才取 dd.store 和脚本 Buff 状态的快照写进存档旁路
 
 -- ---- damage.pre
 ---伤害结算前（Hero/Monster 受到伤害）。可写 damage，可取消：取消后伤害按 0 结算，不扣血、不进死门
@@ -219,17 +224,18 @@
 ---@field filter? dd.filter.damage.post
 
 -- ---- effect.pre
----Effect 应用到一个目标之前。可取消：跳过这一个目标。performer、target 是实际生效的双方
+---Effect 应用到一个目标之前。可取消：跳过这一个目标。performer、target 是实际生效的双方，effect 是 effect 句柄。dd.effect.register 建在它上面
 ---@class dd.fields.effect.pre
 ---@field performer dd.Actor? Hero/Monster 转成 actor 句柄，其他指针和延迟事件为 nil
 ---@field target dd.Actor? Hero/Monster 转成 actor 句柄，其他指针和延迟事件为 nil
----@field effect nil 游戏指针，Lua 里恒为 nil
+---@field effect dd.Effect? effect 句柄（按 effect_name），延迟事件为 nil
 ---@field item nil 游戏指针，Lua 里恒为 nil
 ---@field source integer
 ---@field stress_amount number
 ---@field heal_amount number
 ---@field target_stress number
 ---@field target_hp number
+---@field effect_name string
 ---effect.pre 的事件负载，只在回调执行期间有效
 ---@class dd.ev.effect.pre : dd.Event, dd.fields.effect.pre
 ---effect.pre 的 dd.wait_event 快照
@@ -245,6 +251,7 @@
 ---@field heal_amount? number
 ---@field target_stress? number
 ---@field target_hp? number
+---@field effect_name? string
 ---@class dd.opts.effect.pre : dd.OnOptions
 ---@field filter? dd.filter.effect.pre
 
@@ -253,13 +260,14 @@
 ---@class dd.fields.effect.post
 ---@field performer dd.Actor? Hero/Monster 转成 actor 句柄，其他指针和延迟事件为 nil
 ---@field target dd.Actor? Hero/Monster 转成 actor 句柄，其他指针和延迟事件为 nil
----@field effect nil 游戏指针，Lua 里恒为 nil
+---@field effect dd.Effect? effect 句柄（按 effect_name），延迟事件为 nil
 ---@field item nil 游戏指针，Lua 里恒为 nil
 ---@field source integer
 ---@field stress_amount number
 ---@field heal_amount number
 ---@field target_stress number
 ---@field target_hp number
+---@field effect_name string
 ---@field target_stress_after number
 ---@field target_hp_after number
 ---@field cancelled boolean
@@ -278,6 +286,7 @@
 ---@field heal_amount? number
 ---@field target_stress? number
 ---@field target_hp? number
+---@field effect_name? string
 ---@field target_stress_after? number
 ---@field target_hp_after? number
 ---@field cancelled? boolean
@@ -285,11 +294,11 @@
 ---@field filter? dd.filter.effect.post
 
 -- ---- skill.pre
----技能执行前。skill、target 可写但都是指针，Lua 不能写；Lua 只能读
+---技能执行前（游戏分派之后），只读。skill 是技能句柄（dd.Skill）
 ---@class dd.fields.skill.pre
 ---@field performer dd.Actor? Hero/Monster 转成 actor 句柄，其他指针和延迟事件为 nil
----@field skill nil 游戏指针，Lua 里恒为 nil，SDK 可写，Lua 不能写
----@field target dd.Actor? Hero/Monster 转成 actor 句柄，其他指针和延迟事件为 nil，SDK 可写，Lua 不能写
+---@field skill dd.Skill? 技能句柄（combat.skill_from_pointer），不在执行者职业的技能表里时为 nil
+---@field target dd.Actor? Hero/Monster 转成 actor 句柄，其他指针和延迟事件为 nil
 ---@field target_count integer
 ---@field friendly boolean
 ---skill.pre 的事件负载，只在回调执行期间有效
@@ -310,7 +319,7 @@
 ---技能执行后
 ---@class dd.fields.skill.post
 ---@field performer dd.Actor? Hero/Monster 转成 actor 句柄，其他指针和延迟事件为 nil
----@field skill nil 游戏指针，Lua 里恒为 nil
+---@field skill dd.Skill? 技能句柄（combat.skill_from_pointer），不在执行者职业的技能表里时为 nil
 ---@field target dd.Actor? Hero/Monster 转成 actor 句柄，其他指针和延迟事件为 nil
 ---@field target_count integer
 ---@field friendly boolean
@@ -537,6 +546,36 @@
 ---@field hp_after? number
 ---@class dd.opts.heal.post : dd.OnOptions
 ---@field filter? dd.filter.heal.post
+
+-- ---- damage.final
+---最终伤害（护体、格挡之后，扣血之前），每次命中一次。可写 absorb（0 到 damage）：全部吸收按格挡处理，部分吸收补回生命；PvP 中不派发
+---@class dd.fields.damage.final
+---@field target dd.Actor? Hero/Monster 转成 actor 句柄，其他指针和延迟事件为 nil
+---@field attacker dd.Actor? Hero/Monster 转成 actor 句柄，其他指针和延迟事件为 nil
+---@field damage number
+---@field damage_type integer
+---@field blocked boolean
+---@field deaths_door boolean
+---@field hp_before number
+---@field is_hero boolean
+---@field absorb number 可写
+---damage.final 的事件负载，只在回调执行期间有效
+---@class dd.ev.damage.final : dd.Event, dd.fields.damage.final
+---damage.final 的 dd.wait_event 快照
+---@class dd.snap.damage.final : dd.Snapshot, dd.fields.damage.final
+---damage.final 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.damage.final
+---@field target? dd.Actor
+---@field attacker? dd.Actor
+---@field damage? number
+---@field damage_type? integer
+---@field blocked? boolean
+---@field deaths_door? boolean
+---@field hp_before? number
+---@field is_hero? boolean
+---@field absorb? number
+---@class dd.opts.damage.final : dd.OnOptions
+---@field filter? dd.filter.damage.final
 
 -- ---- app.tick
 ---每帧一次（帧边界）
@@ -2732,6 +2771,156 @@
 ---@class dd.opts.query.FindNonRosterHeroesQuery : dd.OnOptions
 ---@field filter? dd.filter.query.FindNonRosterHeroesQuery
 
+-- ---- buff.add
+---buff 条目追加进表之后（游戏的添加、叠灼烧、怪物同伴、combat 服务的添加）。读档恢复的不派发，只在存档里派发。Lua Mod 加的条目 plugin 是 DDLua、tag 是 <mod id>:<tag>
+---@class dd.fields.buff.add
+---@field actor dd.Actor? actor 句柄；延迟事件按 actor_kind、actor_id 找回句柄
+---@field actor_kind integer
+---@field actor_id integer
+---@field guid integer
+---@field id string
+---@field stat_type integer
+---@field amount number
+---@field duration integer
+---@field duration_type integer
+---@field source integer
+---@field sourcedata integer
+---@field rule_type integer
+---@field plugin string
+---@field tag string
+---buff.add 的事件负载，只在回调执行期间有效
+---@class dd.ev.buff.add : dd.Event, dd.fields.buff.add
+---buff.add 的 dd.wait_event 快照
+---@class dd.snap.buff.add : dd.Snapshot, dd.fields.buff.add
+---buff.add 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.buff.add
+---@field actor? dd.Actor
+---@field actor_kind? integer
+---@field actor_id? integer
+---@field guid? integer
+---@field id? string
+---@field stat_type? integer
+---@field amount? number
+---@field duration? integer
+---@field duration_type? integer
+---@field source? integer
+---@field sourcedata? integer
+---@field rule_type? integer
+---@field plugin? string
+---@field tag? string
+---@class dd.opts.buff.add : dd.OnOptions
+---@field filter? dd.filter.buff.add
+
+-- ---- buff.remove
+---buff 条目删除之前，字段是删除前的值。reason 是删除原因（expired、plugin、refresh、town_visit 等）
+---@class dd.fields.buff.remove
+---@field actor dd.Actor? actor 句柄；延迟事件按 actor_kind、actor_id 找回句柄
+---@field actor_kind integer
+---@field actor_id integer
+---@field guid integer
+---@field id string
+---@field stat_type integer
+---@field amount number
+---@field duration integer
+---@field duration_type integer
+---@field source integer
+---@field sourcedata integer
+---@field rule_type integer
+---@field plugin string
+---@field tag string
+---@field reason string
+---buff.remove 的事件负载，只在回调执行期间有效
+---@class dd.ev.buff.remove : dd.Event, dd.fields.buff.remove
+---buff.remove 的 dd.wait_event 快照
+---@class dd.snap.buff.remove : dd.Snapshot, dd.fields.buff.remove
+---buff.remove 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.buff.remove
+---@field actor? dd.Actor
+---@field actor_kind? integer
+---@field actor_id? integer
+---@field guid? integer
+---@field id? string
+---@field stat_type? integer
+---@field amount? number
+---@field duration? integer
+---@field duration_type? integer
+---@field source? integer
+---@field sourcedata? integer
+---@field rule_type? integer
+---@field plugin? string
+---@field tag? string
+---@field reason? string
+---@class dd.opts.buff.remove : dd.OnOptions
+---@field filter? dd.filter.buff.remove
+
+-- ---- buff.tick
+---持续时间结算之后，每条 duration 变了且还在表里的条目一次；减到 0 被删的只有 buff.remove（expired）
+---@class dd.fields.buff.tick
+---@field actor dd.Actor? actor 句柄；延迟事件按 actor_kind、actor_id 找回句柄
+---@field actor_kind integer
+---@field actor_id integer
+---@field guid integer
+---@field id string
+---@field stat_type integer
+---@field amount number
+---@field duration integer
+---@field duration_type integer
+---@field source integer
+---@field sourcedata integer
+---@field rule_type integer
+---@field plugin string
+---@field tag string
+---@field duration_before integer
+---@field duration_after integer
+---buff.tick 的事件负载，只在回调执行期间有效
+---@class dd.ev.buff.tick : dd.Event, dd.fields.buff.tick
+---buff.tick 的 dd.wait_event 快照
+---@class dd.snap.buff.tick : dd.Snapshot, dd.fields.buff.tick
+---buff.tick 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.buff.tick
+---@field actor? dd.Actor
+---@field actor_kind? integer
+---@field actor_id? integer
+---@field guid? integer
+---@field id? string
+---@field stat_type? integer
+---@field amount? number
+---@field duration? integer
+---@field duration_type? integer
+---@field source? integer
+---@field sourcedata? integer
+---@field rule_type? integer
+---@field plugin? string
+---@field tag? string
+---@field duration_before? integer
+---@field duration_after? integer
+---@class dd.opts.buff.tick : dd.OnOptions
+---@field filter? dd.filter.buff.tick
+
+-- ---- campaign.save
+---游戏在当前存档位上写完一组存档文件（城镇的名册或庄园、城镇文件，地牢的一次探索存档）之后的帧边界，只读。回调都返回之后 DDLua 才取 dd.store 和脚本 Buff 状态的快照写进存档旁路
+---@class dd.fields.campaign.save
+---@field files string
+---@field in_raid boolean
+---@field in_battle boolean
+---@field main_thread boolean
+---@field serial integer
+---@field index integer
+---campaign.save 的事件负载，只在回调执行期间有效
+---@class dd.ev.campaign.save : dd.Event, dd.fields.campaign.save
+---campaign.save 的 dd.wait_event 快照
+---@class dd.snap.campaign.save : dd.Snapshot, dd.fields.campaign.save
+---campaign.save 的 filter：字段等值比较，指针字段用 actor 句柄
+---@class dd.filter.campaign.save
+---@field files? string
+---@field in_raid? boolean
+---@field in_battle? boolean
+---@field main_thread? boolean
+---@field serial? integer
+---@field index? integer
+---@class dd.opts.campaign.save : dd.OnOptions
+---@field filter? dd.filter.campaign.save
+
 ---订阅主题，回调在主线程执行，每次调用有执行预算。主题不存在或不可用、actor 作用域的句柄已失效时
 ---返回 nil 和原因（并写日志）；参数或选项写错直接报错。订阅从下一次派发开始生效。
 ---回调出错写日志（带 traceback），连续出错 3 次（DDLua.cfg 的 max_failures）或超出执行预算时停用。
@@ -2756,6 +2945,7 @@
 ---@overload fun(topic: "stress.post", fn: fun(ev: dd.ev.stress.post), opts?: dd.opts.stress.post): dd.Subscription?, string?
 ---@overload fun(topic: "heal.pre", fn: fun(ev: dd.ev.heal.pre), opts?: dd.opts.heal.pre): dd.Subscription?, string?
 ---@overload fun(topic: "heal.post", fn: fun(ev: dd.ev.heal.post), opts?: dd.opts.heal.post): dd.Subscription?, string?
+---@overload fun(topic: "damage.final", fn: fun(ev: dd.ev.damage.final), opts?: dd.opts.damage.final): dd.Subscription?, string?
 ---@overload fun(topic: "app.tick", fn: fun(ev: dd.ev.app.tick), opts?: dd.opts.app.tick): dd.Subscription?, string?
 ---@overload fun(topic: "app.state", fn: fun(ev: dd.ev.app.state), opts?: dd.opts.app.state): dd.Subscription?, string?
 ---@overload fun(topic: "campaign.load", fn: fun(ev: dd.ev.campaign.load), opts?: dd.opts.campaign.load): dd.Subscription?, string?
@@ -2886,6 +3076,10 @@
 ---@overload fun(topic: "query.ProvisionSupplyBuffQuery", fn: fun(ev: dd.ev.query.ProvisionSupplyBuffQuery), opts?: dd.opts.query.ProvisionSupplyBuffQuery): dd.Subscription?, string?
 ---@overload fun(topic: "query.ProvisionIsItemTooltipsEnabledQuery", fn: fun(ev: dd.ev.query.ProvisionIsItemTooltipsEnabledQuery), opts?: dd.opts.query.ProvisionIsItemTooltipsEnabledQuery): dd.Subscription?, string?
 ---@overload fun(topic: "query.FindNonRosterHeroesQuery", fn: fun(ev: dd.ev.query.FindNonRosterHeroesQuery), opts?: dd.opts.query.FindNonRosterHeroesQuery): dd.Subscription?, string?
+---@overload fun(topic: "buff.add", fn: fun(ev: dd.ev.buff.add), opts?: dd.opts.buff.add): dd.Subscription?, string?
+---@overload fun(topic: "buff.remove", fn: fun(ev: dd.ev.buff.remove), opts?: dd.opts.buff.remove): dd.Subscription?, string?
+---@overload fun(topic: "buff.tick", fn: fun(ev: dd.ev.buff.tick), opts?: dd.opts.buff.tick): dd.Subscription?, string?
+---@overload fun(topic: "campaign.save", fn: fun(ev: dd.ev.campaign.save), opts?: dd.opts.campaign.save): dd.Subscription?, string?
 function dd.on(topic, fn, opts) end
 
 ---和 dd.on 相同，回调调用一次后自动撤销（在调用回调之前撤销）。
@@ -2910,6 +3104,7 @@ function dd.on(topic, fn, opts) end
 ---@overload fun(topic: "stress.post", fn: fun(ev: dd.ev.stress.post), opts?: dd.opts.stress.post): dd.Subscription?, string?
 ---@overload fun(topic: "heal.pre", fn: fun(ev: dd.ev.heal.pre), opts?: dd.opts.heal.pre): dd.Subscription?, string?
 ---@overload fun(topic: "heal.post", fn: fun(ev: dd.ev.heal.post), opts?: dd.opts.heal.post): dd.Subscription?, string?
+---@overload fun(topic: "damage.final", fn: fun(ev: dd.ev.damage.final), opts?: dd.opts.damage.final): dd.Subscription?, string?
 ---@overload fun(topic: "app.tick", fn: fun(ev: dd.ev.app.tick), opts?: dd.opts.app.tick): dd.Subscription?, string?
 ---@overload fun(topic: "app.state", fn: fun(ev: dd.ev.app.state), opts?: dd.opts.app.state): dd.Subscription?, string?
 ---@overload fun(topic: "campaign.load", fn: fun(ev: dd.ev.campaign.load), opts?: dd.opts.campaign.load): dd.Subscription?, string?
@@ -3040,6 +3235,10 @@ function dd.on(topic, fn, opts) end
 ---@overload fun(topic: "query.ProvisionSupplyBuffQuery", fn: fun(ev: dd.ev.query.ProvisionSupplyBuffQuery), opts?: dd.opts.query.ProvisionSupplyBuffQuery): dd.Subscription?, string?
 ---@overload fun(topic: "query.ProvisionIsItemTooltipsEnabledQuery", fn: fun(ev: dd.ev.query.ProvisionIsItemTooltipsEnabledQuery), opts?: dd.opts.query.ProvisionIsItemTooltipsEnabledQuery): dd.Subscription?, string?
 ---@overload fun(topic: "query.FindNonRosterHeroesQuery", fn: fun(ev: dd.ev.query.FindNonRosterHeroesQuery), opts?: dd.opts.query.FindNonRosterHeroesQuery): dd.Subscription?, string?
+---@overload fun(topic: "buff.add", fn: fun(ev: dd.ev.buff.add), opts?: dd.opts.buff.add): dd.Subscription?, string?
+---@overload fun(topic: "buff.remove", fn: fun(ev: dd.ev.buff.remove), opts?: dd.opts.buff.remove): dd.Subscription?, string?
+---@overload fun(topic: "buff.tick", fn: fun(ev: dd.ev.buff.tick), opts?: dd.opts.buff.tick): dd.Subscription?, string?
+---@overload fun(topic: "campaign.save", fn: fun(ev: dd.ev.campaign.save), opts?: dd.opts.campaign.save): dd.Subscription?, string?
 function dd.once(topic, fn, opts) end
 
 ---挂起当前协程，等下一次匹配 filter 的事件，下一帧把字段快照交给协程（不是活的负载，改 .pre 要用 dd.on）。
@@ -3066,6 +3265,7 @@ function dd.once(topic, fn, opts) end
 ---@overload async fun(topic: "stress.post", filter?: dd.filter.stress.post, timeout?: number): dd.snap.stress.post?, string?
 ---@overload async fun(topic: "heal.pre", filter?: dd.filter.heal.pre, timeout?: number): dd.snap.heal.pre?, string?
 ---@overload async fun(topic: "heal.post", filter?: dd.filter.heal.post, timeout?: number): dd.snap.heal.post?, string?
+---@overload async fun(topic: "damage.final", filter?: dd.filter.damage.final, timeout?: number): dd.snap.damage.final?, string?
 ---@overload async fun(topic: "app.tick", filter?: dd.filter.app.tick, timeout?: number): dd.snap.app.tick?, string?
 ---@overload async fun(topic: "app.state", filter?: dd.filter.app.state, timeout?: number): dd.snap.app.state?, string?
 ---@overload async fun(topic: "campaign.load", filter?: dd.filter.campaign.load, timeout?: number): dd.snap.campaign.load?, string?
@@ -3196,4 +3396,8 @@ function dd.once(topic, fn, opts) end
 ---@overload async fun(topic: "query.ProvisionSupplyBuffQuery", filter?: dd.filter.query.ProvisionSupplyBuffQuery, timeout?: number): dd.snap.query.ProvisionSupplyBuffQuery?, string?
 ---@overload async fun(topic: "query.ProvisionIsItemTooltipsEnabledQuery", filter?: dd.filter.query.ProvisionIsItemTooltipsEnabledQuery, timeout?: number): dd.snap.query.ProvisionIsItemTooltipsEnabledQuery?, string?
 ---@overload async fun(topic: "query.FindNonRosterHeroesQuery", filter?: dd.filter.query.FindNonRosterHeroesQuery, timeout?: number): dd.snap.query.FindNonRosterHeroesQuery?, string?
+---@overload async fun(topic: "buff.add", filter?: dd.filter.buff.add, timeout?: number): dd.snap.buff.add?, string?
+---@overload async fun(topic: "buff.remove", filter?: dd.filter.buff.remove, timeout?: number): dd.snap.buff.remove?, string?
+---@overload async fun(topic: "buff.tick", filter?: dd.filter.buff.tick, timeout?: number): dd.snap.buff.tick?, string?
+---@overload async fun(topic: "campaign.save", filter?: dd.filter.campaign.save, timeout?: number): dd.snap.campaign.save?, string?
 function dd.wait_event(topic, filter, timeout) end

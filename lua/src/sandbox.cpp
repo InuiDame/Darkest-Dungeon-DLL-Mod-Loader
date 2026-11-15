@@ -1,6 +1,12 @@
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+
 #include "sandbox.h"
 
 #include "actor.h"
+#include "combat.h"
 #include "events.h"
 #include "manifest.h"
 #include "scheduler.h"
@@ -43,7 +49,18 @@ Mod& CheckLiveMod(lua_State* L, const char* what)
     if (mod.tearingDown) {
         luaL_error(L, "%s：Mod %s 正在拆除，不能再注册", what, mod.id().c_str());
     }
+    if (SessionOf(L).InRule()) {
+        luaL_error(L, "%s：规则回调里只读，不能注册订阅、定时器、协程", what);
+    }
     return mod;
+}
+
+void AfterReentry(lua_State* L)
+{
+    Vm* vm = Vm::From(L);
+    if (vm && !vm->ok()) {
+        RaiseException(kReentryAbandoned, EXCEPTION_NONCONTINUABLE, 0, nullptr);
+    }
 }
 
 void RethrowIfBudget(lua_State* L)
@@ -439,18 +456,85 @@ int Require(lua_State* L)
 
 // ---- dd.fs ----
 
+// 选项 { root = "mod" | "data" }，返回是否是数据目录
+bool DataRoot(lua_State* L, int index, const char* what)
+{
+    if (lua_isnoneornil(L, index)) {
+        return false;
+    }
+    luaL_checktype(L, index, LUA_TTABLE);
+    bool data = false;
+    lua_pushnil(L);
+    while (lua_next(L, index)) {
+        const char* key = lua_type(L, -2) == LUA_TSTRING ? lua_tostring(L, -2) : nullptr;
+        if (!key || std::strcmp(key, "root") != 0) {
+            luaL_error(L, "%s 的选项只有 root", what);
+        }
+        const char* value = lua_type(L, -1) == LUA_TSTRING ? lua_tostring(L, -1) : nullptr;
+        if (value && std::strcmp(value, "data") == 0) {
+            data = true;
+        } else if (!value || std::strcmp(value, "mod") != 0) {
+            luaL_error(L, "%s 的 root 只能是 \"mod\"（Mod 目录，默认）或 \"data\"（数据目录）", what);
+        }
+        lua_pop(L, 1);
+    }
+    return data;
+}
+
+// 数据目录 <游戏根目录>\DDModLoader\data\<mod id>\（D10）。create 为真时（写入）不存在就逐级创建；为假时不存在返回空
+ModFs* DataFs(lua_State* L, Mod& mod, bool create, std::string* error)
+{
+    if (mod.dataFs.IsOpen()) {
+        return &mod.dataFs;
+    }
+    const Host& host = SessionOf(L).host();
+    if (!host.info || !host.info->game_root) {
+        *error = "数据目录不可用（没有 game_info 服务）";
+        return nullptr;
+    }
+    const std::string& id = mod.id();
+    if (id.find_first_not_of('.') == std::string::npos || id.back() == '.' || id.back() == ' ') {
+        *error = "Mod id 不能当目录名（只有点或以点结尾）";
+        return nullptr;
+    }
+    std::string root = std::string(host.info->game_root()) + "\\DDModLoader\\data\\" + id;
+    std::replace(root.begin(), root.end(), '/', '\\');  // \\?\ 前缀的路径不认 /
+    if (root.size() >= 2 && root[1] == ':') {
+        root = "\\\\?\\" + root;  // 按字面处理（不去掉结尾的点、空格）
+    }
+    if (create ? !mod.dataFs.OpenOrCreate(root, error) : !mod.dataFs.Open(root, error)) {
+        if (!create) {
+            *error = "数据目录还不存在（还没有写过文件）";
+        }
+        return nullptr;
+    }
+    return &mod.dataFs;
+}
+
+// dd.fs 的每次调用都要打开文件、逐级取最终路径，耗时和路径层数有关：按操作次数报告工作量，并在返回前检查截止时间
+// （C-B2：循环里反复调用时每轮只有几条指令，计数 hook 要很多轮才检查一次）。写盘本身不能中断
+constexpr long kFsOpWork = 4096;
+
+int FsDone(lua_State* L, std::uint32_t ops, std::size_t bytes, int results)
+{
+    luai_ddstep(L, static_cast<long>(ops) * kFsOpWork + static_cast<long>((std::min)(bytes, std::size_t(1) << 30) >> 4));
+    Vm::From(L)->CheckBudget(L);
+    return results;
+}
+
 int FsRead(lua_State* L)
 {
     Mod& mod = CheckMod(L);
     std::size_t length = 0;
     const char* path = luaL_checklstring(L, 1, &length);
     std::string error;
-    if (!mod.fs.PushFile(L, std::string_view(path, length), &error)) {
+    const ModFs* fs = DataRoot(L, 2, "dd.fs.read") ? DataFs(L, mod, false, &error) : &mod.fs;
+    if (!fs || !fs->PushFile(L, std::string_view(path, length), &error)) {
         lua_pushnil(L);
         lua_pushfstring(L, "%s：%s", path, error.c_str());
-        return 2;
+        return FsDone(L, 2, 0, 2);
     }
-    return 1;
+    return FsDone(L, 2, 0, 1);  // 读到的数据量 PushFile 已经报告
 }
 
 int FsExists(lua_State* L)
@@ -458,28 +542,128 @@ int FsExists(lua_State* L)
     Mod& mod = CheckMod(L);
     std::size_t length = 0;
     const char* path = luaL_checklstring(L, 1, &length);
-    lua_pushboolean(L, mod.fs.Exists(std::string_view(path, length)));
-    return 1;
+    std::string error;
+    const ModFs* fs = DataRoot(L, 2, "dd.fs.exists") ? DataFs(L, mod, false, &error) : &mod.fs;
+    lua_pushboolean(L, fs && fs->Exists(std::string_view(path, length)));
+    return FsDone(L, 2, 0, 1);
+}
+
+int FsWrite(lua_State* L)
+{
+    Mod& mod = CheckMod(L);
+    if (SessionOf(L).InRule()) {
+        return luaL_error(L, "dd.fs.write：规则回调里只读，不能写文件");
+    }
+    std::size_t pathLength = 0;
+    const char* path = luaL_checklstring(L, 1, &pathLength);
+    std::size_t length = 0;
+    const char* data = luaL_checklstring(L, 2, &length);
+    const std::string_view rel(path, pathLength);
+    std::string error;
+    ModFs* fs = DataFs(L, mod, true, &error);
+    if (!fs) {
+        // 数据目录建不出来时每次调用都重新逐级建目录再失败，同样计入预算（审核 R2A-N3）
+        lua_pushnil(L);
+        lua_pushfstring(L, "%s：%s", path, error.c_str());
+        return FsDone(L, 2, 0, 2);
+    }
+    const Config& config = SessionOf(L).config();
+    if (!mod.dataUsageKnown) {
+        // dataFiles 是条目数：文件和目录都算（C-Y1），本会话第一次写之前扫描一次
+        const bool complete = fs->Usage(&mod.dataBytes, &mod.dataFiles);
+        mod.dataUsageKnown = true;
+        luai_ddstep(L, static_cast<long>(mod.dataFiles) * 64);
+        if (!complete) {
+            SessionOf(L).Log(DD_LOG_WARN, &mod, "数据目录的条目超过 100000 个，扫描到此为止（新文件和目录都会因为超过 data_max_files 被拒绝）");
+        }
+    }
+    const std::int64_t old = fs->FileSize(rel);
+    const std::uint64_t maxBytes = static_cast<std::uint64_t>(config.dataMaxMb) * 1024 * 1024;
+    const std::uint64_t kept = mod.dataBytes - (std::min)(mod.dataBytes, static_cast<std::uint64_t>(old > 0 ? old : 0));
+    if (length > maxBytes || kept + length > maxBytes) {
+        lua_pushnil(L);
+        lua_pushfstring(L, "%s：数据目录的总大小会超过上限 %d MB（DDLua.cfg 的 data_max_mb）", path, static_cast<int>(config.dataMaxMb));
+        return FsDone(L, 2, 0, 2);
+    }
+    if (old == -1 && mod.dataFiles + 1 > config.dataMaxFiles) {
+        lua_pushnil(L);
+        lua_pushfstring(L, "%s：数据目录的条目数（文件和目录）会超过上限 %d 个（DDLua.cfg 的 data_max_files）", path,
+            static_cast<int>(config.dataMaxFiles));
+        return FsDone(L, 2, 0, 2);
+    }
+    // 新文件自己占一个条目，剩下的才能用来新建父目录
+    const std::uint64_t maxNewDirs = config.dataMaxFiles > mod.dataFiles + 1 ? config.dataMaxFiles - mod.dataFiles - 1 : 0;
+    std::int64_t replaced = -1;
+    std::uint32_t createdDirs = 0;
+    std::uint32_t ops = 0;
+    const bool wrote = fs->Write(rel, std::string_view(data, length), maxNewDirs, &replaced, &createdDirs, &ops, &error);
+    mod.dataFiles += createdDirs;  // 失败时已经建好的目录也留着
+    if (!wrote) {
+        lua_pushnil(L);
+        lua_pushfstring(L, "%s：%s", path, error.c_str());
+        return FsDone(L, ops + 2, 0, 2);
+    }
+    mod.dataBytes = mod.dataBytes - (std::min)(mod.dataBytes, static_cast<std::uint64_t>(replaced > 0 ? replaced : 0)) + length;
+    mod.dataFiles += replaced < 0 ? 1 : 0;
+    lua_pushboolean(L, 1);
+    return FsDone(L, ops + 2, length, 1);
+}
+
+int FsRemove(lua_State* L)
+{
+    Mod& mod = CheckMod(L);
+    if (SessionOf(L).InRule()) {
+        return luaL_error(L, "dd.fs.remove：规则回调里只读，不能删文件");
+    }
+    std::size_t length = 0;
+    const char* path = luaL_checklstring(L, 1, &length);
+    std::string error;
+    ModFs* fs = DataFs(L, mod, false, &error);
+    std::uint64_t removed = 0;
+    bool isDir = false;
+    if (!fs || !fs->Remove(std::string_view(path, length), &removed, &isDir, &error)) {
+        lua_pushnil(L);
+        lua_pushfstring(L, "%s：%s", path, error.c_str());
+        return FsDone(L, 2, 0, 2);
+    }
+    if (mod.dataUsageKnown) {
+        mod.dataBytes -= isDir ? 0 : (std::min)(mod.dataBytes, removed);
+        mod.dataFiles -= mod.dataFiles ? 1 : 0;
+    }
+    lua_pushboolean(L, 1);
+    return FsDone(L, 3, 0, 1);
 }
 
 int FsList(lua_State* L)
 {
     Mod& mod = CheckMod(L);
     std::size_t length = 0;
-    const char* path = luaL_optlstring(L, 1, "", &length);
+    int optsIndex = 2;
+    const char* path = "";
+    if (lua_type(L, 1) == LUA_TTABLE) {
+        optsIndex = 1;
+    } else {
+        path = luaL_optlstring(L, 1, "", &length);
+    }
+    const bool data = DataRoot(L, optsIndex, "dd.fs.list");
     std::vector<std::string> names;
     std::string error;
-    if (!mod.fs.List(std::string_view(path, length), names, &error)) {
+    const ModFs* fs = data ? DataFs(L, mod, false, &error) : &mod.fs;
+    if (!fs && data && length == 0) {
+        lua_newtable(L);  // 数据目录还不存在：根目录当作空
+        return 1;
+    }
+    if (!fs || !fs->List(std::string_view(path, length), names, &error)) {
         lua_pushnil(L);
         lua_pushfstring(L, "%s：%s", path, error.c_str());
-        return 2;
+        return FsDone(L, 2, 0, 2);
     }
     lua_createtable(L, static_cast<int>(names.size()), 0);
     for (std::size_t i = 0; i < names.size(); ++i) {
         lua_pushlstring(L, names[i].data(), names[i].size());
         lua_rawseti(L, -2, static_cast<lua_Integer>(i + 1));
     }
-    return 1;
+    return FsDone(L, 2 + static_cast<std::uint32_t>((std::min<std::size_t>)(names.size() / 16, 1u << 20)), 0, 1);
 }
 
 // ---- dd.import ----
@@ -595,7 +779,13 @@ int Stats(lua_State* L)
     Session& session = SessionOf(L);
     const auto events = session.events().CountFor(&mod);
     const auto sched = session.scheduler().CountFor(&mod);
-    lua_createtable(L, 0, 5);
+    lua_createtable(L, 0, 8);
+    lua_pushinteger(L, static_cast<lua_Integer>(session.combat().PendingFor(&mod)));
+    lua_setfield(L, -2, "pending");
+    lua_pushinteger(L, static_cast<lua_Integer>(session.combat().RulesFor(&mod)));
+    lua_setfield(L, -2, "rules");
+    lua_pushinteger(L, static_cast<lua_Integer>(session.combat().StatesFor(&mod)));
+    lua_setfield(L, -2, "states");
     lua_pushinteger(L, static_cast<lua_Integer>(events.subscriptions));
     lua_setfield(L, -2, "subscriptions");
     lua_pushinteger(L, static_cast<lua_Integer>(events.waiters));
@@ -607,6 +797,24 @@ int Stats(lua_State* L)
     lua_pushinteger(L, static_cast<lua_Integer>(mod.loads));
     lua_setfield(L, -2, "loads");
     return 1;
+}
+
+// dd.store_status()：旁路的读取结果 loaded / prev / empty / mismatch / unavailable；第二个返回值是原因（没有时为 nil），
+// 第三个是地牢里的存档还在等 raid 核对（探索存档读完后 DDCore 再确认一次，之前怪物的脚本 Buff 状态还没恢复）。
+// 等核对用第三个返回值判断，不要在原因里找「raid」：读到上一代时原因里本来就可能有 raid（审核 R2B 备注 6）
+int StoreStatus(lua_State* L)
+{
+    Mod& mod = CheckMod(L);
+    const Session::StoreInfo* info = SessionOf(L).StoreInfoOf(mod.id());
+    const std::string status = info ? info->status : "empty";
+    lua_pushlstring(L, status.data(), status.size());
+    if (info && !info->reason.empty()) {
+        lua_pushlstring(L, info->reason.data(), info->reason.size());
+    } else {
+        lua_pushnil(L);
+    }
+    lua_pushboolean(L, info && info->raidPending);
+    return 3;
 }
 
 // ---- 构建 ----
@@ -806,6 +1014,7 @@ void PushModEnv(lua_State* L, Session& session, Mod& mod)
     EventBinding::AddFunctions(L, dd, mod.token);
     Scheduler::AddFunctions(L, dd, mod.token);
     actor::AddFunctions(L, dd, mod.token);
+    CombatBinding::AddFunctions(L, dd, mod.token);
 
     // dd.state：按 Mod id 存在会话里，跨重载保留
     lua_rawgeti(L, LUA_REGISTRYINDEX, session.stateRef());
@@ -820,6 +1029,20 @@ void PushModEnv(lua_State* L, Session& session, Mod& mod)
     lua_setfield(L, dd, "state");
     lua_pop(L, 1);
 
+    // dd.store（P4c1）：按 Mod id 存在会话里，Load 时在 main.lua 之前从存档旁路读好，campaign.save 时写出
+    lua_rawgeti(L, LUA_REGISTRYINDEX, session.storeRef());
+    lua_pushstring(L, mod.id().c_str());
+    if (lua_rawget(L, -2) != LUA_TTABLE) {
+        lua_pop(L, 1);
+        lua_newtable(L);
+        lua_pushstring(L, mod.id().c_str());
+        lua_pushvalue(L, -2);
+        lua_rawset(L, -4);
+    }
+    lua_setfield(L, dd, "store");
+    lua_pop(L, 1);
+    SetClosure(L, dd, "store_status", StoreStatus, mod.token);
+
     lua_createtable(L, 0, 4);
     SetClosure(L, lua_gettop(L), "debug", LogFn<DD_LOG_DEBUG>, mod.token);
     SetClosure(L, lua_gettop(L), "info", LogFn<DD_LOG_INFO>, mod.token);
@@ -827,10 +1050,12 @@ void PushModEnv(lua_State* L, Session& session, Mod& mod)
     SetClosure(L, lua_gettop(L), "error", LogFn<DD_LOG_ERROR>, mod.token);
     lua_setfield(L, dd, "log");
 
-    lua_createtable(L, 0, 3);
+    lua_createtable(L, 0, 5);
     SetClosure(L, lua_gettop(L), "read", FsRead, mod.token);
     SetClosure(L, lua_gettop(L), "exists", FsExists, mod.token);
     SetClosure(L, lua_gettop(L), "list", FsList, mod.token);
+    SetClosure(L, lua_gettop(L), "write", FsWrite, mod.token);
+    SetClosure(L, lua_gettop(L), "remove", FsRemove, mod.token);
     lua_setfield(L, dd, "fs");
 
     lua_setfield(L, env, "dd");

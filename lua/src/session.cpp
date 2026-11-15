@@ -2,6 +2,7 @@
 
 #include "actor.h"
 #include "sandbox.h"
+#include "state_json.h"
 
 #include <lauxlib.h>
 
@@ -268,6 +269,333 @@ bool Session::CloseAllowed()
     return false;
 }
 
+// ---- P4c1：存档旁路 ----
+
+namespace {
+
+const char* StoreStatusName(std::uint32_t status)
+{
+    switch (status) {
+    case DD_PERSIST_LOADED:
+        return "loaded";
+    case DD_PERSIST_PREV:
+        return "prev";
+    case DD_PERSIST_EMPTY:
+        return "empty";
+    case DD_PERSIST_MISMATCH:
+        return "mismatch";
+    default:
+        return "unavailable";
+    }
+}
+
+const char* PersistResultText(std::uint32_t result)
+{
+    switch (result) {
+    case DD_PERSIST_E_INVALID:
+        return "参数无效";
+    case DD_PERSIST_E_NOT_DECLARED:
+        return "DDLua 没有声明持久化";
+    case DD_PERSIST_E_TIMING:
+        return "时机不对";
+    case DD_PERSIST_E_THREAD:
+        return "不在主线程";
+    case DD_PERSIST_E_NO_CAMPAIGN:
+        return "不在存档里";
+    case DD_PERSIST_E_UNAVAILABLE:
+        return "持久化不可用（观察 hook 没装上或特征码缺失）";
+    case DD_PERSIST_E_INCONSISTENT:
+        // DDCore 在 raid 二次核对不一致、或者第一次写之前归档原来的旁路失败时都这样返回（审核 R2B 备注 2），原因见 DDCore.log
+        return "DDCore 这次进存档不再写这个 Mod 的旁路（raid 二次核对不一致，或归档原来的旁路失败，原因见 DDCore.log）";
+    default:
+        return "未知错误";
+    }
+}
+
+std::string DescribeState(const store::BuffState& s)
+{
+    return s.buffId + "（" + (s.kind == DD_ACTOR_MONSTER ? "monster#" : "hero#") + std::to_string(s.id) + "，guid " + std::to_string(s.guid) + "）";
+}
+
+}  // namespace
+
+const Session::StoreInfo* Session::StoreInfoOf(std::string_view id) const
+{
+    const auto it = storeInfo_.find(std::string(id));
+    return it == storeInfo_.end() ? nullptr : &it->second;
+}
+
+void Session::LoadPersisted()
+{
+    for (Mod* mod : loadable_) {
+        StoreInfo& info = storeInfo_[mod->id()];
+        info = StoreInfo{};
+        if (!persistent_) {
+            info.reason = "开发会话的 dd.store 不随存档保存";
+            continue;
+        }
+        const DDPersistService* svc = host_.persist;
+        if (!svc) {
+            info.status = "unavailable";
+            info.reason = "DDCore 没有 persist 服务";
+            Log(DD_LOG_WARN, mod, "dd.store：" + info.reason + "，只在内存里");
+            continue;
+        }
+        DDPersistData data{};
+        data.size = sizeof(data);
+        const std::uint32_t result = svc->load(host_.plugin, mod->id().c_str(), &data);
+        if (result != DD_PERSIST_OK) {
+            info.status = "unavailable";
+            info.reason = std::string("persist.load 失败：") + PersistResultText(result);
+            Log(DD_LOG_WARN, mod, "dd.store：" + info.reason);
+            continue;
+        }
+        info.status = StoreStatusName(data.status);
+        info.reason = data.reason ? data.reason : "";
+        info.raidPending = data.raid_pending;
+        const bool haveData = data.status == DD_PERSIST_LOADED || data.status == DD_PERSIST_PREV;
+        std::size_t states = 0;
+        if (haveData) {
+            store::Payload payload;
+            std::string why;
+            const std::string_view bytes(static_cast<const char*>(data.data), data.data_size);
+            bool decoded = store::Decode(bytes, &payload, &why);
+            if (decoded && !payload.store.empty()) {
+                // dd.store 解码成表，放进总表（main.lua 里的 dd.store 就是它）
+                bool ok = false;
+                const bool ran = vm_->Protected(
+                    [&](lua_State* L) {
+                        lua_rawgeti(L, LUA_REGISTRYINDEX, storeRef_);
+                        lua_pushstring(L, mod->id().c_str());
+                        ok = state_json::Decode(L, payload.store, &why);
+                        if (ok) {
+                            lua_rawset(L, -3);
+                        } else {
+                            lua_pop(L, 1);
+                        }
+                        lua_pop(L, 1);
+                    },
+                    &why);
+                decoded = ran && ok;
+            }
+            if (!decoded) {
+                info.status = "mismatch";
+                info.reason = "旁路数据解析失败：" + why;
+                info.raidPending = false;
+                Log(DD_LOG_ERROR, mod, "dd.store：" + info.reason + "，dd.store 是空表");
+                continue;
+            }
+            for (auto& b : payload.buffs) {
+                if (b.kind == DD_ACTOR_MONSTER && !data.raid_pending) {
+                    Log(DD_LOG_INFO, mod, "脚本 Buff 状态丢弃：" + DescribeState(b) + "：旁路里有怪物的状态，但存档不在地牢里");
+                    continue;
+                }
+                pendingStates_.push_back({ mod->id(), std::move(b) });
+                ++states;
+            }
+        }
+        std::string text = "dd.store：" + info.status;
+        if (haveData) {
+            text += "（Mod 版本 " + std::string(data.version ? data.version : "") + "，写于 " + std::to_string(data.written_ms) + "，" +
+                std::to_string(data.data_size) + " 字节，脚本 Buff 状态 " + std::to_string(states) + " 条" + (data.from_backup ? "，读自 backup" : "") + "）";
+        }
+        if (!info.reason.empty()) {
+            text += "：" + info.reason;
+        }
+        Log(data.status == DD_PERSIST_MISMATCH || data.status == DD_PERSIST_UNAVAILABLE ? DD_LOG_WARN : DD_LOG_INFO, mod, text);
+    }
+}
+
+void Session::ImportStates(std::uint32_t kind, const std::string* onlyMod)
+{
+    if (!vm_ || !vm_->ok() || !combat_) {
+        return;
+    }
+    const DDGameService* game = actor::Service(host_);
+    std::size_t restored = 0, dropped = 0;
+    for (auto it = pendingStates_.begin(); it != pendingStates_.end();) {
+        if (it->state.kind != kind || (onlyMod && it->mod != *onlyMod)) {
+            ++it;
+            continue;
+        }
+        PendingState p = std::move(*it);
+        it = pendingStates_.erase(it);
+        Mod* mod = FindMod(p.mod);
+        std::string why;
+        DDActorRef ref{};
+        ref.size = sizeof(ref);
+        if (!mod || mod->state != ModState::Loaded) {
+            why = "Mod 没有加载成功";
+        } else if (kind == DD_ACTOR_HERO && p.state.roster != 0) {
+            why = "备用名册上的英雄不恢复";
+        } else if (!game || !game->actor_find(kind, p.state.id, &ref)) {
+            why = kind == DD_ACTOR_HERO ? "英雄不在名册里（解雇了？）" : "怪物不在当前战斗里";
+        } else {
+            CombatBinding::StateRecord record;
+            record.mod = p.mod;
+            record.buffId = p.state.buffId;
+            record.actor = ref;
+            record.guid = p.state.guid;
+            record.json = std::move(p.state.json);
+            if (combat_->ImportState(record, &why)) {
+                ++restored;
+                continue;
+            }
+        }
+        ++dropped;
+        const std::string text = "脚本 Buff 状态丢弃：" + DescribeState(p.state) + "：" + why;
+        mod ? Log(DD_LOG_INFO, mod, text) : LogId(DD_LOG_INFO, p.mod, text);
+    }
+    if (restored || dropped) {
+        Log(DD_LOG_INFO, nullptr, std::string("脚本 Buff 状态（") + (kind == DD_ACTOR_HERO ? "英雄" : "怪物") + "）：从旁路恢复 " + std::to_string(restored) +
+            " 条，丢弃 " + std::to_string(dropped) + " 条");
+    }
+}
+
+void Session::PersistVerify(const DDPersistVerify& verify)
+{
+    const std::string id = verify.key ? verify.key : "";
+    const auto it = storeInfo_.find(id);
+    if (it == storeInfo_.end()) {
+        return;
+    }
+    StoreInfo& info = it->second;
+    info.raidPending = false;
+    Mod* mod = FindMod(id);
+    if (verify.status == DD_PERSIST_MISMATCH) {
+        info.status = "mismatch";
+        info.reason = verify.reason ? verify.reason : "";
+        std::size_t dropped = 0;
+        for (auto p = pendingStates_.begin(); p != pendingStates_.end();) {
+            if (p->mod == id) {
+                p = pendingStates_.erase(p);
+                ++dropped;
+            } else {
+                ++p;
+            }
+        }
+        const std::string text = "dd.store：raid 核对不一致（" + info.reason + "），状态改成 mismatch；main.lua 已经读到的 dd.store 不收回，" +
+            "这次进存档不再写这个 Mod 的旁路（DDCore 保留原来的两代），等 raid 核对的怪物脚本 Buff 状态丢弃 " + std::to_string(dropped) + " 条";
+        mod ? Log(DD_LOG_WARN, mod, text) : LogId(DD_LOG_WARN, id, text);
+        return;
+    }
+    info.reason = verify.reason ? verify.reason : "";
+    const std::string text = "dd.store：raid 核对一致（" + info.status + "）";
+    mod ? Log(DD_LOG_INFO, mod, text) : LogId(DD_LOG_INFO, id, text);
+    ImportStates(DD_ACTOR_MONSTER, &id);
+}
+
+void Session::PushStore(lua_State* L, const Mod& mod)
+{
+    // Mod 把 dd.store 整个换成别的表时用新表（并记进总表，下次读档前一直用它）
+    if (mod.envRef != LUA_NOREF) {
+        lua_rawgeti(L, LUA_REGISTRYINDEX, mod.envRef);
+        lua_pushliteral(L, "dd");
+        if (lua_rawget(L, -2) == LUA_TTABLE) {
+            lua_pushliteral(L, "store");
+            if (lua_rawget(L, -2) == LUA_TTABLE) {
+                lua_rawgeti(L, LUA_REGISTRYINDEX, storeRef_);
+                lua_pushstring(L, mod.id().c_str());
+                lua_pushvalue(L, -3);
+                lua_rawset(L, -3);
+                lua_pop(L, 1);
+                lua_replace(L, -3);
+                lua_pop(L, 1);
+                return;
+            }
+            lua_pop(L, 1);
+        }
+        lua_pop(L, 2);
+    }
+    lua_rawgeti(L, LUA_REGISTRYINDEX, storeRef_);
+    lua_pushstring(L, mod.id().c_str());
+    if (lua_rawget(L, -2) != LUA_TTABLE) {
+        lua_pop(L, 1);
+        lua_newtable(L);
+    }
+    lua_replace(L, -2);
+}
+
+void Session::PersistSave(const DDPersistSaveInfo& info)
+{
+    if (!persistent_ || !host_.persist || !vm_ || !vm_->ok() || !combat_) {
+        return;
+    }
+    ++saveCount_;
+    // 编码时就按 store_max_kb 限制（审核 B-N6）：每个 Mod 的 dd.store 和脚本 Buff 状态编码到上限就停下，不先编码完很大的表再丢掉。
+    // 走廊每步、战斗每回合都存档，这一段在主线程上
+    const std::size_t limit = static_cast<std::size_t>(config_.storeMaxKb) * 1024;
+    const auto overText = [&] {
+        return "随存档写出的数据超过 store_max_kb（" + std::to_string(config_.storeMaxKb) + " KB），这次不写（旁路保留上一次写的，下次读档多半不一致）";
+    };
+    std::vector<std::string> errors, over;
+    auto records = combat_->ExportStates(&errors, limit, &over);
+    for (const auto& error : errors) {
+        Log(DD_LOG_ERROR, nullptr, "脚本 Buff 的状态不能保存，这一条这次跳过：" + error);
+    }
+    const DDGameService* game = actor::Service(host_);
+    std::string summary;
+    std::size_t written = 0;
+    for (Mod* mod : loadOrder_) {
+        if (mod->state != ModState::Loaded) {
+            continue;
+        }
+        if (std::find(over.begin(), over.end(), mod->id()) != over.end()) {
+            Log(DD_LOG_ERROR, mod, overText() + "：脚本 Buff 的状态就已经超过");
+            continue;
+        }
+        store::Payload payload;
+        std::string why;
+        bool encoded = false, tooLarge = false;
+        const bool ran = vm_->Protected(
+            [&](lua_State* L) {
+                PushStore(L, *mod);
+                encoded = state_json::Encode(L, -1, "dd.store", payload.store, &why, limit, &tooLarge);
+                lua_pop(L, 1);
+            },
+            &why);
+        if (ran && !encoded && tooLarge) {
+            Log(DD_LOG_ERROR, mod, overText() + "：" + why);
+            continue;
+        }
+        if (!ran || !encoded) {
+            Log(DD_LOG_ERROR, mod, "dd.store 不能保存，这次不写（旁路保留上一次写的，下次读档多半不一致）：" + why);
+            continue;
+        }
+        for (const auto& r : records) {
+            // 只保存现在还能解析的 actor（英雄在名册里、怪物在当前战斗里）
+            if (r.mod == mod->id() && game && game->actor_resolve(&r.actor)) {
+                payload.buffs.push_back({ r.buffId, r.actor.kind, r.actor.id, r.actor.roster, r.guid, r.json });
+            }
+        }
+        const std::string bytes = store::Encode(payload);
+        if (bytes.size() > limit) {
+            Log(DD_LOG_ERROR, mod, overText() + "：合起来 " + Kb(bytes.size()));
+            continue;
+        }
+        const std::uint32_t result = host_.persist->save(host_.plugin, mod->id().c_str(), bytes.data(), static_cast<std::uint32_t>(bytes.size()),
+            mod->manifest.versionText.c_str());
+        if (result == DD_PERSIST_E_INCONSISTENT) {
+            // raid 二次核对不一致（免得把来自不一致那一代的数据写回去）或归档失败之后 DDCore 不再写，预期的，只记一次
+            StoreInfo& store = storeInfo_[mod->id()];
+            if (!store.saveBlocked) {
+                store.saveBlocked = true;
+                Log(DD_LOG_INFO, mod, std::string("dd.store：") + PersistResultText(result) + "，之后的存档都不写，直到下次进存档");
+            }
+            continue;
+        }
+        if (result != DD_PERSIST_OK) {
+            Log(DD_LOG_ERROR, mod, std::string("persist.save 失败：") + PersistResultText(result));
+            continue;
+        }
+        ++written;
+        summary += " " + mod->id() + "（" + std::to_string(bytes.size()) + " 字节，状态 " + std::to_string(payload.buffs.size()) + " 条）";
+    }
+    Log(DD_LOG_INFO, nullptr, "campaign.save #" + std::to_string(info.index) + "（" + std::string(info.files ? info.files : "") +
+        (info.in_raid ? "，地牢" : "，城镇") + (info.in_battle ? "，战斗中" : "") + "）：写出 " + std::to_string(written) + " 个 Mod" +
+        (summary.empty() ? std::string() : "：" + summary.substr(1)));
+}
+
 Mod* Session::FindMod(std::string_view id) const
 {
     for (const auto& mod : mods_) {
@@ -327,8 +655,11 @@ bool Session::CreateVm()
             EventBinding::RegisterMetatables(L);
             Scheduler::RegisterMetatables(L);
             actor::RegisterMetatables(L);
+            CombatBinding::RegisterMetatables(L);
             lua_newtable(L);  // dd.state 的总表：id -> 表
             stateRef_ = luaL_ref(L, LUA_REGISTRYINDEX);
+            lua_newtable(L);  // dd.store 的总表：id -> 表（P4c1）
+            storeRef_ = luaL_ref(L, LUA_REGISTRYINDEX);
         },
         &error);
     if (!prepared) {
@@ -338,6 +669,7 @@ bool Session::CreateVm()
     }
     events_ = std::make_unique<EventBinding>(*this);
     scheduler_ = std::make_unique<Scheduler>(*this);
+    combat_ = std::make_unique<CombatBinding>(*this);
     Log(DD_LOG_INFO, nullptr, "Lua VM 已创建（" LUA_RELEASE "，内存上限 " + std::to_string(config_.memoryLimitMb) +
         " MB，预算 " + std::to_string(config_.budgetMs) + " ms，main.lua 预算 " + std::to_string(config_.loadBudgetMs) +
         " ms），基础占用 " + Kb(vm_->MemoryUsed()));
@@ -424,6 +756,7 @@ void Session::Load(const std::vector<ModSource>& sources)
     for (std::size_t i = 0; i < loadCount; ++i) {
         loadable_.push_back(mods_[i].get());
     }
+    LoadPersisted();
     for (std::size_t i = 0; i < loadCount; ++i) {
         Mod& mod = *mods_[i];
         std::string failedDep;
@@ -443,6 +776,9 @@ void Session::Load(const std::vector<ModSource>& sources)
         }
         LoadMod(mod);
     }
+    // 英雄的脚本 Buff 状态：main.lua 都执行完（脚本 Buff 定义好了）之后、CAMPAIGN_LOAD 回调返回之前导入，和英雄身上
+    // 实际的条目核对（id 和 guid 都对上才恢复）；怪物的等 raid 核对通过
+    ImportStates(DD_ACTOR_HERO, nullptr);
     memory_.loaded = vm_->MemoryUsed();
     Log(DD_LOG_INFO, nullptr, "加载完成：成功 " + std::to_string(LoadedCount()) + " 个，共 " + std::to_string(mods_.size()) +
         " 个 Lua Mod，Lua 内存 " + Kb(vm_->MemoryUsed()));
@@ -469,6 +805,9 @@ bool Session::LoadMod(Mod& mod)
         }
         if (scheduler_) {
             scheduler_->ReleaseMod(mod);
+        }
+        if (combat_) {
+            combat_->ReleaseMod(mod);  // 规则、脚本 Buff 定义和状态、排队记录（P4b）
         }
     });
     const std::size_t before = vm_->MemoryUsed();
@@ -565,6 +904,7 @@ void Session::Teardown()
                 mod->state = ModState::TornDown;
             }
         }
+        combat_.reset();  // 不碰 Lua 引用（VM 已损坏），只向 DDCore 撤销规则和内部订阅
         scheduler_.reset();
         events_.reset();
         LogSubscriptionCounts("拆除后");
@@ -581,6 +921,10 @@ void Session::Teardown()
     std::size_t count = 0;
     {
         const TeardownClock clock(*this, "拆除");
+        // P4b：拆除之前丢弃脚本 Buff 的状态，不调用 on_remove（F7）
+        if (combat_ && vm_->ok()) {
+            combat_->BeforeTeardown();
+        }
         for (auto it = loadOrder_.rbegin(); it != loadOrder_.rend(); ++it) {
             if ((*it)->state == ModState::Loaded) {
                 TeardownMod(**it);
@@ -589,13 +933,20 @@ void Session::Teardown()
         }
     }
     // 兜底：撤销 Mod 拆除后还剩下的（不应该有），然后释放 dd.state
+    combat_.reset();
     scheduler_.reset();
     events_.reset();
     LogSubscriptionCounts("拆除后");
     if (vm_->ok()) {
         luaL_unref(vm_->L(), LUA_REGISTRYINDEX, stateRef_);
+        luaL_unref(vm_->L(), LUA_REGISTRYINDEX, storeRef_);
     }
     stateRef_ = LUA_NOREF;
+    storeRef_ = LUA_NOREF;
+    if (!pendingStates_.empty()) {
+        Log(DD_LOG_INFO, nullptr, "脚本 Buff：退出存档时还有 " + std::to_string(pendingStates_.size()) + " 条旁路里的状态没有恢复（等 raid 核对的怪物状态），丢弃");
+        pendingStates_.clear();
+    }
     vm_->FullGc();
     const std::size_t after = vm_->MemoryUsed();
     const std::size_t residual = vm_->Close();
@@ -683,15 +1034,22 @@ void Session::Tick()
             return;
         }
     }
-    // 每秒：actor 作用域的订阅（派发时检查之外，英雄离开名册、怪物在战斗外，没有派发也能撤销），日志限速的汇总
+    // 每秒：actor 作用域的订阅（派发时检查之外，英雄离开名册、怪物在战斗外，没有派发也能撤销），日志限速的汇总，
+    // 不再能解析的 actor 上的脚本 Buff 状态（P4b）
+    bool sweep = false;
     if (Now() >= nextActorSweep_) {
         nextActorSweep_ = Now() + 1.0;
+        sweep = true;
         events_->SweepActorScopes();
         for (auto& mod : mods_) {
             if (mod->logDropped && Now() - mod->logWindow >= 1.0) {
                 FlushLogDrops(*mod);
             }
         }
+    }
+    combat_->Tick(sweep);
+    if (!vm_->ok()) {
+        return;
     }
     scheduler_->Tick(frame);
     if (frame.Deferred() > 0) {
@@ -867,8 +1225,22 @@ void Session::LogSubscriptionCounts(const char* when) const
     }
     Log(match ? DD_LOG_INFO : DD_LOG_ERROR, nullptr, std::string("订阅核对（") + when + "）：本会话 dd.on " +
         std::to_string(subs.subscriptions) + " 个、wait_event " + std::to_string(subs.waiters) + " 个、定时器 " +
-        std::to_string(sched.timers) + " 个、协程 " + std::to_string(sched.tasks) + " 个；DDLua 持有 SDK 订阅共 " +
+        std::to_string(sched.timers) + " 个、协程 " + std::to_string(sched.tasks) + " 个" +
+        (subs.internal ? "、内部订阅 " + std::to_string(subs.internal) + " 个（脚本 Buff）" : std::string()) + "；DDLua 持有 SDK 订阅共 " +
         std::to_string(mine) + " 个" + core + (match ? "" : "，不一致！"));
+}
+
+std::size_t Session::SubscriptionLoad(const Mod& mod) const
+{
+    std::size_t n = 0;
+    if (events_) {
+        const auto counts = events_->CountFor(&mod);
+        n += counts.subscriptions + counts.waiters;
+    }
+    if (combat_) {
+        n += combat_->PendingFor(&mod) + combat_->RulesFor(&mod);
+    }
+    return n;
 }
 
 }  // namespace ddlua

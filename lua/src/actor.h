@@ -1,5 +1,6 @@
 #pragma once
-// actor 句柄的 Lua 绑定：dd.actor.hero(id)、dd.actor.monster(guid)、dd.actor.is(v)，事件指针字段转句柄。
+// actor 句柄的 Lua 绑定：dd.actor.hero(id)、dd.actor.monster(guid)、dd.actor.is(v)，事件指针字段转句柄；
+// F5 起有只读枚举 dd.actor.party()、dd.actor.monsters()、dd.actor.in_battle()（game 服务的 party_heroes 等）。
 //
 // 句柄 userdata（dd.actor）只存 DDActorRef（值，不含指针），每次读字段都经 game 服务重新解析（DDCore 负责
 // 存档序号、探索序号、战斗序号的比较），解析失败时字段读出 nil、:valid() 为 false。同一个 actor 在一个 VM 里只有一个

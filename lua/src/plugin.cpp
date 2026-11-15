@@ -3,10 +3,13 @@
 // 没有启用 Lua Mod 时只有 lifecycle 订阅（CAMPAIGN_LOAD、CAMPAIGN_UNLOAD，开发用全局加载打开时加 ASSETS_READY），
 // 不订阅事件、不装 hook、不创建 VM。有 Lua VM 时才订阅 lifecycle TICK（驱动定时器、协程、重载），
 // 事件订阅全部由 Lua Mod 的 dd.on / dd.wait_event 产生。日志写 DDModLoader\log\DDLua.log，每行带 Mod id 或会话名。
+// P4c1：Load 时总是向 DDCore 声明使用存档旁路（存档的读取早于 CAMPAIGN_LOAD，观察 hook 要在 AppReady 装好），
+// DDCore 因此装 4 个只读的观察 hook；dd.store 和脚本 Buff 的状态经它随存档保存。
 
 #include "config.h"
 #include "host.h"
 #include "manifest.h"
+#include "sandbox.h"
 #include "session.h"
 
 #include <dd/dd_api.h>
@@ -86,6 +89,8 @@ void LoadConfig()
         " max_per_mod=" + std::to_string(p.config.maxPerMod) + " frame_budget_ms=" + std::to_string(p.config.frameBudgetMs) +
         " log_lines_per_sec=" + std::to_string(p.config.logLinesPerSec) + " log_max_mb=" + std::to_string(p.config.logMaxMb) +
         " teardown_budget_ms=" + std::to_string(p.config.teardownBudgetMs) +
+        " rule_budget_ms=" + std::to_string(p.config.ruleBudgetMs) + " combat_frame_ms=" + std::to_string(p.config.combatFrameMs) + " data_max_mb=" + std::to_string(p.config.dataMaxMb) +
+        " data_max_files=" + std::to_string(p.config.dataMaxFiles) + " store_max_kb=" + std::to_string(p.config.storeMaxKb) +
         " dev_mode=" + (p.config.devMode ? "1" : "0") +
         " dev_global_dirs=" + (dirs.empty() ? "（关闭）" : dirs));
 }
@@ -157,7 +162,8 @@ bool RunMarked(ddlua::Session* session, const char* what, void (*fn)(void*), voi
     }
     char code[96];
     std::snprintf(code, sizeof(code), "异常码 %08lX，地址 %p", g_faultCode, g_faultAddress);
-    const std::string where = std::string(code) + "（" + DescribeAddress(g_faultAddress) + "）";
+    const std::string where = std::string(code) + "（" + DescribeAddress(g_faultAddress) + "）" +
+        (g_faultCode == ddlua::kReentryAbandoned ? "：嵌套的 Lua 回调里发生了原生异常，外层入口随之放弃（P4b 的 AfterReentry）" : "");
     P().host.Log(DD_LOG_ERROR, std::string("[DDLua] ") + what + " 时发生原生异常（SEH）：" + where +
         "。DDLua 已接住，DDCore 的 lifecycle 订阅不受影响");
     if (session) {
@@ -269,6 +275,7 @@ void DD_CALL OnCampaignLoad(const DDPhaseEvent* event, void*)
         p.host.Log(DD_LOG_INFO, "[" + name + "] 进入存档：启用 " + std::to_string(count) + " 个 Mod，" + std::to_string(missing) +
             " 个没有找到目录（见 DDCore.log）");
         p.campaign = std::make_unique<ddlua::Session>(p.host, p.config, name);
+        p.campaign->SetPersistent(true);  // dd.store 和脚本 Buff 状态随存档保存（P4c1）
         struct LoadArgs {
             ddlua::Session* session;
             const std::vector<ddlua::ModSource>* sources;
@@ -291,6 +298,44 @@ void DD_CALL OnCampaignUnload(const DDPhaseEvent* event, void*)
         }
     });
     Guarded("CampaignUnload", [] { UpdateTick(); });
+}
+
+// P4c1：DDCore 在 campaign.save 的订阅都派发完之后调用（主线程帧边界）。存档会话写出 dd.store 和脚本 Buff 状态
+void DD_CALL OnPersistSave(const DDPersistSaveInfo* info, void*)
+{
+    Guarded("campaign.save 保存", [&] {
+        auto& p = P();
+        if (!info || !p.campaign || !p.campaign->vm() || p.campaign->Broken()) {
+            return;
+        }
+        struct Args {
+            ddlua::Session* session;
+            const DDPersistSaveInfo* info;
+        } args{ p.campaign.get(), info };
+        RunMarked(p.campaign.get(), "campaign.save 保存 dd.store", [](void* raw) {
+            auto* a = static_cast<Args*>(raw);
+            a->session->PersistSave(*a->info);
+        }, &args);
+    });
+}
+
+// 地牢存档的 raid 核对结果（as_raid_start 加载结束后的帧边界）
+void DD_CALL OnPersistVerify(const DDPersistVerify* verify, void*)
+{
+    Guarded("raid 核对", [&] {
+        auto& p = P();
+        if (!verify || !p.campaign || !p.campaign->vm() || p.campaign->Broken()) {
+            return;
+        }
+        struct Args {
+            ddlua::Session* session;
+            const DDPersistVerify* verify;
+        } args{ p.campaign.get(), verify };
+        RunMarked(p.campaign.get(), "raid 核对后恢复脚本 Buff 状态", [](void* raw) {
+            auto* a = static_cast<Args*>(raw);
+            a->session->PersistVerify(*a->verify);
+        }, &args);
+    });
 }
 
 void DD_CALL OnAssetsReady(const DDPhaseEvent*, void*)
@@ -344,6 +389,10 @@ DD_EXPORT bool DD_CALL DDPlugin_Load(const DDApi* api)
     // events：dd.on / dd.wait_event 用；没有 Lua Mod 时 DDLua 不订阅任何事件主题
     host.events = static_cast<const DDEventsService*>(api->query(DD_SERVICE_EVENTS, DD_SERVICE_EVENTS_VERSION));
     host.task = static_cast<const DDTaskService*>(api->query(DD_SERVICE_TASK, DD_SERVICE_TASK_VERSION));
+    // combat（P4b）：dd.buff、dd.effect 用；没有 Lua Mod 时不注册规则、不订阅 buff.*，也不设操作回调
+    host.combat = static_cast<const DDCombatService*>(api->query(DD_SERVICE_COMBAT, DD_SERVICE_COMBAT_VERSION));
+    // persist（P4c1）：dd.store 和脚本 Buff 状态随存档保存
+    host.persist = static_cast<const DDPersistService*>(api->query(DD_SERVICE_PERSIST, DD_SERVICE_PERSIST_VERSION));
     if (!host.log || !host.info || !host.lifecycle) {
         return false;
     }
@@ -361,5 +410,13 @@ DD_EXPORT bool DD_CALL DDPlugin_Load(const DDApi* api)
     }
     host.Log(DD_LOG_INFO, std::string("[DDLua] 只订阅了 lifecycle（CampaignLoad、CampaignUnload") +
         (p.config.devGlobalDirs.empty() ? "" : "、AssetsReady") + "），没有订阅事件主题，没有安装 hook");
+    if (host.persist) {
+        const std::uint32_t declared = host.persist->declare(host.plugin, &OnPersistSave, &OnPersistVerify, nullptr);
+        host.Log(declared == DD_PERSIST_OK ? DD_LOG_INFO : DD_LOG_WARN,
+            declared == DD_PERSIST_OK ? "[DDLua] 声明使用存档旁路（dd.store、脚本 Buff 状态随存档保存；DDCore 在 AppReady 装只读的观察 hook）"
+                                      : "[DDLua] 声明存档旁路失败（返回 " + std::to_string(declared) + "），dd.store 只在内存里");
+    } else {
+        host.Log(DD_LOG_WARN, "[DDLua] DDCore 没有 persist 服务，dd.store 只在内存里");
+    }
     return ok;
 }

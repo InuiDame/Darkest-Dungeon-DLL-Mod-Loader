@@ -100,6 +100,26 @@ Config ParseConfig(std::string_view text, std::vector<std::string>* warnings)
             if (!ParseUint(value, 1, 600000, config.teardownBudgetMs)) {
                 bad();
             }
+        } else if (key == "rule_budget_ms") {
+            if (!ParseUint(value, 1, 1000, config.ruleBudgetMs)) {
+                bad();
+            }
+        } else if (key == "combat_frame_ms") {
+            if (!ParseUint(value, 1, 1000, config.combatFrameMs)) {
+                bad();
+            }
+        } else if (key == "data_max_mb") {
+            if (!ParseUint(value, 1, 1024, config.dataMaxMb)) {
+                bad();
+            }
+        } else if (key == "data_max_files") {
+            if (!ParseUint(value, 1, 100000, config.dataMaxFiles)) {
+                bad();
+            }
+        } else if (key == "store_max_kb") {
+            if (!ParseUint(value, 1, 1024, config.storeMaxKb)) {
+                bad();
+            }
         } else if (key == "dev_mode") {
             std::uint32_t flag = 0;
             if (ParseUint(value, 0, 1, flag)) {

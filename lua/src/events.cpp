@@ -6,6 +6,7 @@
 #include "events.h"
 
 #include "actor.h"
+#include "combat.h"
 #include "sandbox.h"
 #include "scheduler.h"
 #include "session.h"
@@ -157,6 +158,9 @@ const DDEventsService& Events(lua_State* L)
     return *events;
 }
 
+bool PushSpecialPointer(lua_State* L, Session& session, DDEvent* event, const TopicMeta& topic, const FieldMeta& field, void* pointer,
+    std::uint32_t flags);
+
 // 读一个字段压栈（在 Lua 的 C 函数里或保护模式内调用，出错时抛 Lua 错误）
 void PushFieldValue(lua_State* L, Session& session, DDEvent* event, const TopicMeta& topic, const FieldMeta& field,
     std::uint32_t flags)
@@ -192,7 +196,9 @@ void PushFieldValue(lua_State* L, Session& session, DDEvent* event, const TopicM
     case DD_FIELD_POINTER: {
         void* value = nullptr;
         result = events.get_pointer(event, name, &value);
-        PushPointerField(L, session, topic, field, value, (flags & DD_EVENT_F_DEFERRED) != 0);
+        if (!PushSpecialPointer(L, session, event, topic, field, value, flags)) {
+            PushPointerField(L, session, topic, field, value, (flags & DD_EVENT_F_DEFERRED) != 0);
+        }
         break;
     }
     default:
@@ -290,7 +296,7 @@ int PayloadNewIndex(lua_State* L)
         return luaL_error(L, "延迟事件（加载线程上发生、排队到主线程的）只读：%s.%s", topic.name.c_str(), key);
     }
     if (!(flags & DD_EVENT_F_WRITABLE)) {
-        return luaL_error(L, "主题 %s 只读，只有 .pre 和 query.* 主题可写", topic.name.c_str());
+        return luaL_error(L, "主题 %s 只读（只有可写的 .pre 主题和 query.* 能写）", topic.name.c_str());
     }
     if (!(field->access & DD_FIELD_WRITE)) {
         return luaL_error(L, "主题 %s 的字段 %s 只读", topic.name.c_str(), key);
@@ -437,22 +443,94 @@ int SubToString(lua_State* L)
     return 1;
 }
 
-// dd.on / dd.once
-int Subscribe(lua_State* L, bool once)
+int LuaOn(lua_State* L)
 {
-    const char* what = once ? "dd.once" : "dd.on";
+    return EventBinding::LuaSubscribe(L, "dd.on", luaL_checkstring(L, 1), 2, 3, false, nullptr);
+}
+
+int LuaOnce(lua_State* L)
+{
+    return EventBinding::LuaSubscribe(L, "dd.once", luaL_checkstring(L, 1), 2, 3, true, nullptr);
+}
+
+int LuaOff(lua_State* L)
+{
+    CheckMod(L);
+    SubUd& ud = CheckSub(L, 1);
+    return OffImpl(L, ud.key, "dd.off(sub)");
+}
+
+int LuaSubscriptions(lua_State* L)
+{
+    Mod& mod = CheckMod(L);
+    lua_pushinteger(L, static_cast<lua_Integer>(SessionOf(L).events().CountFor(&mod).subscriptions));
+    return 1;
+}
+
+// 指针字段的特殊转换（P4b）：effect.* 的 effect → effect 句柄，skill.* 的 skill → 技能句柄，buff.* 延迟事件的 actor → 句柄。
+// 处理了返回 true
+bool PushSpecialPointer(lua_State* L, Session& session, DDEvent* event, const TopicMeta& topic, const FieldMeta& field, void* pointer,
+    std::uint32_t flags)
+{
+    const DDEventsService& events = *session.host().events;
+    const bool deferred = (flags & DD_EVENT_F_DEFERRED) != 0;
+    if (field.name == "effect" && topic.Find("effect_name")) {
+        const char* name = nullptr;
+        if (deferred || !pointer || events.get_string(event, "effect_name", &name) != DD_EV_OK || !name || !*name) {
+            lua_pushnil(L);
+        } else {
+            combat::PushEffect(L, name);
+        }
+        return true;
+    }
+    if (field.name == "skill" && topic.Find("performer")) {
+        void* performer = nullptr;
+        const DDCombatService* combat = combat::Service(session.host());
+        DDSkillRef ref{};
+        ref.size = sizeof(ref);
+        if (deferred || !pointer || !combat || events.get_pointer(event, "performer", &performer) != DD_EV_OK || !performer ||
+            !combat->skill_from_pointer(performer, pointer, &ref)) {
+            lua_pushnil(L);
+        } else {
+            combat::PushSkill(L, ref);
+        }
+        return true;
+    }
+    if (field.name == "actor" && deferred && topic.Find("actor_kind") && topic.Find("actor_id")) {
+        std::int64_t kind = 0;
+        std::int64_t id = 0;
+        const DDGameService* game = actor::Service(session.host());
+        DDActorRef ref{};
+        ref.size = sizeof(ref);
+        if (game && events.get_int(event, "actor_kind", &kind) == DD_EV_OK && events.get_int(event, "actor_id", &id) == DD_EV_OK &&
+            game->actor_find(static_cast<std::uint32_t>(kind), static_cast<std::uint32_t>(id), &ref)) {
+            actor::Push(L, ref);
+        } else {
+            lua_pushnil(L);
+        }
+        return true;
+    }
+    return false;
+}
+
+}  // namespace
+
+// dd.on / dd.once / dd.effect.register
+int EventBinding::LuaSubscribe(lua_State* L, const char* what, const char* topicName, int fnIndex, int optsIndex, bool once,
+    const NameMatch* name)
+{
     Mod& mod = CheckLiveMod(L, what);
-    const char* topicName = luaL_checkstring(L, 1);
-    luaL_checktype(L, 2, LUA_TFUNCTION);
+    luaL_checktype(L, fnIndex, LUA_TFUNCTION);
     std::int32_t priority = 0;
     std::uint32_t scope = DD_EVENT_SCOPE_PLUGIN;
     bool actorScope = false;
     DDActorRef scopeActor{};
     bool hasFilter = false;
-    if (!lua_isnoneornil(L, 3)) {
-        luaL_checktype(L, 3, LUA_TTABLE);
+    const int opts = optsIndex;
+    if (opts && !lua_isnoneornil(L, opts)) {
+        luaL_checktype(L, opts, LUA_TTABLE);
         lua_pushnil(L);
-        while (lua_next(L, 3)) {  // 原始遍历，不触发 Mod 的元方法
+        while (lua_next(L, opts)) {  // 原始遍历，不触发 Mod 的元方法
             if (lua_type(L, -2) != LUA_TSTRING) {
                 return luaL_error(L, "%s 的选项名必须是字符串", what);
             }
@@ -495,8 +573,7 @@ int Subscribe(lua_State* L, bool once)
     }
     Session& session = SessionOf(L);
     EventBinding& binding = session.events();
-    const auto counts = binding.CountFor(&mod);
-    if (counts.subscriptions + counts.waiters >= session.config().maxPerMod) {
+    if (session.SubscriptionLoad(mod) >= session.config().maxPerMod) {
         return luaL_error(L, "%s：订阅数达到上限 %d（DDLua.cfg 的 max_per_mod）", what, static_cast<int>(session.config().maxPerMod));
     }
     std::string reason;
@@ -507,10 +584,13 @@ int Subscribe(lua_State* L, bool once)
         lua_pushstring(L, reason.c_str());
         return 2;
     }
+    if (name && !topic->Find("effect_name")) {
+        return luaL_error(L, "%s：主题 %s 没有 effect_name 字段", what, topic->name.c_str());
+    }
     std::vector<FilterItem> filter;
     if (hasFilter) {
         lua_pushliteral(L, "filter");
-        lua_rawget(L, 3);
+        lua_rawget(L, opts);
         filter = ParseFilter(L, lua_gettop(L), *topic);
         lua_pop(L, 1);
     }
@@ -527,7 +607,7 @@ int Subscribe(lua_State* L, bool once)
     lua_pushstring(L, topic->name.c_str());
     lua_setiuservalue(L, -2, 1);
     luaL_setmetatable(L, kSubMeta);
-    lua_pushvalue(L, 2);
+    lua_pushvalue(L, fnIndex);
     const int fnRef = luaL_ref(L, LUA_REGISTRYINDEX);
 
     auto sub = std::make_shared<EventBinding::Sub>();
@@ -541,6 +621,10 @@ int Subscribe(lua_State* L, bool once)
     sub->actorScope = actorScope;
     sub->scopeActor = scopeActor;
     sub->once = once;
+    if (name) {
+        sub->hasName = true;
+        sub->name = *name;
+    }
     if (!binding.Subscribe(sub, &reason)) {
         luaL_unref(L, LUA_REGISTRYINDEX, fnRef);
         session.Log(DD_LOG_WARN, &mod, std::string(what) + " 失败：" + reason);
@@ -552,31 +636,33 @@ int Subscribe(lua_State* L, bool once)
     return 1;
 }
 
-int LuaOn(lua_State* L)
+std::uint64_t EventBinding::SubscribeNative(const char* topicName, std::function<void(DDEvent*)> fn, std::string* reason)
 {
-    return Subscribe(L, false);
+    const TopicMeta* topic = Meta(topicName, reason);
+    if (!topic) {
+        return 0;
+    }
+    auto sub = std::make_shared<Sub>();
+    sub->modId = "DDLua";
+    sub->topic = topic;
+    sub->native = std::move(fn);
+    if (!Subscribe(sub, reason)) {
+        return 0;
+    }
+    return sub->key;
 }
 
-int LuaOnce(lua_State* L)
+void* EventBinding::PushPayload(lua_State* L, DDEvent* event, const TopicMeta* topic)
 {
-    return Subscribe(L, true);
+    return NewPayload(L, event, topic);
 }
 
-int LuaOff(lua_State* L)
+void EventBinding::ExpirePayload(void* payload)
 {
-    CheckMod(L);
-    SubUd& ud = CheckSub(L, 1);
-    return OffImpl(L, ud.key, "dd.off(sub)");
+    if (payload) {
+        static_cast<PayloadUd*>(payload)->event = nullptr;
+    }
 }
-
-int LuaSubscriptions(lua_State* L)
-{
-    Mod& mod = CheckMod(L);
-    lua_pushinteger(L, static_cast<lua_Integer>(SessionOf(L).events().CountFor(&mod).subscriptions));
-    return 1;
-}
-
-}  // namespace
 
 const FieldMeta* TopicMeta::Find(std::string_view field) const
 {
@@ -825,6 +911,10 @@ EventBinding::Counts EventBinding::CountFor(const Mod* mod) const
         if (mod && sub->mod != mod) {
             continue;
         }
+        if (sub->native) {
+            counts.internal += 1;
+            continue;
+        }
         (sub->waiter ? counts.waiters : counts.subscriptions) += 1;
     }
     return counts;
@@ -873,6 +963,16 @@ void EventBinding::RemoveWaiter(std::uint64_t key)
 bool EventBinding::MatchFilter(const Sub& sub, const DDEvent* event) const
 {
     const DDEventsService& events = *session_.host().events;
+    if (sub.hasName) {
+        const char* value = nullptr;
+        if (events.get_string(event, "effect_name", &value) != DD_EV_OK || !value) {
+            return false;
+        }
+        const std::string_view name(value);
+        if (sub.name.prefix ? name.substr(0, sub.name.text.size()) != sub.name.text : name != sub.name.text) {
+            return false;
+        }
+    }
     for (const auto& item : sub.filter) {
         const char* name = item.field->name.c_str();
         switch (item.field->type) {
@@ -938,6 +1038,10 @@ void EventBinding::OnEvent(std::uint64_t key, DDEvent* event)
             Remove(key, true);
             return;
         }
+        if (sub->native) {
+            sub->native(event);  // 内部订阅（脚本 Buff），不进 Lua 的部分在 C++ 里先过滤
+            return;
+        }
         if (!MatchFilter(*sub, event)) {
             return;
         }
@@ -993,7 +1097,8 @@ void EventBinding::InvokeCallback(const std::shared_ptr<Sub>& sub, DDEvent* even
     ++sub->failures;
     const bool active = Active(sub->key);
     const std::uint32_t limit = session_.config().maxFailures;
-    std::string text = sub->topic->name + " 的回调出错";
+    std::string text = (sub->hasName ? "dd.effect.register(\"" + sub->name.text + (sub->name.prefix ? "*" : "") + "\")" : sub->topic->name) +
+        " 的回调出错";
     if (active && (budget || sub->failures >= limit)) {
         text += budget ? "（超出执行预算），已停用该订阅" : "（连续 " + std::to_string(sub->failures) + " 次），已停用该订阅";
         Remove(sub->key, true);

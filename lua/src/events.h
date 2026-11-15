@@ -10,12 +10,21 @@
 // （预算、traceback），连续出错 max_failures 次停用，超预算立即停用。
 //
 // 只在主线程使用（DDCore 的回调全部在主线程）。
+//
+// P4b：
+// - 内部订阅：DDLua 自己的（脚本 Buff 的 buff.add/remove/tick、damage.pre），不属于任何 Mod，回调是 C++ 函数（Sub::native），
+//   不计入 dd.on 的数目，但和 Mod 的订阅一样是 SDK 订阅，订阅核对按 SDK 的总数比较。
+// - dd.effect.register：effect.pre 的订阅加上 effect_name 的精确或前缀匹配（Sub::name），在 C++ 里比较。
+// - 指针字段：effect.* 的 effect 是 effect 句柄（按 effect_name），skill.* 的 skill 是技能句柄（combat.skill_from_pointer），
+//   buff.* 的延迟事件里 actor 按 actor_kind、actor_id 构造句柄。
+// - 回调可能嵌在别的入口里（立即执行的写操作同步派发 buff.add 等），Vm::Call 按隔离的嵌套入口处理。
 
 #include <dd/dd_api.h>
 #include <lauxlib.h>
 #include <lua.h>
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -65,6 +74,22 @@ public:
     // dd.on、dd.once、dd.off、dd.subscriptions，装进 dd 表（保护模式内）
     static void AddFunctions(lua_State* L, int dd, std::uint64_t token);
 
+    // effect_name 的匹配（dd.effect.register）
+    struct NameMatch {
+        std::string text;
+        bool prefix = false;  // 以 * 结尾：前缀匹配
+    };
+    // dd.on / dd.once 的实现，Lua C 函数里调用：fnIndex 处是回调，optsIndex 处是选项（0 表示没有）。
+    // name 不为空时只派发 effect_name 匹配的事件（主题要有 effect_name 字段）。返回压栈的个数（订阅对象，或 nil 和原因）
+    static int LuaSubscribe(lua_State* L, const char* what, const char* topic, int fnIndex, int optsIndex, bool once,
+        const NameMatch* name);
+    // 内部订阅（不进 Lua）。返回键，失败返回 0 并写 reason
+    std::uint64_t SubscribeNative(const char* topic, std::function<void(DDEvent*)> fn, std::string* reason);
+
+    // 负载 userdata（dd.event），给 combat.cpp 的脚本 Buff 回调用：压栈，Expire 之后再访问报错
+    static void* PushPayload(lua_State* L, DDEvent* event, const TopicMeta* topic);
+    static void ExpirePayload(void* payload);
+
     // wait_event 的等待者：订阅 topic（栈上 topicIndex），filterIndex 为 0 表示没有。事件匹配时取一份字段快照，
     // 撤销订阅，交给调度器（Scheduler::WakeTask）。主题不存在或不可用时返回 0 并写 reason；filter 不合法时抛 Lua 错误
     std::uint64_t AddWaiter(lua_State* L, const Mod& mod, int topicIndex, int filterIndex, std::uint64_t taskId, std::string* reason);
@@ -74,8 +99,9 @@ public:
     void ReleaseMod(const Mod& mod);
 
     struct Counts {
-        std::size_t subscriptions = 0;  // dd.on / dd.once
+        std::size_t subscriptions = 0;  // dd.on / dd.once（含 dd.effect.register）
         std::size_t waiters = 0;        // dd.wait_event
+        std::size_t internal = 0;       // DDLua 自己的内部订阅（只在 mod 为空时统计）
     };
     Counts CountFor(const Mod* mod) const;  // mod 为空时统计整个会话
     // 所有会话持有的 SDK 订阅数（和 DDCore 的 subscription_count 核对）
@@ -128,6 +154,9 @@ struct EventBinding::Sub {
     bool waiter = false;       // wait_event 的等待者
     std::uint64_t taskId = 0;
     std::uint32_t failures = 0;  // 连续出错次数
+    bool hasName = false;      // dd.effect.register：只派发 effect_name 匹配的
+    NameMatch name;
+    std::function<void(DDEvent*)> native;  // 内部订阅：不进 Lua，交给这个函数
 };
 
 // 读事件字段时指针字段的转换：Hero、Monster 转成 actor 句柄（game 服务的 actor_from_pointer），

@@ -15,13 +15,17 @@
 // 事件回调不能顺延，仍然只有单次预算。
 // VM 损坏（审核 B-Y3）：Lua 代码执行期间发生原生异常（SEH）后，本会话停止一切 Lua 派发，拆除时不碰 VM、直接丢弃。
 
+#include "combat.h"
 #include "config.h"
 #include "events.h"
 #include "host.h"
 #include "manifest.h"
 #include "modfs.h"
 #include "scheduler.h"
+#include "store.h"
 #include "vm.h"
+
+#include <map>
 
 #include <cstdint>
 #include <functional>
@@ -82,6 +86,13 @@ struct Mod {
     mutable std::uint32_t logLines = 0;
     mutable std::uint64_t logDropped = 0;
 
+    // P4b 数据目录（dd.fs.write）：<游戏根目录>\DDModLoader\data\<mod id>\，第一次用到时打开（写入时创建）。
+    // 用量第一次写入前扫描一次，之后按写入、删除增减
+    ModFs dataFs;
+    bool dataUsageKnown = false;
+    std::uint64_t dataBytes = 0;
+    std::uint64_t dataFiles = 0;
+
     struct Cleanup {
         std::uint64_t id;
         std::function<void()> fn;
@@ -118,10 +129,25 @@ public:
     bool RunChunk(Mod& mod, std::string_view code, std::string_view chunkName, std::string* error, bool* budgetExceeded = nullptr,
         std::uint32_t budgetMs = 0);
 
-    // 事件绑定和调度器，VM 存在期间有效
+    // 事件绑定、调度器和 combat 绑定（P4b），VM 存在期间有效
     EventBinding& events() { return *events_; }
     Scheduler& scheduler() { return *scheduler_; }
-    bool HasRuntime() const { return events_ && scheduler_; }
+    CombatBinding& combat() { return *combat_; }
+    bool HasRuntime() const { return events_ && scheduler_ && combat_; }
+    // 事件绑定还在（combat 绑定析构时 combat_ 已经置空，HasRuntime 为假，撤销内部订阅只看这个，C-N4）
+    bool HasEvents() const { return events_ != nullptr; }
+    // max_per_mod 的计数：dd.on / dd.once / dd.effect.register、dd.wait_event、带 done 的排队写操作、dd.buff.rule
+    std::size_t SubscriptionLoad(const Mod& mod) const;
+
+    // 规则回调（dd.buff.rule）正在执行：只读，写操作和注册类的函数报错
+    bool InRule() const { return ruleDepth_ > 0; }
+    struct RuleScope {
+        explicit RuleScope(Session& session) : session_(session) { ++session_.ruleDepth_; }
+        ~RuleScope() { --session_.ruleDepth_; }
+        RuleScope(const RuleScope&) = delete;
+        RuleScope& operator=(const RuleScope&) = delete;
+        Session& session_;
+    };
 
     // 调度用的时钟（秒，单调）。默认 QueryPerformanceCounter，离线测试可以换成假时钟
     double Now() const;
@@ -140,6 +166,26 @@ public:
 
     // dd.state 的总表（注册表引用，id -> 表）
     int stateRef() const { return stateRef_; }
+
+    // ---- P4c1：存档旁路（dd.store、脚本 Buff 状态随存档保存） ----
+    // 按存档的会话由 plugin.cpp 在 Load 之前打开；开发会话的 dd.store 只在内存里，不随存档保存
+    void SetPersistent(bool on) { persistent_ = on; }
+    bool Persistent() const { return persistent_; }
+    // dd.store 的总表（注册表引用，id -> 表）。Load 时在 main.lua 之前从旁路读好，跨重载保留
+    int storeRef() const { return storeRef_; }
+    struct StoreInfo {
+        std::string status = "empty";  // dd.store_status()：loaded / prev / empty / mismatch / unavailable
+        std::string reason;
+        bool raidPending = false;      // 地牢里的存档：等 DDCore 核对 raid
+        bool saveBlocked = false;      // raid 核对不一致后 DDCore 拒绝再写（DD_PERSIST_E_INCONSISTENT），已经记过日志
+    };
+    const StoreInfo* StoreInfoOf(std::string_view id) const;
+    // DDCore 的保存回调（campaign.save 的订阅都派发完之后）：每个加载成功的 Mod 写出 dd.store 和它的脚本 Buff 状态
+    void PersistSave(const DDPersistSaveInfo& info);
+    // 地牢存档的 raid 核对结果：一致时恢复怪物的脚本 Buff 状态；不一致时状态改成 mismatch，丢弃没恢复的怪物状态
+    void PersistVerify(const DDPersistVerify& verify);
+    std::uint32_t SaveCount() const { return saveCount_; }
+    std::size_t PendingStates() const { return pendingStates_.size(); }
 
     // 订阅数核对：本会话的记录、DDLua 全部的 SDK 订阅、DDCore 统计的该插件订阅数
     void LogSubscriptionCounts(const char* when) const;
@@ -195,6 +241,12 @@ public:
 private:
     bool LoadMod(Mod& mod);
     void TeardownMod(Mod& mod);
+    // P4c1：创建 VM 之后、执行 main.lua 之前读旁路（dd.store 解码成表，脚本 Buff 状态留到 main.lua 之后导入）
+    void LoadPersisted();
+    // 导入还没恢复的脚本 Buff 状态：kind 是 DD_ACTOR_HERO / DD_ACTOR_MONSTER，onlyMod 不为空时只导入这个 Mod 的
+    void ImportStates(std::uint32_t kind, const std::string* onlyMod);
+    // dd.store 的表压栈：Mod 环境里 dd.store 是表就用它（允许整体赋值），否则用会话里的
+    void PushStore(lua_State* L, const Mod& mod);
     bool CreateVm();
     Mod* FindLoadable(std::string_view id) const;
     // 文件监视：变化（连续两轮一致）的 Mod id
@@ -219,6 +271,8 @@ private:
 
     std::unique_ptr<EventBinding> events_;
     std::unique_ptr<Scheduler> scheduler_;
+    std::unique_ptr<CombatBinding> combat_;  // 持有内部订阅，要先于 events_ 销毁
+    int ruleDepth_ = 0;
     std::function<double()> clock_;
     std::uint64_t ticks_ = 0;
     struct PendingReload {
@@ -246,6 +300,16 @@ private:
     double nextWatch_ = 0;
     double nextActorSweep_ = 0;
     int stateRef_ = LUA_NOREF;
+    // P4c1
+    bool persistent_ = false;
+    int storeRef_ = LUA_NOREF;
+    std::map<std::string, StoreInfo> storeInfo_;
+    struct PendingState {
+        std::string mod;
+        store::BuffState state;
+    };
+    std::vector<PendingState> pendingStates_;
+    std::uint32_t saveCount_ = 0;
 };
 
 }  // namespace ddlua
