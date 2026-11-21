@@ -11,66 +11,33 @@ std::uint32_t GameHash(std::string_view text)
 {
     std::uint32_t h = 0;
     for (const char c : text) {
-        h = h * 53 + static_cast<unsigned char>(c);
+        h = h * game::layout::kGameHashMul + static_cast<unsigned char>(c);
     }
     return h;
 }
 
 // ---- 枚举表 ----
-// 顺序就是游戏里的数值。check_actor_layout.py 从两个 exe 的静态初始化函数里提取名字和这里逐项比较
+// 顺序就是游戏里的数值，表在 game/layout.inc，tools/dd_update.py verify 从两个 exe 的静态初始化函数里提取名字和它逐项比较
 namespace {
 
-const char* const kStatNames[] = { "status", "tag", "combat_stat_add", "combat_stat_multiply", "hp_dot_poison",
-    "hp_dot_bleed", "hp_heal_amount", "hp_heal_percent", "hp_heal_received_percent", "stress_dmg_percent",
-    "stress_heal_percent", "resistance", "poison_chance", "bleed_chance", "stun_chance", "move_chance", "debuff_chance",
-    "resolve_check_percent", "resolve_xp_bonus_percent", "scouting_chance", "remove_negative_quirk_chance",
-    "food_consumption_percent", "starving_damage_percent", "upgrade_discount", "party_surprise_chance",
-    "monsters_surprise_chance", "riposte", "guarded", "damage_received_percent", "stress_heal_received_percent",
-    "stress_dmg_received_percent", "vampire", "activity_side_effect_chance", "disable_combat_skill_attribute",
-    "stress_dot", "shuffle_dot", "hp_dot_heal", "torchlight_burn_percent", "quirk_evolution_death_immune",
-    "vampire_evolution_duration", "ambush_chance", "tag_blocked", "ignore_protection", "stealth", "guard_blocked",
-    "crit_received_chance", "damage_reflect_percent", "shard_reward_percent", "shard_consume_percent",
-    "cure_poison_chance", "cure_bleed_chance", "cure_poison_received_chance", "cure_bleed_received_chance",
-    "hp_dot_poison_amount_percent", "hp_dot_poison_amount_received_percent", "hp_dot_poison_duration_percent",
-    "hp_dot_poison_duration_received_percent", "hp_dot_bleed_amount_percent", "hp_dot_bleed_amount_received_percent",
-    "hp_dot_bleed_duration_percent", "hp_dot_bleed_duration_received_percent", "stress_dot_amount_percent",
-    "stress_dot_amount_received_percent", "stress_dot_duration_percent", "stress_dot_duration_received_percent",
-    "shuffle_dot_duration_percent", "shuffle_dot_duration_received_percent", "hp_heal_dot_amount_percent",
-    "hp_heal_dot_amount_received_percent", "hp_heal_dot_duration_percent", "hp_heal_dot_duration_received_percent",
-    "torch_decrease_percent", "torch_increase_percent", "ignore_stealth", "transfer_buff_from_attacker_chance",
-    "transfer_debuff_from_attacker_chance", "random_target_friendly_chance", "random_target_attack_chance",
-    "guard_duration_percent", "guard_duration_received_percent", "stress_on_miss", "stress_from_idle_in_town",
-    "quirk_tag_evolution_duration", "deathblow_chance", "heartattack_stress_heal_percent", "riposte_duration_percent",
-    "buff_duration_percent", "ignore_guard", "hp_dot_burn", "hp_dot_burn_amount_percent",
-    "hp_dot_burn_amount_received_percent", "wildfire_apply_adjacent_targets", "hp_dot_burn_decay_percent",
-    "cure_burn_chance", "cure_burn_received_chance", "effect_chance", "crit_dmg_multiply", "crit_dmg_add",
-    "hp_heal_amount_received", "heal_crit_chance_add", "heal_crit_chance_multiply", "disable_combat_skill" };
+using game::layout::IndexOf;
+constexpr const auto& kStatNames = game::layout::kEnumStatNames;
+constexpr const auto& kSourceNames = game::layout::kEnumSourceNames;  // 游戏里带前缀 bsrc_，这里不带
+constexpr const auto& kDurationNames = game::layout::kEnumDurationNames;
+constexpr const auto& kRuleNames = game::layout::kEnumRuleNames;
 
-// 游戏里带前缀 bsrc_
-const char* const kSourceNames[] = { "notspecified", "skill", "instantSkill", "affliction", "virtue", "quirk", "trinket",
-    "trinket_set", "campingskill", "deathsdoor", "town", "curio", "stun", "guard", "riposte", "item", "disease",
-    "companion", "deathsdoor_recovery", "deathsdoor_recovery_heart_attack", "quest_failure",
-    "completed_darkest_dungeon_quest_party_hero", "town_event", "vampire", "never_again", "battle_modifier", "district",
-    "torchsettings", "flashback_start", "flashback_result", "crit", "trinket_additional_effect", "quest_modifier",
-    "last_hero" };
+static_assert(std::size(kStatNames) == game::layout::kEnumStat);
+static_assert(std::size(kSourceNames) == game::layout::kEnumSource);
+static_assert(std::size(kDurationNames) == game::layout::kEnumDuration);
+static_assert(std::size(kRuleNames) == game::layout::kEnumRule);
+static_assert(game::layout::SRC_S == DD_SOURCE_F_SAVED && game::layout::SRC_T == DD_SOURCE_F_TOWN_CLEAR &&
+    game::layout::SRC_Y == DD_SOURCE_F_TRAY);
 
-const char* const kDurationNames[] = { "combat_end", "quest_complete", "quest_not_complete", "quest_end", "activity_end",
-    "idle_start_town_visit", "till_removed", "none", "before_turn", "after_turn", "after_round" };
-
-const char* const kRuleNames[] = { "always", "monsterSize", "lightbelow", "lightabove", "hpbelow", "hpabove",
-    "stress_below", "stress_above", "afflicted", "virtued", "meleeonly", "rangedonly", "firstroundonly", "actorStatus",
-    "monsterType", "at_deaths_door", "in_rank", "target_in_rank", "has_buff", "in_camp", "in_dungeon", "in_room",
-    "in_corridor", "walking_backwards", "in_activity", "riposte", "skill", "in_mode", "actor_base_class", "is_vampire",
-    "target_is_vampire", "has_quirk", "monster_type_count_min", "is_guarded", "target_is_guarded", "is_stealthed",
-    "target_is_stealthed", "has_item_id", "has_item_type", "is_guarding", "target_is_guarding", "torch_setting",
-    "is_actor_status", "target_hpbelow", "target_hpabove", "attacking_monster_type", "no_trinkets", "activated_first",
-    "activated_last", "ondeathsdoorenter", "negative_quirk_above", "quest_uses_remaining_above", "target_is_burning",
-    "any_is_burning", "is_target_corpse" };
-
-static_assert(std::size(kStatNames) == 102);
-static_assert(std::size(kSourceNames) == 34);
-static_assert(std::size(kDurationNames) == 11);
-static_assert(std::size(kRuleNames) == 55);
+// stat 的数值按名字取（ValidateSubStat 用），编译期求值
+consteval std::int32_t Stat(std::string_view name)
+{
+    return IndexOf(kStatNames, name);
+}
 
 struct Table {
     const char* const* names;
@@ -133,44 +100,8 @@ std::int32_t EnumValue(std::uint32_t table, std::string_view name)
 
 std::uint32_t SourceFlags(std::int32_t source)
 {
-    // 下标是来源的数值。S：+0x44 进存档，T：+0x46 回城清，Y：+0x48 进 tray
-    constexpr std::uint32_t S = DD_SOURCE_F_SAVED, T = DD_SOURCE_F_TOWN_CLEAR, Y = DD_SOURCE_F_TRAY;
-    static constexpr std::uint32_t kFlags[] = {
-        T,          // 0 notspecified
-        S | T | Y,  // 1 skill
-        S | T,      // 2 instantSkill
-        0,          // 3 affliction
-        T,          // 4 virtue
-        0,          // 5 quirk
-        0,          // 6 trinket
-        0,          // 7 trinket_set
-        S | T | Y,  // 8 campingskill
-        T,          // 9 deathsdoor
-        S | T | Y,  // 10 town
-        S | T | Y,  // 11 curio
-        S | T | Y,  // 12 stun
-        S | T,      // 13 guard
-        S | T,      // 14 riposte
-        S | T | Y,  // 15 item
-        0,          // 16 disease
-        Y,          // 17 companion
-        T,          // 18 deathsdoor_recovery
-        T,          // 19 deathsdoor_recovery_heart_attack
-        S | T,      // 20 quest_failure
-        T,          // 21 completed_darkest_dungeon_quest_party_hero
-        S,          // 22 town_event
-        S,          // 23 vampire
-        T,          // 24 never_again
-        S | T,      // 25 battle_modifier
-        S,          // 26 district
-        T,          // 27 torchsettings
-        S | T,      // 28 flashback_start
-        S | T | Y,  // 29 flashback_result
-        S | T | Y,  // 30 crit
-        S | T | Y,  // 31 trinket_additional_effect
-        T,          // 32 quest_modifier
-        T,          // 33 last_hero
-    };
+    // 下标是来源的数值（layout.inc 的 SourceFlags）：S +0x44 进存档，T +0x46 回城清，Y +0x48 进 tray
+    constexpr const auto& kFlags = game::layout::kSourceFlagsValues;
     static_assert(std::size(kFlags) == std::size(kSourceNames));
     return source >= 0 && static_cast<std::size_t>(source) < std::size(kFlags) ? kFlags[source] : 0;
 }
@@ -216,19 +147,13 @@ bool Fail(std::string* why, const char* text)
 
 // stat_sub_type 的合法值（P4 审核 C-Y3、A-N4，[静态]）：游戏在属性累加（47AD50）和 buff 提示（7C6100 等）里按哈希查这些表，
 // 认不出时有的弹 assert（选错按钮执行 int3）、有的越界写到相邻的累加值、有的只写日志、这条 buff 不起作用
-const char* const kCombatStatNames[] = { "damage_low", "damage_high", "defense_rating", "protection_rating", "speed_rating",
-    "attack_rating", "crit_chance", "max_hp", "riposte_on_hit_chance", "riposte_on_miss_chance" };  // 2AAE800，490810 / 47DB60
-const char* const kResistanceNames[] = { "stun", "move", "poison", "bleed", "disease", "debuff", "death_blow", "trap" };  // 2AE5330，51B480
-const char* const kSideEffectNames[] = { "go_missing", "add_quirk", "apply_buff", "add_currency", "remove_currency", "activity_lock",
-    "add_trinket", "remove_trinket" };  // 2AA2940，44F5F0
-const char* const kSkillAttributeNames[] = { "stress", "stun", "heal", "bleed", "poison", "tag", "guard", "move", "disease", "buff",
-    "debuff", "daze" };  // 2AAE650，2AAE670 的线性查找
-const char* const kStressSourceNames[] = { "unkown", "debug", "activity", "town_idle", "quest_fail", "pass", "hunger", "effect",
-    "hero_crit", "monster_crit", "hero_killing_blow", "hero_death", "mode", "control", "capture", "camping_relieve_stress", "camping_eat",
-    "camping_skill", "deaths_door", "tile", "retreat", "curio", "flashback", "town_event" };  // 2AE58F0，下标 0 原文就是 unkown
-const char* const kHealSourceNames[] = { "hero_skill", "hero_skill_multi_target", "monster_skill", "monster_skill_multi_target",
-    "camp_skill", "camp_skill_multi_target", "effect", "act_out", "curio", "eat", "companion", "debug", "dot", "flashback",
-    "damage_heal" };  // 2AC85D0，4BDF00
+// 表在 game/layout.inc（SubStat*，注释里有 Steam 版的表地址和查找函数）
+constexpr const auto& kCombatStatNames = game::layout::kSubStatCombatNames;
+constexpr const auto& kResistanceNames = game::layout::kSubStatResistanceNames;
+constexpr const auto& kSideEffectNames = game::layout::kSubStatSideEffectNames;
+constexpr const auto& kSkillAttributeNames = game::layout::kSubStatSkillAttributeNames;
+constexpr const auto& kStressSourceNames = game::layout::kSubStatStressSourceNames;
+constexpr const auto& kHealSourceNames = game::layout::kSubStatHealSourceNames;
 
 template <std::size_t N>
 bool OneOf(std::string_view text, const char* const (&names)[N])
@@ -262,24 +187,24 @@ bool ValidateSubStat(std::int32_t stat, std::string_view sub, std::string* why)
         return false;
     };
     switch (stat) {
-    case 2:  // combat_stat_add
-    case 3:  // combat_stat_multiply
+    case Stat("combat_stat_add"):
+    case Stat("combat_stat_multiply"):
         return need(OneOf(sub, kCombatStatNames), false, Join(kCombatStatNames), "认不出时游戏把数值加到相邻的属性上，显示提示时弹 assert");
-    case 11:  // resistance
+    case Stat("resistance"):
         return need(OneOf(sub, kResistanceNames), false, Join(kResistanceNames), "认不出时游戏弹 assert，再越界写到相邻的累加值");
-    case 32:  // activity_side_effect_chance
+    case Stat("activity_side_effect_chance"):
         return need(OneOf(sub, kSideEffectNames), false, Join(kSideEffectNames), "认不出时游戏弹 assert，再越界写到相邻的累加值");
-    case 33:  // disable_combat_skill_attribute
+    case Stat("disable_combat_skill_attribute"):
         return need(OneOf(sub, kSkillAttributeNames), false, Join(kSkillAttributeNames), "认不出时游戏弹 assert，再越界写到相邻的累加值");
-    case 9:   // stress_dmg_percent
-    case 10:  // stress_heal_percent
-    case 29:  // stress_heal_received_percent
-    case 30:  // stress_dmg_received_percent
+    case Stat("stress_dmg_percent"):
+    case Stat("stress_heal_percent"):
+    case Stat("stress_heal_received_percent"):
+    case Stat("stress_dmg_received_percent"):
         return need(OneOf(sub, kStressSourceNames), true, Join(kStressSourceNames), "认不出时游戏越界写到相邻的累加值");
-    case 6:   // hp_heal_amount
-    case 7:   // hp_heal_percent
-    case 8:   // hp_heal_received_percent
-    case 98:  // hp_heal_amount_received
+    case Stat("hp_heal_amount"):
+    case Stat("hp_heal_percent"):
+    case Stat("hp_heal_received_percent"):
+    case Stat("hp_heal_amount_received"):
         return need(OneOf(sub, kHealSourceNames), true, Join(kHealSourceNames), "认不出时游戏只写日志，这条 buff 不起作用");
     default:
         return true;  // 其余 stat 游戏不解析 sub_stat（disable_combat_skill 是技能 id，任意文本）
@@ -623,7 +548,7 @@ DDRuleId RuleRegistry::Register(std::uint32_t owner, std::string_view name, DDRu
     const std::uint32_t hash = GameHash(name);
     // 479CD0 的规则 13/42 在 479F41 起按这些内置状态名的哈希判断（[静态]，A-N3）。注册同名（或同哈希）的规则后 hook 先命中，
     // 原版数据里所有 actorStatus / is_actor_status 的这类 buff 都会改由插件决定，所以拒绝
-    static constexpr const char* kBuiltinStatus[] = { "stunned", "tagged", "poisoned", "bleeding", "burning", "virtued", "afflicted", "dazed" };
+    constexpr const auto& kBuiltinStatus = game::layout::kBuiltinStatusNames;
     for (const char* builtin : kBuiltinStatus) {
         if (GameHash(builtin) == hash) {
             if (why) {
@@ -966,8 +891,11 @@ bool ParseEffectText(std::string_view text, std::vector<EffectBlock>* blocks, st
                 }
                 return false;
             }
-            static constexpr std::pair<std::string_view, int> kLists[] = { { ".kill_enemy_types", 4 }, { ".buff_ids", 8 },
-                { ".summon_monsters", 4 }, { ".summon_ranks", 4 }, { ".set_monster_class_ids", 8 } };
+            using namespace game::layout;
+            static constexpr std::pair<std::string_view, int> kLists[] = {
+                { ".kill_enemy_types", static_cast<int>(kEffectListKillEnemyTypes) }, { ".buff_ids", static_cast<int>(kEffectListBuffIds) },
+                { ".summon_monsters", static_cast<int>(kEffectListSummonMonsters) }, { ".summon_ranks", static_cast<int>(kEffectListSummonRanks) },
+                { ".set_monster_class_ids", static_cast<int>(kEffectListSetMonsterClassIds) } };
             for (const auto& [key, count] : kLists) {
                 if (ListCrashes(body, key, count, &locale)) {
                     if (why) {
@@ -1026,10 +954,7 @@ bool ExtractEffectNames(std::string_view text, std::vector<std::string>* names, 
     }
     // .target：4F02D0 按 36F020 取值后在 21 项的表（2AD58F0，静态初始化 9C560）里找，找不到（含缺少 .target）时弹 assert
     // 「EffectTarget: Invalid type」（选错按钮执行 int3），所以缺少或认不出都拒绝
-    static constexpr const char* kTargets[] = { "performer", "target", "performer_group", "performer_group_other", "target_group",
-        "target_group_other", "target_enemy_group", "target_enemy_rank", "target_enemy_random", "target_hero_random", "this_trinket",
-        "global", "performer_adjacent_random", "performer_adjacent_front", "performer_adjacent_behind", "performer_adjacents",
-        "target_adjacent_random", "target_adjacent_front", "target_adjacent_behind", "target_adjacents", "other_trinket" };
+    constexpr const auto& kTargets = game::layout::kEffectTargetsNames;
     for (std::size_t i = 0; i < blocks.size(); ++i) {
         std::string target;
         bool locale = false;

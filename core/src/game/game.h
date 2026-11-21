@@ -1,6 +1,7 @@
 #pragma once
-// 把 signatures.inc 的特征码解析成进程内地址，并做布局校验。
+// 把 signatures.inc 的特征码解析成进程内地址，并做布局校验（layout.inc 的运行时核对见 layout_check.h、ADR 0036）。
 
+#include "layout_check.h"
 #include "phase_tracker.h"
 
 #include <windows.h>
@@ -84,15 +85,22 @@ struct Addresses {
     std::uint8_t* saveSlotBackup = nullptr;
     std::uint8_t* appShutdown = nullptr;
     void* const volatile* storageManager = nullptr;  // StorageManager* 全局；+0x38 是槽 5（当前 profile）的设备，设备 +0x20 是名字
+
+    // 布局清单运行时核对的停用开关（ADR 0036）。CoreBoot 在 Resolve 之后按核对结果填，之后各服务只读
+    check::Gate gate;
 };
 
 struct ResolveReport {
     std::vector<std::string> missing;      // 必需特征码缺失的说明
     std::vector<std::string> layoutErrors; // 布局校验失败的说明
     std::vector<std::string> notes;        // 可选特征码缺失等提示
+    std::vector<check::SigResult> sigs;    // 按 check::Signatures() 的顺序（RVA）
+    check::CheckReport check;              // layout.inc 全部运行时依据的求值结果
+    double resolveMicros = 0;              // 特征码扫描（含 PE 解析）的耗时
 };
 
-// 在 exe 中解析全部特征码并校验布局。返回 false 时 report 写明缺了什么。
+// 在 exe 中解析全部特征码、求值 layout.inc 的运行时依据，并校验状态名表。同一性依据不成立的特征码不给地址
+// （按缺失处理）。返回 false 时 report 写明缺了什么
 bool Resolve(HMODULE exe, Addresses& out, ResolveReport& report);
 
 // HOOK 类特征码的前 steal 字节，就是安装 hook 时要比对的入口字节。id 不存在或含通配时返回 false

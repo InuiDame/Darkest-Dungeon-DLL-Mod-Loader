@@ -1,5 +1,6 @@
 #include "system.h"
 
+#include "../game/layout.h"
 #include "../guard.h"
 #include "churn_log.h"
 
@@ -8,6 +9,7 @@
 #include <intrin.h>
 
 #include <algorithm>
+#include <bit>
 #include <climits>
 #include <cstdio>
 #include <cstring>
@@ -20,6 +22,9 @@
 namespace ddc::events {
 
 namespace {
+
+// 游戏布局常量的唯一来源是 game/layout.inc（tools/dd_update.py verify 核对，依据见 knowledge/dd1/combat.md、events.md）
+using namespace game::layout;
 
 constexpr int kMaxFields = 32;
 
@@ -123,7 +128,7 @@ void WriteRaw(void* base, const FieldMap& map, const Slot& slot)
     }
 }
 
-// 原生事件到语义主题的映射。字段偏移相对事件对象起点，依据见 knowledge/dd1/events.md
+// 原生事件到语义主题的映射。字段偏移相对事件对象起点（layout.inc 的 Ev*），依据见 knowledge/dd1/events.md
 struct NativeSource {
     const char* topic;
     const char* event;
@@ -136,44 +141,44 @@ const std::vector<NativeSource>& NativeSources()
         { "battle.start", "BattleCreatedEvent", {} },
         { "battle.end", "BattleDestroyedEvent", {} },
         { "actor.deathsdoor", "HeroReachedDeathsDoorEvent",
-            { { "hero", Raw::Ptr, 0x10 }, { "damage_type", Raw::I32, 0x18 }, { "source_id", Raw::U32, 0x1C },
-                { "source_type", Raw::I32, 0x20 } } },
+            { { "hero", Raw::Ptr, kEvHeroReachedDeathsDoor_hero }, { "damage_type", Raw::I32, kEvHeroReachedDeathsDoor_damage_type }, { "source_id", Raw::U32, kEvHeroReachedDeathsDoor_source_id },
+                { "source_type", Raw::I32, kEvHeroReachedDeathsDoor_source_type } } },
         { "actor.heartattack", "HeartAttackEvent",
-            { { "heart_attacks", Raw::I32, 0x14 }, { "flag0", Raw::B8, 0x18 }, { "flag1", Raw::B8, 0x19 },
-                { "flag2", Raw::B8, 0x1A } } },
+            { { "heart_attacks", Raw::I32, kEvHeartAttack_heart_attacks }, { "flag0", Raw::B8, kEvHeartAttack_flag0 }, { "flag1", Raw::B8, kEvHeartAttack_flag1 },
+                { "flag2", Raw::B8, kEvHeartAttack_flag2 } } },
         { "actor.death", "HeroDeathEvent",
-            { { "hero_id", Raw::I32, 0x10 }, { "is_monster", Raw::ConstFalse, 0 } } },
+            { { "hero_id", Raw::I32, kEvHeroDeath_hero_id }, { "is_monster", Raw::ConstFalse, 0 } } },
         { "actor.death", "MonsterDeathEvent",
-            { { "monster_guid", Raw::I32, 0x18 }, { "attacker_id", Raw::I32, 0x1C }, { "damage_type", Raw::I32, 0x20 },
-                { "class_field_d0", Raw::I32, 0x10 }, { "class_field_cc", Raw::I32, 0x14 }, { "flag", Raw::B8, 0x24 },
+            { { "monster_guid", Raw::I32, kEvMonsterDeath_monster_guid }, { "attacker_id", Raw::I32, kEvMonsterDeath_attacker_id }, { "damage_type", Raw::I32, kEvMonsterDeath_damage_type },
+                { "class_field_d0", Raw::I32, kEvMonsterDeath_class_field_d0 }, { "class_field_cc", Raw::I32, kEvMonsterDeath_class_field_cc }, { "flag", Raw::B8, kEvMonsterDeath_flag },
                 { "is_monster", Raw::ConstTrue, 0 } } },
-        { "actor.affliction", "HeroAfflictionVirtueEvent", { { "hero", Raw::Ptr, 0x10 } } },
-        { "raid.start", "RaidStartEvent", { { "raid", Raw::Ptr, 0x10 } } },
-        { "raid.finish", "RaidFinishResultsEvent", { { "results", Raw::Ptr, 0x10 } } },
+        { "actor.affliction", "HeroAfflictionVirtueEvent", { { "hero", Raw::Ptr, kEvHeroAfflictionVirtue_hero } } },
+        { "raid.start", "RaidStartEvent", { { "raid", Raw::Ptr, kEvRaidStart_raid } } },
+        { "raid.finish", "RaidFinishResultsEvent", { { "results", Raw::Ptr, kEvRaidFinishResults_results } } },
         { "raid.step", "PartyStepEvent", {} },
         { "raid.torch", "TorchModifiedEvent",
-            { { "torch_before", Raw::F32, 0x10 }, { "torch_after", Raw::F32, 0x14 }, { "delta", Raw::F32, 0x18 },
-                { "flag", Raw::B8, 0x1C } } },
-        { "town.enter", "PreOnStartTownVisitEvent", { { "flag", Raw::B8, 0x10 } } },
-        { "town.event", "TownEventOnStartTownVisitEvent", { { "event", Raw::Ptr, 0x10 } } },
+            { { "torch_before", Raw::F32, kEvTorchModified_torch_before }, { "torch_after", Raw::F32, kEvTorchModified_torch_after }, { "delta", Raw::F32, kEvTorchModified_delta },
+                { "flag", Raw::B8, kEvTorchModified_flag } } },
+        { "town.enter", "PreOnStartTownVisitEvent", { { "flag", Raw::B8, kEvPreOnStartTownVisit_flag } } },
+        { "town.event", "TownEventOnStartTownVisitEvent", { { "event", Raw::Ptr, kEvTownEventOnStartTownVisit_event } } },
         { "town.building", "BuildingStateChangedEvent",
-            { { "name", Raw::Str, 0x10, 0x50 }, { "value", Raw::I32, 0x60 }, { "flag", Raw::B8, 0x64 } } },
-        { "town.activity", "ActivityOpenedEvent", { { "activity", Raw::Ptr, 0x10 }, { "flag", Raw::B8, 0x18 } } },
-        { "town.activity.finish", "ActivityFinishedEvent", { { "activity_id", Raw::I32, 0x10 } } },
-        { "hero.recruit", "HeroRecruitedEvent", { { "hero_id", Raw::I32, 0x10 } } },
-        { "hero.dismiss", "HeroDismissedEvent", { { "hero_id", Raw::I32, 0x10 } } },
+            { { "name", Raw::Str, kEvBuildingStateChanged_name, kEvBuildingStateChanged_name_cap }, { "value", Raw::I32, kEvBuildingStateChanged_value }, { "flag", Raw::B8, kEvBuildingStateChanged_flag } } },
+        { "town.activity", "ActivityOpenedEvent", { { "activity", Raw::Ptr, kEvActivityOpened_activity }, { "flag", Raw::B8, kEvActivityOpened_flag } } },
+        { "town.activity.finish", "ActivityFinishedEvent", { { "activity_id", Raw::I32, kEvActivityFinished_activity_id } } },
+        { "hero.recruit", "HeroRecruitedEvent", { { "hero_id", Raw::I32, kEvHeroRecruited_hero_id } } },
+        { "hero.dismiss", "HeroDismissedEvent", { { "hero_id", Raw::I32, kEvHeroDismissed_hero_id } } },
         { "hero.quirk", "QuirkAppliedEvent",
-            { { "hero_id", Raw::I32, 0x10 }, { "kind", Raw::I32, 0x14 }, { "quirk", Raw::Str, 0x18, 0x100 } } },
-        { "hero.skill", "HeroSkillUpgradedEvent", { { "hero_id", Raw::I32, 0x10 }, { "skill_index", Raw::I32, 0x14 } } },
+            { { "hero_id", Raw::I32, kEvQuirkApplied_hero_id }, { "kind", Raw::I32, kEvQuirkApplied_kind }, { "quirk", Raw::Str, kEvQuirkApplied_quirk, kEvQuirkApplied_quirk_cap } } },
+        { "hero.skill", "HeroSkillUpgradedEvent", { { "hero_id", Raw::I32, kEvHeroSkillUpgraded_hero_id }, { "skill_index", Raw::I32, kEvHeroSkillUpgraded_skill_index } } },
         { "inventory.add", "InventoryAddItemEvent",
-            { { "inventory", Raw::Ptr, 0x10 }, { "item", Raw::Ptr, 0x18 }, { "value", Raw::I32, 0x20 } } },
+            { { "inventory", Raw::Ptr, kEvInventoryAddItem_inventory }, { "item", Raw::Ptr, kEvInventoryAddItem_item }, { "value", Raw::I32, kEvInventoryAddItem_value } } },
         { "inventory.modified", "InventoryModifiedEvent", {} },
         { "inventory.premerge", "InventoryPreMergeEvent",
-            { { "inventory", Raw::Ptr, 0x10 }, { "other", Raw::Ptr, 0x18 } } },
+            { { "inventory", Raw::Ptr, kEvInventoryPreMerge_inventory }, { "other", Raw::Ptr, kEvInventoryPreMerge_other } } },
         { "inventory.postmerge", "InventoryPostMergeEvent",
-            { { "inventory", Raw::Ptr, 0x10 }, { "other", Raw::Ptr, 0x18 } } },
+            { { "inventory", Raw::Ptr, kEvInventoryPostMerge_inventory }, { "other", Raw::Ptr, kEvInventoryPostMerge_other } } },
         { "estate.currency", "EstateCurrencyChangeEvent",
-            { { "currency", Raw::U32, 0x10 }, { "delta", Raw::I32, 0x14 } } },
+            { { "currency", Raw::U32, kEvEstateCurrencyChange_currency }, { "delta", Raw::I32, kEvEstateCurrencyChange_delta } } },
     };
     return kSources;
 }
@@ -191,42 +196,30 @@ struct QueryDef {
 const std::vector<QueryDef>& QueryDefs()
 {
     static const std::vector<QueryDef> kDefs = {
-        { "CampingPointBuffQuery", { { { "points", Raw::I32, 0x08 }, true } } },
+        { "CampingPointBuffQuery", { { { "points", Raw::I32, kQyCampingPointBuff_points }, true } } },
         { "CurioInteractionBuffQuery",
-            { { { "hero", Raw::Ptr, 0x08 }, false }, { { "curio", Raw::Ptr, 0x10 }, false },
-                { { "stress", Raw::F32, 0x18 }, true }, { { "heal", Raw::F32, 0x1C }, true } } },
-        { "FindNonRosterHeroesQuery", { { { "container", Raw::Ptr, 0x08 }, false } } },
+            { { { "hero", Raw::Ptr, kQyCurioInteractionBuff_hero }, false }, { { "curio", Raw::Ptr, kQyCurioInteractionBuff_curio }, false },
+                { { "stress", Raw::F32, kQyCurioInteractionBuff_stress }, true }, { { "heal", Raw::F32, kQyCurioInteractionBuff_heal }, true } } },
+        { "FindNonRosterHeroesQuery", { { { "container", Raw::Ptr, kQyFindNonRosterHeroes_container }, false } } },
         { "InventoryExtraStackingLimitQuery",
-            { { { "item_id", Raw::U32, 0x08 }, false }, { { "arg", Raw::U32, 0x0C }, false },
-                { { "limit", Raw::I32, 0x10 }, true } } },
+            { { { "item_id", Raw::U32, kQyInventoryExtraStackingLimit_item_id }, false }, { { "arg", Raw::U32, kQyInventoryExtraStackingLimit_arg }, false },
+                { { "limit", Raw::I32, kQyInventoryExtraStackingLimit_limit }, true } } },
         { "InventoryReplacementEffectIdQuery",
-            { { { "item_id", Raw::U32, 0x08 }, false }, { { "arg", Raw::U32, 0x0C }, false },
-                { { "effect_id", Raw::I32, 0x10 }, true } } },
-        { "IsDisabledQuery", { { { "hero_id", Raw::U32, 0x08 }, false }, { { "disabled", Raw::B8, 0x0C }, true } } },
+            { { { "item_id", Raw::U32, kQyInventoryReplacementEffectId_item_id }, false }, { { "arg", Raw::U32, kQyInventoryReplacementEffectId_arg }, false },
+                { { "effect_id", Raw::I32, kQyInventoryReplacementEffectId_effect_id }, true } } },
+        { "IsDisabledQuery", { { { "hero_id", Raw::U32, kQyIsDisabled_hero_id }, false }, { { "disabled", Raw::B8, kQyIsDisabled_disabled }, true } } },
         { "LootDarknessBuffQuery",
-            { { { "light", Raw::F32, 0x08 }, false }, { { "result", Raw::Ptr, 0x10 }, true },
-                { { "arg", Raw::I32, 0x18 }, false } } },
-        { "ProvisionIsItemTooltipsEnabledQuery", { { { "enabled", Raw::B8, 0x08 }, true } } },
-        { "ProvisionSupplyBuffQuery", { { { "items_first", Raw::Ptr, 0x08 }, false } } },
-        { "TownGoldInterestBuffQuery", { { { "interest", Raw::I32, 0x08 }, true } } },
-        { "TownVisitIdleStressBuffQuery", { { { "stress_relief", Raw::F32, 0x08 }, true }, { { "flag", Raw::B8, 0x0C }, true } } },
+            { { { "light", Raw::F32, kQyLootDarknessBuff_light }, false }, { { "result", Raw::Ptr, kQyLootDarknessBuff_result }, true },
+                { { "arg", Raw::I32, kQyLootDarknessBuff_arg }, false } } },
+        { "ProvisionIsItemTooltipsEnabledQuery", { { { "enabled", Raw::B8, kQyProvisionIsItemTooltipsEnabled_enabled }, true } } },
+        { "ProvisionSupplyBuffQuery", { { { "items_first", Raw::Ptr, kQyProvisionSupplyBuff_items_first }, false } } },
+        { "TownGoldInterestBuffQuery", { { { "interest", Raw::I32, kQyTownGoldInterestBuff_interest }, true } } },
+        { "TownVisitIdleStressBuffQuery", { { { "stress_relief", Raw::F32, kQyTownVisitIdleStressBuff_stress_relief }, true }, { { "flag", Raw::B8, kQyTownVisitIdleStressBuff_flag }, true } } },
     };
     return kDefs;
 }
 
-// ---- 游戏对象布局常量（依据见 knowledge/dd1/combat.md、events.md） ----
-constexpr std::size_t kActorHp = 0x10A8;       // float
-constexpr std::size_t kActorStress = 0x12FC;   // float
-constexpr std::size_t kBattleRound = 0xA8;     // int
-constexpr std::size_t kVtSlotStress = 36;      // 0x120
-constexpr std::size_t kVtSlotDamage = 50;      // 0x190
-constexpr std::size_t kVtSlotHeal = 51;        // 0x198
-
-constexpr std::size_t kEntrySize = 0x28;       // EventListenerDataContainer
-constexpr std::size_t kEntryListener = 0x08;
-constexpr std::size_t kEntryActive = 0x10;
-constexpr std::size_t kQueryEntrySize = 0x18;  // BaseListenerDataContainer<Query>
-
+// EventManager / QueryDispatcher 按类型序号索引的列表（layout.inc 的 ListDataSize、ListDataDirty）
 struct ListData {
     std::uint8_t* first;
     std::uint8_t* last;
@@ -234,15 +227,19 @@ struct ListData {
     std::uint8_t dirty;
     std::uint8_t pad[7];
 };
+static_assert(sizeof(ListData) == kListDataSize && offsetof(ListData, dirty) == kListDataDirty);
 
-// Listener<T const> / Listener<T> 布局
+// Listener<T const> / Listener<T> 布局（ListenerPriority、ListenerFunction，std::function 的实现指针在其中 StdFunctionImpl）
 struct FakeListener {
     void* vtable;
     std::int32_t priority;
     std::int32_t pad0;
-    std::uint8_t funcStorage[0x38];
+    std::uint8_t funcStorage[kStdFunctionImpl];
     void* funcImpl;
 };
+static_assert(offsetof(FakeListener, priority) == kListenerPriority && offsetof(FakeListener, funcStorage) == kListenerFunction &&
+    offsetof(FakeListener, funcImpl) == kListenerFunction + kStdFunctionImpl &&
+    sizeof(FakeListener) == kListenerFunction + kStdFunctionSize);
 
 // 派发策略，见 system.h
 enum class ListKind { Event, Query };
@@ -439,6 +436,17 @@ using AdvanceRoundFn = void(__fastcall*)(void*);
 using StartTurnFn = int(__fastcall*)(void*, void*, void*);
 using ConsumeBlockFn = bool(__fastcall*)(void*, int, float);
 using ActorPredicateFn = bool(__fastcall*)(void*);
+using ListenerAddFn = void*(__fastcall*)(void*, void*);
+
+// 原型和 layout.inc 的 Proto* 项绑定（参数个数，U1 修复 FA）：游戏更新改了原型要同时改这里和清单
+static_assert(kArgs<DamageFn> == kProtoActorDamage && kArgs<HealFn> == kProtoActorHeal && kArgs<StressFn> == kProtoActorStress);
+static_assert(kArgs<EffectFn> == kProtoEffectApplyInternal && kArgs<VoidThis3> == kProtoApplyHit && kArgs<VoidThis3> == kProtoApplyMiss);
+static_assert(kArgs<AttackSkillFn> == kProtoActorDoAttackSkill && kArgs<FriendlySkillFn> == kProtoActorDoSkillFriendly);
+static_assert(kArgs<AdvanceRoundFn> == kProtoBattleAdvanceRound && kArgs<StartTurnFn> == kProtoCombatStartTurn);
+static_assert(kArgs<ConsumeBlockFn> == kProtoConsumeHealthDamageBlock && kArgs<ActorPredicateFn> == kProtoActorPredicate);
+static_assert(kArgs<ListenerAddFn> == kProtoListenerAdd && kArgs<ListenerAddFn> == kProtoQueryListenerAdd);
+// 按固定宽度读写的字段（layout.inc 的宽度项）
+static_assert(kHitDataScalarSize == sizeof(float) && kBattleIntSize == sizeof(std::int32_t) && kActorFloatSize == sizeof(float));
 
 struct HookOrig {
     DamageFn heroDamage = nullptr;
@@ -561,7 +569,7 @@ bool ActivePvP()
     }
     __try {
         const auto* raid = static_cast<const std::uint8_t*>(*addr->raidCurrent);
-        const char* name = *reinterpret_cast<const char* const*>(raid + 0x52C0);
+        const char* name = *reinterpret_cast<const char* const*>(raid + kRaidPvpName);
         return name && std::strcmp(name, "arena_mp") == 0;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
@@ -690,9 +698,7 @@ bool SetActorHp(void* actor, float value)
     }
 }
 
-constexpr std::size_t kVtSlotDeathsDoor = 40;  // 0x140
-constexpr std::size_t kVtSlotDead = 43;        // 0x158
-constexpr float kDamageEpsilon = 1e-6f;        // 4836A0 扣血前比较的阈值（0xEE61E0 处的常量）
+constexpr float kDamageEpsilon = std::bit_cast<float>(kDamageEpsilonBits);  // 4836A0 扣血前比较的阈值（0xEE61E0 处的常量）
 
 // 怪物受伤（5FC3E0）在 480400 返回假之后的扣血规则（P4 审核 A-S2，[静态]）：只有免疫一个分支不扣血——
 // [[Monster+0x1468]+0xF97]（.can_be_damaged_directly）为 0 且 DEB7D0[伤害类型] 非 0（类型 0–7、9、10、13–19）；
@@ -702,16 +708,16 @@ enum class MonsterDeduct { NotMonsterPath, Deducts, Immune, Unknown };
 MonsterDeduct MonsterRule(void* actor, int type)
 {
     const auto* table = g_ctx->addr->monsterImmuneTable;
-    if (type < 0 || type >= 20 || !table) {
+    if (type < 0 || type >= static_cast<int>(kMonsterImmuneTypeCount) || !table) {
         return MonsterDeduct::Unknown;  // 表只有 20 种类型有意义；超出时游戏读的是表外的字节
     }
     __try {
         const auto* p = static_cast<const std::uint8_t*>(actor);
-        const auto* monsterClass = *reinterpret_cast<const std::uint8_t* const*>(p + 0x1468);
+        const auto* monsterClass = *reinterpret_cast<const std::uint8_t* const*>(p + kMonsterClass);
         if (!monsterClass) {
             return MonsterDeduct::Unknown;
         }
-        return monsterClass[0xF97] == 0 && table[type] != 0 ? MonsterDeduct::Immune : MonsterDeduct::Deducts;
+        return monsterClass[kMonsterClassCanBeDamagedDirectly] == 0 && table[type] != 0 ? MonsterDeduct::Immune : MonsterDeduct::Deducts;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return MonsterDeduct::Unknown;
     }
@@ -918,8 +924,6 @@ float __fastcall MonsterStressDetour(void* self, void* prng, float amount, void*
     return StressImpl(g_ctx->orig.monsterStress, self, prng, amount, source, type);
 }
 
-constexpr std::size_t kEffectSwapRoles = 0x3E0;
-
 void __fastcall EffectApplyDetour(void* prng, void* performer, void* target, const void* effect, void* item, float f1,
     bool b1, float f2, int source, unsigned u, void* result, bool b2, bool b3)
 {
@@ -935,12 +939,12 @@ void __fastcall EffectApplyDetour(void* prng, void* performer, void* target, con
         return;
     }
     // effect+0x3E0 非零时游戏交换执行者和目标（4C50DF），负载给出实际生效的双方，压力和 HP 也读实际目标
-    const bool swapped = *(static_cast<const std::uint8_t*>(effect) + kEffectSwapRoles) != 0;
+    const bool swapped = *(static_cast<const std::uint8_t*>(effect) + kEffectSwap) != 0;
     void* const actualPerformer = swapped ? target : performer;
     void* const actualTarget = swapped ? performer : target;
     // Effect+0 是 char[64] 名字（4F02D0），复制一份保证以 0 结尾
-    char effectName[65] = {};
-    std::memcpy(effectName, effect, 64);
+    char effectName[kEffectNameCap + 1] = {};
+    std::memcpy(effectName, static_cast<const std::uint8_t*>(effect) + kEffectName, kEffectNameCap);
     Slot slots[kMaxFields]{};
     const auto fill = [&] {
         slots[EF_performer].v.p = actualPerformer;
@@ -954,9 +958,9 @@ void __fastcall EffectApplyDetour(void* prng, void* performer, void* target, con
         slots[EF_source].v.i = source;
         slots[EF_source].set = true;
         // Effect 字段偏移来自 .darkest 解析函数（4F02D0）：.stress +0x4C、.heal +0xC8
-        slots[EF_stressAmt].v.f = ReadFloat(effect, 0x4C);
+        slots[EF_stressAmt].v.f = ReadFloat(effect, kEffectStress);
         slots[EF_stressAmt].set = true;
-        slots[EF_healAmt].v.f = ReadFloat(effect, 0xC8);
+        slots[EF_healAmt].v.f = ReadFloat(effect, kEffectHeal);
         slots[EF_healAmt].set = true;
         slots[EF_stress].v.f = actualTarget ? ReadFloat(actualTarget, kActorStress) : 0.0f;
         slots[EF_stress].set = true;
@@ -998,13 +1002,6 @@ void __fastcall EffectApplyDetour(void* prng, void* performer, void* target, con
         c.hub->Dispatch(c.effectPost, payload);
     }
 }
-
-constexpr std::size_t kAttackPerformer = 0x20;
-constexpr std::size_t kAttackSkill = 0x28;
-constexpr std::size_t kTargetActor = 0x00;
-constexpr std::size_t kTargetDamage = 0x08;
-constexpr std::size_t kTargetHit = 0x10;
-constexpr std::size_t kTargetCrit = 0x11;
 
 // 命中结算路由：hit.pre 可以改 hit、crit、damage
 void DispatchHit(void* battle, void* attack, void* tgt, bool originalHit)
@@ -1089,14 +1086,14 @@ void __fastcall ApplyMissDetour(void* battle, void* attack, void* tgt)
     DispatchHit(battle, attack, tgt, false);
 }
 
-// std::vector<Actor*> 的 first/last
+// std::vector<Actor*> 的 first（StdVectorFirst）/last（StdVectorLast）
 void** VecFirst(void* vec)
 {
-    return static_cast<void**>(ReadPtr(vec, 0));
+    return static_cast<void**>(ReadPtr(vec, kStdVectorFirst));
 }
 void** VecLast(void* vec)
 {
-    return static_cast<void**>(ReadPtr(vec, 8));
+    return static_cast<void**>(ReadPtr(vec, kStdVectorLast));
 }
 
 void SkillImpl(void* battle, void* performer, const void* skill, void* targets, bool friendly, bool flag)
@@ -1349,7 +1346,7 @@ struct System::Impl {
         for (auto* p = reinterpret_cast<std::uint64_t*>(RdataBegin);
              reinterpret_cast<std::uint8_t*>(p + 1) <= RdataEnd; ++p) {
             const std::uintptr_t q = *p;
-            if (q < rdBegin || q >= rdEnd || rdEnd - q < 24) {
+            if (q < rdBegin || q >= rdEnd || rdEnd - q < kRttiObjectLocatorSize) {
                 continue;
             }
             const auto* col = reinterpret_cast<const std::uint32_t*>(q);
@@ -1363,7 +1360,7 @@ struct System::Impl {
             if (tdRva < 0x1000 || tdRva + 0x20 >= imageSize) {
                 continue;
             }
-            const char* name = reinterpret_cast<const char*>(image + tdRva + 0x10);
+            const char* name = reinterpret_cast<const char*>(image + tdRva + kRttiTypeDescriptorName);
             const std::size_t prefixLen = (std::strncmp(name, kEventPrefix, sizeof(kEventPrefix) - 1) == 0)
                 ? sizeof(kEventPrefix) - 1
                 : (std::strncmp(name, kQueryPrefix, sizeof(kQueryPrefix) - 1) == 0 ? sizeof(kQueryPrefix) - 1 : 0);
@@ -1391,19 +1388,20 @@ struct System::Impl {
         }
         tdIndexBuilt = true;
         static constexpr char kPrefix[] = ".?AV";
-        auto* p = DataBegin + 0x10;
+        // 类型描述符的修饰名在描述符 +kRttiTypeDescriptorName（layout.inc）
+        auto* p = DataBegin + kRttiTypeDescriptorName;
         while (p + 4 < DataEnd) {
             auto* hit = static_cast<std::uint8_t*>(std::memchr(p, '.', static_cast<std::size_t>(DataEnd - p - 4)));
             if (!hit) {
                 break;
             }
-            if (std::memcmp(hit, kPrefix, 4) == 0 && hit - DataBegin >= 0x10) {
+            if (std::memcmp(hit, kPrefix, 4) == 0 && hit - DataBegin >= static_cast<std::ptrdiff_t>(kRttiTypeDescriptorName)) {
                 const char* name = reinterpret_cast<const char*>(hit);
                 std::size_t length = strnlen(name, static_cast<std::size_t>(DataEnd - hit));
                 if (length > 4 && length < 512) {
                     std::string text(name, length);
                     if (text.rfind(".?AV?$Listener@", 0) == 0 || text == ".?AVBaseListener@@") {
-                        tdIndex.emplace(std::move(text), hit - 0x10);
+                        tdIndex.emplace(std::move(text), hit - kRttiTypeDescriptorName);
                     }
                 }
                 p = hit + (length ? length : 1);
@@ -1481,12 +1479,17 @@ struct System::Impl {
             *why = "未找到 BaseListener 的类型描述符";
             return nullptr;
         }
-        auto* bcd0 = RttiAlloc(0x1C);
-        auto* bcd1 = RttiAlloc(0x1C);
+        // 结构大小按 MSVC x64 RTTI（layout.inc 的 Rtti*Size）；下面按 int32 下标填的字段和它们一致
+        static_assert(kRttiBaseClassDescriptorSize == 7 * sizeof(std::int32_t) && kRttiClassHierarchySize == 4 * sizeof(std::int32_t) &&
+            kRttiObjectLocatorSize == 6 * sizeof(std::int32_t), "RTTI 结构的大小和下面填的字段不一致");
+        // 虚表：COL 指针 + 填的槽（ForgedListenerVtableSlots）+ 结尾留一个空位
+        static_assert(kForgedListenerVtableSlots == 1, "伪造虚表只填槽 0，改槽数时同步改下面的填写");
+        auto* bcd0 = RttiAlloc(kRttiBaseClassDescriptorSize);
+        auto* bcd1 = RttiAlloc(kRttiBaseClassDescriptorSize);
         auto* bases = RttiAlloc(2 * sizeof(std::int32_t));
-        auto* chd = RttiAlloc(0x10);
-        auto* col = RttiAlloc(0x18);
-        auto* vtable = RttiAlloc(0x18);
+        auto* chd = RttiAlloc(kRttiClassHierarchySize);
+        auto* col = RttiAlloc(kRttiObjectLocatorSize);
+        auto* vtable = RttiAlloc((1 + kForgedListenerVtableSlots + 1) * sizeof(void*));
         if (!bcd0 || !bcd1 || !bases || !chd || !col || !vtable) {
             *why = "RTTI 伪造页分配失败";
             return nullptr;
@@ -1532,9 +1535,11 @@ struct System::Impl {
     }
 
     // ---- 主题注册 ----
+    // 语义 hook 主题：背后都是内联 hook 或虚表槽（BuildHookDefs），按 ADR 0036 算「写」
     Topic* AddSemantic(const char* name, std::vector<FieldDesc> fields, bool writable, bool cancellable)
     {
         Topic* topic = hub->AddTopic(name, TopicKind::Semantic, std::move(fields), writable, cancellable);
+        topic->hooked = true;
         return topic;
     }
 
@@ -1570,6 +1575,10 @@ struct System::Impl {
             false, false);
         campaignUnload = hub->AddTopic("campaign.unload", TopicKind::App, { FieldDesc{ "serial", DD_FIELD_INT, kAccessR } },
             false, false);
+        // 应用主题由 DDCore 的每帧 hook（UpdateStateInternal）派发
+        for (Topic* t : { appTick, appState, campaignLoad, campaignUnload }) {
+            t->hooked = true;
+        }
 
         // 按需检查所依赖的地址
         const auto setMissing = [&](Topic* topic, const std::string& reason) {
@@ -1608,6 +1617,12 @@ struct System::Impl {
                 }
             }
         }
+        // 布局核对停用了 pvp（ADR 0036）：同上，另外 Query 写回（RegisterQueryTopics）和 combat 写操作（core.cpp）也停
+        if (addr->gate.Off(game::check::Dep::Pvp)) {
+            for (Topic* t : { c.damagePre, c.effectPre, c.skillPre, c.hitPre, c.stressPre, c.healPre, c.damageFinal }) {
+                hub->Gate(t, "PvP 判定停用（" + addr->gate.Reason(game::check::Dep::Pvp) + "）");
+            }
+        }
     }
 
     TypeState* FindNative(const char* name)
@@ -1625,7 +1640,7 @@ struct System::Impl {
         auto* addr = deps.addr;
         const int count = *addr->eventTypeCount;
         for (int i = 0; i < count; ++i) {
-            const char* raw = addr->eventClassNames + static_cast<std::size_t>(i) * 0x80;
+            const char* raw = addr->eventClassNames + static_cast<std::size_t>(i) * kClassNameStride;
             if (!raw[0]) {
                 continue;
             }
@@ -1743,6 +1758,16 @@ struct System::Impl {
                 hub->SetAvailability(topic, false, "来源原生事件不存在或没有 Listener 虚表");
             }
         }
+        // 布局核对停用了原生事件桥（ADR 0036）：native.* 和映射来的语义主题都不可用，不往游戏的 listener 列表里注册
+        if (deps.addr->gate.Off(game::check::Dep::EventsNative)) {
+            const std::string reason = "原生事件桥停用（" + deps.addr->gate.Reason(game::check::Dep::EventsNative) + "）";
+            for (auto& type : eventTypes) {
+                hub->Gate(type->topic, reason);
+            }
+            for (const auto& topicName : mergedOrder) {
+                hub->Gate(hub->Find(topicName), reason);
+            }
+        }
     }
 
     void RegisterQueryTopics()
@@ -1757,7 +1782,7 @@ struct System::Impl {
             return;
         }
         for (int i = 0; i < addr->queryTypeCount; ++i) {
-            const char* raw = addr->queryClassNames + static_cast<std::size_t>(i) * 0x80;
+            const char* raw = addr->queryClassNames + static_cast<std::size_t>(i) * kClassNameStride;
             auto type = std::make_unique<TypeState>();
             type->kind = ListKind::Query;
             type->id = i;
@@ -1794,6 +1819,16 @@ struct System::Impl {
             }
             queryTypes.push_back(std::move(type));
         }
+        // 布局核对停用了 Query 桥或 PvP 判定（ADR 0036）：Query 的回调能写回结果，PvP 判定不可用时也不派发
+        const auto& gate = addr->gate;
+        const bool queryOff = gate.Off(game::check::Dep::EventsQuery);
+        if (queryOff || gate.Off(game::check::Dep::Pvp)) {
+            const std::string reason = queryOff ? "Query 桥停用（" + gate.Reason(game::check::Dep::EventsQuery) + "）"
+                                                : "PvP 判定停用，Query 写回不可用（" + gate.Reason(game::check::Dep::Pvp) + "）";
+            for (auto& type : queryTypes) {
+                hub->Gate(type->topic, reason);
+            }
+        }
     }
 
     static void* const* kImplVtable();
@@ -1816,9 +1851,9 @@ struct System::Impl {
             return;
         }
         if (type.kind == ListKind::Event) {
-            reinterpret_cast<void*(__fastcall*)(void*, void*)>(deps.addr->listenerAdd)(list, &type.listener);
+            reinterpret_cast<ListenerAddFn>(deps.addr->listenerAdd)(list, &type.listener);
         } else {
-            reinterpret_cast<void*(__fastcall*)(void*, void*)>(deps.addr->queryListenerAdd)(list, &type.listener);
+            reinterpret_cast<ListenerAddFn>(deps.addr->queryListenerAdd)(list, &type.listener);
         }
     }
 
@@ -1829,10 +1864,10 @@ struct System::Impl {
         if (!list) {
             return;
         }
-        const std::size_t stride = type.kind == ListKind::Event ? kEntrySize : kQueryEntrySize;
+        const std::size_t stride = type.kind == ListKind::Event ? kListenerEntrySize : kQueryListenerEntrySize;
         for (auto* e = list->first; e != list->last; e += stride) {
-            if (*reinterpret_cast<void**>(e + kEntryListener) == &type.listener) {
-                e[kEntryActive] = 0;
+            if (*reinterpret_cast<void**>(e + kListenerEntryListener) == &type.listener) {
+                e[kListenerEntryActive] = 0;
                 list->dirty = 1;
             }
         }
@@ -1894,7 +1929,7 @@ struct System::Impl {
         if (!list) {
             return;
         }
-        const std::size_t stride = type.kind == ListKind::Event ? kEntrySize : kQueryEntrySize;
+        const std::size_t stride = type.kind == ListKind::Event ? kListenerEntrySize : kQueryListenerEntrySize;
         const std::size_t total = static_cast<std::size_t>(list->last - list->first) / stride;
         int active = 0;
         int ourActiveIndex = -1;
@@ -1902,11 +1937,11 @@ struct System::Impl {
         int minCount = 0;
         for (std::size_t i = 0; i < total; ++i) {
             auto* e = list->first + i * stride;
-            auto* listener = *reinterpret_cast<std::uint8_t**>(e + kEntryListener);
-            if (!e[kEntryActive]) {
+            auto* listener = *reinterpret_cast<std::uint8_t**>(e + kListenerEntryListener);
+            if (!e[kListenerEntryActive]) {
                 continue;
             }
-            const int priority = SafeReadInt(listener + 8);
+            const int priority = SafeReadInt(listener + kListenerPriority);
             if (priority < minPriority) {
                 minPriority = priority;
                 minCount = 1;
@@ -1966,16 +2001,16 @@ struct System::Impl {
             int lowest = INT_MAX;
             int active = 0;
             int ourIndex = -1;
-            for (auto* e = list->first; e != list->last; e += kEntrySize) {
-                auto* listener = *reinterpret_cast<std::uint8_t**>(e + kEntryListener);
-                if (!e[kEntryActive]) {
+            for (auto* e = list->first; e != list->last; e += kListenerEntrySize) {
+                auto* listener = *reinterpret_cast<std::uint8_t**>(e + kListenerEntryListener);
+                if (!e[kListenerEntryActive]) {
                     continue;
                 }
                 if (listener == reinterpret_cast<std::uint8_t*>(&type.listener)) {
                     ourIndex = active;
                 } else {
                     ++others;
-                    lowest = (std::min)(lowest, SafeReadInt(listener + 8));
+                    lowest = (std::min)(lowest, SafeReadInt(listener + kListenerPriority));
                 }
                 ++active;
             }
@@ -2209,6 +2244,8 @@ void* const kImplVtableStorage[] = {
     reinterpret_cast<void*>(&ImplDelete),
     reinterpret_cast<void*>(&ImplGet),
 };
+static_assert(std::size(kImplVtableStorage) == kStdFuncImplVtableSlots, "std::function 实现的虚表槽数和 layout.inc 不一致");
+static_assert(kArgs<decltype(&ImplDoCall)> == kProtoStdFuncDoCall, "_Do_call 的参数个数和 layout.inc 的 ProtoStdFuncDoCall 不一致");
 
 // 回调入口用的全局实例（同时只有一个 System）
 System::Impl* g_impl = nullptr;
@@ -2274,7 +2311,7 @@ void System::Impl::HandleEventCallback(TypeState& type, const std::uint8_t* even
         Slot slots[kMaxFields]{};
         slots[0].v.s = type.name.c_str();
         slots[0].set = true;
-        slots[1].v.i = *reinterpret_cast<const std::int64_t*>(event + 8);
+        slots[1].v.i = *reinterpret_cast<const std::int64_t*>(event + kEventTime);
         slots[1].set = true;
         for (std::size_t i = 0; i < type.queryFields.size() && i < type.querySlotIndices.size(); ++i) {
             const std::uint32_t index = type.querySlotIndices[i];

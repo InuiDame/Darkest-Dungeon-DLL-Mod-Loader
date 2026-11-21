@@ -4,6 +4,8 @@
 // 依据：knowledge/dd1/combat.md 的「Buff 结构」「Buff 规则」，设计见 ADR 0025（写操作的时机）、0028（运行时定义）、
 // 0029（规则扩展）。下面的 D3、D8 是 P4 简报的设计编号，和 ADR 的对应见 docs/history/p4-review-findings.md。
 
+#include "../game/layout.h"
+
 #include <dd/dd_api.h>
 
 #include <atomic>
@@ -19,20 +21,20 @@
 
 namespace ddc::combat {
 
-// 游戏的字符串哈希 h = h*53 + c（无符号 32 位），buff id、规则字符串、effect 名字都用它
+// 游戏的字符串哈希 h = h*53 + c（无符号 32 位，乘数是 layout.inc 的 GameHashMul），buff id、规则字符串、effect 名字都用它
 std::uint32_t GameHash(std::string_view text);
 
 // ---- 枚举表 ----
 // 名字和数值来自游戏的静态初始化函数（stat 75820、source 78500、duration 78FB0、rule 79340，Steam 版 RVA），
-// tools/check_actor_layout.py 离线核对两个 exe。source 的名字在游戏里带前缀 bsrc_，这里去掉，查找时两种写法都认
+// 表在 game/layout.inc，tools/dd_update.py verify 离线核对两个 exe。source 的名字在游戏里带前缀 bsrc_，这里去掉，查找时两种写法都认
 std::uint32_t EnumCount(std::uint32_t table);
 const char* EnumName(std::uint32_t table, std::int32_t value);  // 超界或表号不对返回 nullptr
 std::int32_t EnumValue(std::uint32_t table, std::string_view name);  // 找不到返回 -1
-// 来源的 DD_SOURCE_F_* 标志（来源表 +0x44、+0x46、+0x48，静态初始化 78500 写的常量，check_actor_layout.py 核对），超界返回 0
+// 来源的 DD_SOURCE_F_* 标志（来源表 +0x44、+0x46、+0x48，静态初始化 78500 写的常量，layout.inc 的 SourceFlags），超界返回 0
 std::uint32_t SourceFlags(std::int32_t source);
 
 // ---- 参数校验 ----
-inline constexpr std::size_t kTextMax = 63;  // 游戏里 char[64] 字段的最大长度
+inline constexpr std::size_t kTextMax = game::layout::kGameTextCap - 1;  // 游戏里 char[64] 字段的最大长度
 bool ValidText(std::string_view text, bool allowEmpty);
 // stat_sub_type 按 stat 校验：combat_stat_add/multiply、resistance、activity_side_effect_chance、disable_combat_skill_attribute
 // 必须是游戏认的名字；压力和治疗类的可以为空或是游戏认的来源；其余 stat 不限（见 logic.cpp 的表）
@@ -249,7 +251,7 @@ struct EffectBlock {
     std::string text;        // 块的内容（游戏复制进缓冲的那一段）
 };
 // 块的最大长度：2904D0 用 strncpy_s(reader, 0x400, 块, 块长) 复制，块长 >= 0x400 时进程被 CRT 终止
-inline constexpr std::size_t kEffectBlockMax = 0x3FF;
+inline constexpr std::size_t kEffectBlockMax = game::layout::kEffectBlockMax;
 // 按游戏的规则分块，并拒绝会让游戏崩溃、死循环或结果依赖区域设置的文本（见 logic.cpp 的说明），why 写原因
 bool ParseEffectText(std::string_view text, std::vector<EffectBlock>* blocks, std::string* why);
 // 提取文本里每个 effect: 块游戏会用的 .name。除 ParseEffectText 的检查以外，有不是 effect: 的块、块没有 .name、

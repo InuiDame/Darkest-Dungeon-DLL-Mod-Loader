@@ -36,7 +36,7 @@ DD.ModLoader/
 ├─ templates/      native 插件模板、Lua Mod 模板（templates/lua/）
 ├─ examples/       hello_native、hello_events、lua/hello_lua、lua/shield_lite（DDShield 护盾的 Lua 复刻）
 ├─ tests/          unit/ 不依赖游戏的单元测试，plugins/ 游戏内自检和探针插件，lua/ 测试用和场景用的 Lua Mod
-├─ tools/          rig.py、check_sigs.py、event_coverage.py 等，见 06-workflow.md
+├─ tools/          rig.py、dd_update.py（校验、修复、自测，模块在 ddupdate/，基线在 baseline/）、event_coverage.py 等，见 06-workflow.md
 ├─ spikes/p0/      P0 的验证代码，不在构建中，只作参考
 └─ docs/
 ```
@@ -97,7 +97,7 @@ P4 的 Buff、Effect、技能都经 `combat` 服务开放（取舍见 [ADR 0025]
 - **读取的时机**：buff、Buff 库、effect 的读取只在主线程、没有加载线程在跑时进行，否则返回 false（加载线程会前移、搬动 buff 表，审核 A-S3）。`read_ready` 报告现在能不能读，插件用它区分「加载中」和「真的没有」（R2A-S1，DDLua 据此返回以「加载中」开头的原因）。
 - **主题**（[ADR 0026](adr/0026-buff-topics-on-container-ops.md)、[0030](adr/0030-damage-final-absorb.md)）：`buff.add`（`5C4F50` 出口）、`buff.remove`（`5C4FF0` 入口，原因按调用栈里最内层认得的游戏函数判断；`buff_remove` 只把谓词命中的条目算 `plugin`）、`buff.tick`（`47AAD0` 入口和出口对比，原函数里减到 0 被删的条目在删除前补派发）、`damage.final`（`480400`，攻击者在槽位 50 记下；部分吸收按调用者区分英雄和怪物的扣血规则，怪物的返回点和免疫表由特征码 `MonsterBlockReturn` 定位），都按需安装。只在存档里派发，进存档之后加载线程上的按 [ADR 0009](adr/0009-off-thread-events-deferred.md) 延迟派发。`effect.*` 加了 `effect_name`，`skill.pre` 改成只读。
 - **规则扩展**（[ADR 0029](adr/0029-rule-extension-entry-hook.md)）：`479CD0` 入口 hook，有规则注册时才装。`rule_type` 是 13/42 且 `rule_data.string` 的哈希命中注册表时调用回调，回调返回 `DD_RULE_TRUE` / `DD_RULE_FALSE` 时 DDCore 按 `is_false_rule` 取反；回调返回 `DD_RULE_ORIGINAL`（出错、超时、停用中）、不在主线程、PvP、回调崩溃过时转原函数，和没有注册时一样。游戏内置的状态名（`stunned` 等 8 个，规则 13/42 自己判断的）不能注册。命中次数、耗时和单帧峰值有统计（`rule_stats`），退出存档时写进 `DDCore.log`。
-- 依赖的特征码缺失时只有对应的能力不可用（返回 `DD_COMBAT_E_UNAVAILABLE` 或主题不可用）。结构偏移由 `tools/check_actor_layout.py` 离线核对。
+- 依赖的特征码缺失时只有对应的能力不可用（返回 `DD_COMBAT_E_UNAVAILABLE` 或主题不可用）。结构偏移登记在布局清单里，离线由 `dd_update.py verify` 核对，运行时由 DDCore 核对，不成立时按依赖表停用（见下面「地址、布局清单和校验」）。
 
 外部模块的 hook 经 `events::System::AddHook` 挂到事件系统的同一套按需装卸里（订阅数或额外条件），和语义 hook 一样只在帧边界、避开加载线程修改。
 
@@ -123,15 +123,21 @@ DDLua 这一侧（`lua/src/combat.cpp`）：所有 Lua Mod 共用 DDLua 这一�
 - AppReady、AssetsReady 和每次 CampaignLoad 时输出 hook 报告到 `DDCore.log`，并核对补丁是否还在，失效的项写 WARN。
 - 现有插件的 hook 清单见 `knowledge/dd1/hooks.md`；和框架冲突的插件直接卸载（[ADR 0017](adr/0017-no-legacy-plugin-compat.md)）。
 
-## 特征码
+## 地址、布局清单和校验
 
-地址只用特征码，规则见 [ADR 0006](adr/0006-signature-addressing.md)。`signatures.inc` 的写法约定：内联语义 hook 的特征码把入口 steal 字节写成通配（入口可能已被别的 DLL hook），`DD_ENTRY` 给出真实入口字节，`DD_CHAIN_TARGET` 标记 DDCore 内部串联的目标（`check_sigs.py` 不算重叠错误）。
+地址只用特征码，规则见 [ADR 0006](adr/0006-signature-addressing.md)；地址之外的游戏布局和整条更新流水线见 [ADR 0035](adr/0035-update-pipeline.md)，运行时核对和停用见 [ADR 0036](adr/0036-runtime-layout-check.md)。
+
+- **布局清单**：`core/src/game/signatures.inc`（地址）和 `layout.inc`（结构偏移和大小、虚表槽位、枚举表、事件和 Query 负载偏移、命中位置上的固定偏移）是唯一来源，加载器、DDCore、`tools/dd_update.py` 都读它们，C++ 经 `layout.h` 取常量（`layout::k<名字>`）。每一项带依赖表（失效时影响哪些服务和主题）和依据：运行时可求值的 `DD_EVIDENCE`、只能离线求值的 `DD_OFFLINE`，或者 `DD_UNVERIFIED` 写明怎么核实。格式写在两个文件开头。
+- **`signatures.inc` 的写法约定**：内联语义 hook 的特征码把入口 steal 字节写成通配（入口可能已被别的 DLL hook），`DD_ENTRY` 给出真实入口字节，`DD_CHAIN_TARGET` 标记 DDCore 内部串联的目标（校验时不算重叠错误），`ANCHOR` 是只给依据当锚点的特征码。
+- **运行时核对**（`core/src/game/layout_check.cpp`）：`game::Resolve` 扫描特征码之后、装任何 hook 之前，对全部运行时依据求值（自己解析异常目录，语义和 `tools/ddupdate` 的 Python 实现相同，`tests/layout_compare` 的对照测试逐项比较）。约 60 ms 扫描加 13 ms 求值。
+- **停用**：不成立的项按依赖表停用读写能力和主题；未知版本上只能离线核对、没有静态依据的项按「不能核对」处理，停用写能力和可写的主题，只读的照常；依赖表里有 `core` 的必需项落到停用时 DDCore 整体停用。开关是 `game::Addresses::gate`，服务入口查 `Gated(...)`，主题经 `Hub::Gate` 标成不可用。特征码的同一性依据不成立时这条特征码不给地址。
+- **离线校验和修复**（`tools/dd_update.py`，[06-workflow.md](06-workflow.md) 的「游戏更新后」）：`verify` 在运行时核对之外还做要反汇编或要基线的检查：HOOK 偷取范围和入口、命中的函数是不是基线里的同一个（同一性）、依据唯一命中的位置是不是基线里那条指令（依据位置核对，没法对照又没有佐证时记为无法确认、不算通过）、同组（`DD_GROUP`）有成员变了时列出组里要人工核实的项；`repair` 定位失效项、给出补丁和逐项可信度，`accept` 把新版本记为已知、生成基线（只放行运行时自己会发现的失效，NONE 项、同组升级的项、无法确认的项要逐项确认，确认记录进仓库）；`selftest` 用盲定位和变异样本自测。
 
 ## 主要风险
 
 | 风险 | 对策 |
 | --- | --- |
-| 游戏更新使特征码失效 | 离线校验，失败时停用，不崩溃（ADR 0006） |
+| 游戏更新使特征码或结构偏移失效 | 离线校验和修复（ADR 0035）；运行时核对布局清单，失败时按依赖表停用，不崩溃、不读写错位置（ADR 0006、0036） |
 | 脚本改动战斗导致 PvP 不同步 | PvP 中不派发会改结算的订阅（ADR 0011） |
 | 脚本错误拖垮游戏 | 回调 SEH 隔离；Lua 全部保护调用，执行预算按真实时间（[ADR 0020](adr/0020-lua-budget-best-effort.md)），原生异常后丢弃 VM |
 | 悬垂的游戏对象 | 事件负载只在回调期间有效（[ADR 0023](adr/0023-lua-payload-and-coroutines.md)）；跨回调保存用不带指针的句柄 |

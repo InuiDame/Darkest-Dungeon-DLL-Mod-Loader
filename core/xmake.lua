@@ -8,6 +8,6 @@ target("DDCore")
     add_files("src/main.cpp", "src/core.cpp", "src/guard.cpp", "src/log.cpp")
     add_files("src/hook/*.cpp", "src/logic/*.cpp", "src/runtime/*.cpp", "src/game/*.cpp", "src/plugin/*.cpp", "src/events/*.cpp",
         "src/combat/*.cpp", "src/persist/*.cpp")
-    add_headerfiles("src/**.h", "src/game/signatures.inc")
+    add_headerfiles("src/**.h", "src/game/signatures.inc", "src/game/layout.inc")
     add_syslinks("shlwapi")
 target_end()

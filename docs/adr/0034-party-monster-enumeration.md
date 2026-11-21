@@ -17,7 +17,7 @@ Mod 要在「没有事件」的时候知道队伍、怪物和场合：开战后 
 
 ## 后果
 
-- `Raid+8` 的读法有静态依据（`4C41F0` 的 `target_hero_random` 分支、`Battle::HeroesRerank` 的写回）和离线核对（`tools/check_actor_layout.py`），P4 最终场景里三个场景 Mod 靠它在走廊和战斗里认出了队伍 [运行]。队伍按站位排序只有静态依据。
+- `Raid+8` 的读法有静态依据（`4C41F0` 的 `target_hero_random` 分支、`Battle::HeroesRerank` 的写回）和离线核对（`tools/dd_update.py verify` 的布局部分，原 `check_actor_layout.py`），P4 最终场景里三个场景 Mod 靠它在走廊和战斗里认出了队伍 [运行]。队伍按站位排序只有静态依据。
 - 战斗销毁中途（`5A5BE0` 逐个删除怪物、最后才清空表）调用 `battle_monsters` 时表里可能有已释放的指针，靠虚表核对和 SEH 挡住，没有在游戏里验证。
 - 旧的 DDCore 会让整个 `dd.actor` 不可用（DDLua 要求 `game` 服务的大小覆盖新函数），按 [ADR 0018](0018-no-version-compat-until-p7.md) 开发期不处理。
 

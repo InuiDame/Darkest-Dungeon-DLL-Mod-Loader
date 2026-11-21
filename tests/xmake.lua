@@ -10,11 +10,26 @@ target("dd_core_tests")
     add_cxflags("/utf-8", "/permissive-", "/Zc:__cplusplus", "/Zc:preprocessor", { tools = "cl" })
     add_defines("UNICODE", "_UNICODE")
     add_includedirs("../sdk/include")
-    add_files("unit/test_main.cpp", "unit/c_compat.c")
+    add_files("unit/test_main.cpp", "unit/c_compat.c", "unit/layout_golden.cpp")
     add_files("../core/src/logic/*.cpp", "../core/src/hook/*.cpp", "../core/src/runtime/*.cpp", "../core/src/events/hub.cpp",
         "../core/src/game/phase_tracker.cpp", "../core/src/game/actors.cpp", "../core/src/guard.cpp",
-        "../core/src/combat/logic.cpp", "../core/src/persist/store.cpp")
+        "../core/src/combat/logic.cpp", "../core/src/persist/store.cpp", "../core/src/game/layout_check.cpp")
     add_syslinks("user32", "shlwapi")
+target_end()
+
+-- U1b：布局清单运行时核对的 C++/Python 对照测试。把 exe 按节映射（不执行），跑 DDCore 的特征码解析和依据求值
+-- （layout_check.cpp，同一份源码），写 JSON；tools/ddupdate/cpp_compare.py 调用它并和 dd_update.py verify --json 逐项比较
+target("dd_layout_compare")
+    set_kind("binary")
+    set_default(false)
+    set_group("tests")
+    set_languages("c++23")
+    set_runtimes(is_mode("debug") and "MTd" or "MT")
+    set_exceptions("cxx")
+    set_warnings("all")
+    add_cxflags("/utf-8", "/permissive-", "/Zc:__cplusplus", "/Zc:preprocessor", { tools = "cl" })
+    add_defines("UNICODE", "_UNICODE")
+    add_files("layout_compare/main.cpp", "../core/src/game/layout_check.cpp")
 target_end()
 
 -- Lua 本地包和 sol2 的冒烟测试，编译选项和 DDLua 相同（dd.native）

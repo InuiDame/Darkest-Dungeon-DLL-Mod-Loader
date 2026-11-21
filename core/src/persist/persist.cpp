@@ -1,5 +1,7 @@
 #include "persist.h"
 
+#include "../game/layout.h"
+
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
@@ -13,10 +15,10 @@ namespace ddc::persist {
 
 namespace {
 
-// 槽 5（当前 profile）的设备在 StorageManager+0x38，设备名在设备对象 +0x20（char[0x80]），见 signatures.inc 的 StorageManager
-constexpr std::uintptr_t kSmSlot5 = 0x38;
-constexpr std::uintptr_t kDeviceName = 0x20;
-constexpr std::size_t kDeviceNameCap = 0x80;
+// 槽 5（当前 profile）的设备在 StorageManager+0x38，设备名在设备对象 +0x20（char[0x80]），偏移在 game/layout.inc
+using game::layout::kStorageDeviceName;
+using game::layout::kStorageDeviceNameCap;
+using game::layout::kStorageProfileSlot;
 constexpr std::uint32_t kFlushMs = 3000;
 // 退到桌面时多等一会儿：写盘失败要重试（最多约 4 秒），机械硬盘上几个 Mod 各自 FlushFileBuffers 也要时间（审核 N7）
 constexpr std::uint32_t kExitFlushMs = 10000;
@@ -29,6 +31,11 @@ constexpr std::uint32_t kSaveLogFirst = 3;         // 每次进存档前几次 c
 using QueueWriteFn = void* (*)(void*, void*, const char*, const char*, const void*, std::uint64_t, std::uint64_t, std::uint64_t, void*);
 using ReadFileFn = std::uint64_t (*)(void*, const char*, const char*, void*, std::uint64_t, std::uint64_t);
 using Void4Fn = std::uint64_t (*)(std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t);
+// 原型和 layout.inc 的 Proto* 项绑定（转发的参数个数，U1 修复 FA）：游戏更新改了原型要同时改这里和清单
+static_assert(game::layout::kArgs<QueueWriteFn> == game::layout::kProtoStorageQueueWrite &&
+    game::layout::kArgs<ReadFileFn> == game::layout::kProtoStorageReadFile &&
+    game::layout::kArgs<Void4Fn> == game::layout::kProtoSaveSlotBackup && game::layout::kArgs<Void4Fn> == game::layout::kProtoAppShutdown,
+    "persist 的 hook 原型和 layout.inc 的 Proto* 项不一致");
 
 Persist::Impl* g_impl = nullptr;
 QueueWriteFn g_origWrite = nullptr;
@@ -79,10 +86,10 @@ void ReadProfileDevice(void* const volatile* sm, char* out, std::size_t cap)
     out[0] = 0;
     std::uintptr_t manager = 0, device = 0;
     if (!sm || !SafePointer(const_cast<void* const*>(sm), &manager) || !manager ||
-        !SafePointer(reinterpret_cast<const void*>(manager + kSmSlot5), &device) || !device) {
+        !SafePointer(reinterpret_cast<const void*>(manager + kStorageProfileSlot), &device) || !device) {
         return;
     }
-    SafeString(reinterpret_cast<const char*>(device + kDeviceName), out, (std::min)(cap, kDeviceNameCap));
+    SafeString(reinterpret_cast<const char*>(device + kStorageDeviceName), out, (std::min)(cap, kStorageDeviceNameCap));
 }
 
 const char* Basename(const char* path)
@@ -268,7 +275,7 @@ struct Persist::Impl {
 
     std::string ProfileDevice() const
     {
-        char name[kDeviceNameCap] = {};
+        char name[kStorageDeviceNameCap] = {};
         ReadProfileDevice(deps.addr->storageManager, name, sizeof(name));
         return name;
     }
@@ -338,7 +345,7 @@ struct Persist::Impl {
     // size 是 2487E0 的第 6 个参数截成的 32 位（ArgU32）
     void ObserveWrite(const char* dev, const char* file, const void* buffer, std::uint32_t size)
     {
-        char device[kDeviceNameCap], path[0x110];
+        char device[kStorageDeviceNameCap], path[0x110];
         if (!SafeString(dev, device, sizeof(device)) || !SafeString(file, path, sizeof(path))) {
             return;
         }
@@ -382,7 +389,7 @@ struct Persist::Impl {
     // got 是 248D60 读到的字节数，已经截成 32 位、不超过容量
     void ObserveRead(const char* dev, const char* file, const void* buffer, std::uint32_t got)
     {
-        char device[kDeviceNameCap], path[0x110];
+        char device[kStorageDeviceNameCap], path[0x110];
         if (!SafeString(dev, device, sizeof(device)) || !SafeString(file, path, sizeof(path))) {
             return;
         }
@@ -821,6 +828,7 @@ struct Persist::Impl {
                 events::FieldDesc{ "serial", DD_FIELD_INT, events::kAccessR }, events::FieldDesc{ "index", DD_FIELD_INT, events::kAccessR } },
             false, false);
         if (topic) {
+            topic->hooked = true;  // 由存档读写函数上的观察 hook 派发（ADR 0036 的「写」）
             deps.events->hub().SetAvailability(topic, false, "没有插件声明使用持久化（persist.declare），观察 hook 没有安装");
         }
     }

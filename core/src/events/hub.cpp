@@ -45,8 +45,25 @@ void Hub::SetAvailability(Topic* topic, bool available, const std::string& reaso
         return;
     }
     std::lock_guard lock(mutex_);
+    if (topic->gated) {
+        return;  // 布局核对停用的主题保持不可用，原因不变
+    }
     topic->available = available;
     topic->unavailableReason = reason;
+}
+
+void Hub::Gate(Topic* topic, const std::string& reason)
+{
+    if (!topic) {
+        return;
+    }
+    std::lock_guard lock(mutex_);
+    if (topic->gated) {
+        return;  // 保留第一次停用的原因
+    }
+    topic->available = false;
+    topic->gated = true;
+    topic->unavailableReason = "布局核对停用：" + reason;
 }
 
 std::vector<Topic*> Hub::Topics() const

@@ -94,6 +94,10 @@ struct Topic {
     std::vector<std::shared_ptr<Subscription>> subs;  // 按 (priority, seq) 升序，受 hub 的 mutex 保护
     bool available = true;
     std::string unavailableReason;
+    bool gated = false;          // 被布局核对停用（ADR 0036）：之后 SetAvailability 不能再把它置为可用
+    // 主题背后装内联 hook 或改虚表槽（语义 hook 主题、buff.*、app.*、campaign.save）。按 ADR 0036 这算「写」：依赖的
+    // 布局项不能核对时连只读的主题一起停用。native.* 和映射来的语义主题只靠往 listener 列表注册（归 events.native），是 false
+    bool hooked = false;
     void* bridgeData = nullptr;  // 桥接层的挂载点，中枢不解读
     std::uint64_t dispatchCount = 0;
     std::uint64_t firstThread = 0;
@@ -120,6 +124,8 @@ public:
         bool cancellable);
     Topic* Find(std::string_view name);
     void SetAvailability(Topic* topic, bool available, const std::string& reason);
+    // 布局核对停用主题（ADR 0036）：置为不可用，并且之后的 SetAvailability(true) 不再生效
+    void Gate(Topic* topic, const std::string& reason);
 
     // 按注册顺序的主题快照（下标稳定，只增不减）
     std::vector<Topic*> Topics() const;

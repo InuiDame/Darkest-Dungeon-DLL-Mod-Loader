@@ -2,7 +2,11 @@
 // 本文件被 dllmain.cpp 包含一次，用到那边的 Log()、路径工具。
 //
 // 这里的代码尽量精简，协议处理全部在 DDCore 里：dbghelp.dll 是最难更新的文件。
-// 特征码来自 core/src/game/signatures.inc，和 DDCore、tools/check_sigs.py 是同一份。
+// 特征码来自 core/src/game/signatures.inc，和 DDCore、tools/dd_update.py 是同一份。
+// 加载器不读布局清单（layout.inc）：这里只用 CreateAppSystems 的特征码、偷取字节数和 DD_ENTRY，运行时的核对是下面的
+// 「唯一命中 + 命中位置是函数入口 + 入口字节和 DD_ENTRY 一致」，偷取字节数在编译期核对，不成立时不装早期 hook（U1b，
+// ADR 0036；函数入口和偷取字节数是 U1 修复 FA 加的，审核 A 的 S1、备注 4）。清单里唯一依赖 loader 的是 detour 的原型
+// （ProtoCreateAppSystems，没有静态依据），加载器核对不了，ADR 0036 列为局限。
 
 #include "../common/boot_abi.h"
 #include "../common/pattern.h"
@@ -14,16 +18,36 @@
 
 namespace dd_early {
 
-// 只取 CreateAppSystems 这一项
+// 只用 CreateAppSystems 这一项（特征码、偷取字节数和 DD_ENTRY 给出的入口字节）
 #define DD_SIG(id, kind, req, steal, capture, pattern) \
     inline constexpr const char kPattern_##id[] = pattern; \
     inline constexpr unsigned kSteal_##id = steal;
+#define DD_ENTRY(id, bytes) inline constexpr const char kEntry_##id[] = bytes;
 #define DD_KNOWN_BUILD(sha, label)
 #include "signatures.inc"
 #undef DD_SIG
+#undef DD_ENTRY
 #undef DD_KNOWN_BUILD
 
+// 下面写入 5 字节的 jmp rel32，偷取范围至少要 5 字节（DDCore 的 hook 引擎会拒绝更短的，这里没有引擎，编译期核对）
+static_assert(kSteal_CreateAppSystems >= 5, "CreateAppSystems 的偷取字节数小于 5，放不下 jmp rel32");
+
 using CreateAppSystemsFn = void*(__fastcall*)(void*);
+
+// 命中位置必须是函数入口（和 DDCore 的 check::CheckHookEntry、dd_update.py verify 同一条）：异常目录里包含它的表项要从它开始，
+// 而且不是链式分块（UNW_FLAG_CHAININFO）或间接表项。不在任何表项里时不拦（和 Python 一样），只有入口字节的核对
+static bool IsFunctionEntry(const std::uint8_t* target) {
+    DWORD64 imageBase = 0;
+    const PRUNTIME_FUNCTION entry = RtlLookupFunctionEntry(reinterpret_cast<DWORD64>(target), &imageBase, nullptr);
+    if (!entry) {
+        return true;
+    }
+    if (imageBase + entry->BeginAddress != reinterpret_cast<DWORD64>(target) || (entry->UnwindData & 1)) {
+        return false;
+    }
+    const auto* unwind = reinterpret_cast<const std::uint8_t*>(imageBase + entry->UnwindData);
+    return ((unwind[0] >> 3) & UNW_FLAG_CHAININFO) == 0;
+}
 
 static CreateAppSystemsFn g_gate = nullptr;
 static std::wstring g_gameRoot;
@@ -83,11 +107,20 @@ static bool Install(const std::wstring& gameRoot, const std::wstring& binDir) {
         return false;
     }
 
-    // 再校验入口字节：特征码的前 5 字节就是搬走的指令 mov [rsp+8],rcx，不含 rip 相对寻址
-    static const std::uint8_t kEntry[] = { 0x48, 0x89, 0x4C, 0x24, 0x08 };
-    const unsigned steal = kSteal_CreateAppSystems;
     auto* target = const_cast<std::uint8_t*>(hit);
-    if (steal != sizeof(kEntry) || std::memcmp(target, kEntry, steal) != 0) {
+    if (!IsFunctionEntry(target)) {
+        Log(L"[DDCore] 特征码 CreateAppSystems 命中的位置不是函数入口，不安装早期 hook，DDCore 不启动，新协议插件不可用；旧式 DLL 照常加载");
+        return false;
+    }
+
+    // 再校验入口字节：DD_ENTRY 给出的就是搬走的指令 mov [rsp+8],rcx，不含 rip 相对寻址（dd_update.py verify 校验过）
+    std::vector<int> entry;
+    const unsigned steal = kSteal_CreateAppSystems;
+    bool entryOk = dd::common::ParsePattern(kEntry_CreateAppSystems, entry) && entry.size() == steal;
+    for (std::size_t i = 0; entryOk && i < entry.size(); ++i) {
+        entryOk = entry[i] >= 0 && target[i] == static_cast<std::uint8_t>(entry[i]);
+    }
+    if (!entryOk) {
         Log(L"[DDCore] CreateAppSystems 入口字节不符，不安装早期 hook");
         return false;
     }

@@ -897,12 +897,20 @@ uint32_t DD_CALL SvcEvSubscriptionCount(DDPluginHandle plugin)
     return record && c.events ? static_cast<uint32_t>(c.events->hub().OwnerCount(record->owner)) : 0;
 }
 
+// 布局清单运行时核对停用的能力（ADR 0036）。开关在 CoreBoot 里填好之后只读，任何线程都可以查
+using game::check::Dep;
+
+bool Gated(Dep dep)
+{
+    return C().addr.gate.Off(dep);
+}
+
 // game ---------------------------------------------------------------------
 
 bool DD_CALL SvcGameModsAvailable()
 {
     auto& c = C();
-    return GetCurrentThreadId() == c.mainThread && c.addr.userServices && c.addr.appliedUgcVector;
+    return GetCurrentThreadId() == c.mainThread && c.addr.userServices && c.addr.appliedUgcVector && !Gated(Dep::GameMods);
 }
 
 uint32_t DD_CALL SvcGameModCount()
@@ -930,7 +938,7 @@ bool DD_CALL SvcGameModAt(uint32_t index, DDModEntry* out)
 void ObserveBattle(const char* where)
 {
     auto& c = C();
-    if (!c.tracker || !c.addr.raidCurrent) {
+    if (!c.tracker || !c.addr.raidCurrent || Gated(Dep::GameBattle)) {
         return;
     }
     const BattleSample sample = game::ReadBattleSample(c.addr.raidCurrent);
@@ -945,8 +953,10 @@ game::ActorEnv ActorEnvNow()
     auto& c = C();
     ObserveBattle("actor 服务调用时");
     game::ActorEnv env;
-    env.heroVtable = c.addr.heroVtable;
-    env.monsterVtable = c.addr.monsterVtable;
+    // game.actor 停用时不给任何句柄；怪物句柄还要求战斗序号有效（game.battle）
+    const bool actorsOff = Gated(Dep::GameActor);
+    env.heroVtable = actorsOff ? nullptr : c.addr.heroVtable;
+    env.monsterVtable = actorsOff || Gated(Dep::GameBattle) ? nullptr : c.addr.monsterVtable;
     env.campaignCurrent = c.addr.campaignCurrent;
     env.raidCurrent = c.addr.raidCurrent;
     env.maxStat = c.addr.actorMaxStat;
@@ -992,12 +1002,12 @@ void* DD_CALL SvcGameActorResolve(const DDActorRef* ref)
 
 bool DD_CALL SvcGameActorInfo(const DDActorRef* ref, DDActorInfo* out)
 {
-    return OnMainThread() && ref && game::ActorReadInfo(ActorEnvNow(), *ref, out);
+    return OnMainThread() && ref && !Gated(Dep::GameActorInfo) && game::ActorReadInfo(ActorEnvNow(), *ref, out);
 }
 
 uint32_t DD_CALL SvcGameBattleSerial()
 {
-    return OnMainThread() ? ActorEnvNow().battleSerial : 0;
+    return OnMainThread() && !Gated(Dep::GameBattle) ? ActorEnvNow().battleSerial : 0;
 }
 
 bool LoadingNow();
@@ -1014,7 +1024,7 @@ bool ListActors(bool party, DDActorRef* out, uint32_t capacity, uint32_t* outCou
     if (outCount) {
         *outCount = 0;
     }
-    if (!EnumReady()) {
+    if (!EnumReady() || Gated(Dep::GameActorList)) {
         return false;
     }
     const game::ActorEnv env = ActorEnvNow();
@@ -1038,7 +1048,7 @@ bool DD_CALL SvcGameBattleMonsters(DDActorRef* out, uint32_t capacity, uint32_t*
 int32_t DD_CALL SvcGameBattleState()
 {
     auto& c = C();
-    if (!EnumReady()) {
+    if (!EnumReady() || Gated(Dep::GameBattle)) {
         return -1;
     }
     ObserveBattle("actor 服务调用时");
@@ -1083,7 +1093,7 @@ bool CopySized(const T* src, T* out)
     return CopyIn(src, out, (std::min)(static_cast<std::size_t>(size), sizeof(T)));
 }
 
-std::uint32_t CombatReject(DDCombatOpResult* out, std::uint32_t kind, std::uint32_t code)
+std::uint32_t CombatReject(DDCombatOpResult* out, std::uint32_t kind, std::uint32_t code, const char* message = nullptr)
 {
     if (out && out->size >= sizeof(DDCombatOpResult)) {
         out->kind = kind;
@@ -1091,9 +1101,21 @@ std::uint32_t CombatReject(DDCombatOpResult* out, std::uint32_t kind, std::uint3
         out->result = code;
         out->guid = 0;
         out->count = 0;
-        out->message = combat::Combat::ResultText(code);
+        out->message = message ? message : combat::Combat::ResultText(code);
     }
     return code;
+}
+
+// combat 写操作被布局核对停用时的说明（停用的是这项能力本身，或者它的前提 PvP 判定）。返回 nullptr 表示没有停用
+const char* CombatWriteGated(Dep dep)
+{
+    if (Gated(dep)) {
+        return "布局核对停用了这项能力（ADR 0036），详情见 DDCore.log 的「布局核对」";
+    }
+    if (Gated(Dep::Pvp)) {
+        return "布局核对停用了 PvP 判定（ADR 0036），写操作不可用，详情见 DDCore.log 的「布局核对」";
+    }
+    return nullptr;
 }
 
 const char* DD_CALL SvcCombatResultText(uint32_t result)
@@ -1122,42 +1144,42 @@ bool DD_CALL SvcCombatReadReady()
 
 uint32_t DD_CALL SvcCombatEnumCount(uint32_t table)
 {
-    return combat::EnumCount(table);
+    return Gated(Dep::CombatEnum) ? 0 : combat::EnumCount(table);
 }
 
 const char* DD_CALL SvcCombatEnumName(uint32_t table, int32_t value)
 {
-    return combat::EnumName(table, value);
+    return Gated(Dep::CombatEnum) ? nullptr : combat::EnumName(table, value);
 }
 
 int32_t DD_CALL SvcCombatEnumValue(uint32_t table, const char* name)
 {
-    return name ? combat::EnumValue(table, ReadPluginString(name)) : -1;
+    return name && !Gated(Dep::CombatEnum) ? combat::EnumValue(table, ReadPluginString(name)) : -1;
 }
 
 uint32_t DD_CALL SvcCombatSourceFlags(int32_t source)
 {
-    return combat::SourceFlags(source);
+    return Gated(Dep::CombatEnum) ? 0 : combat::SourceFlags(source);
 }
 
 bool DD_CALL SvcCombatBuffList(const DDActorRef* actor, uint32_t* guids, uint32_t capacity, uint32_t* count)
 {
     auto& c = C();
     DDActorRef ref{};
-    return c.combat && CopyActorRef(actor, &ref) && c.combat->BuffList(ref, guids, capacity, count);
+    return c.combat && !Gated(Dep::CombatBuffRead) && CopyActorRef(actor, &ref) && c.combat->BuffList(ref, guids, capacity, count);
 }
 
 bool DD_CALL SvcCombatBuffGet(const DDActorRef* actor, uint32_t guid, DDBuffInfo* out)
 {
     auto& c = C();
     DDActorRef ref{};
-    return c.combat && CopyActorRef(actor, &ref) && c.combat->BuffGet(ref, guid, out);
+    return c.combat && !Gated(Dep::CombatBuffRead) && CopyActorRef(actor, &ref) && c.combat->BuffGet(ref, guid, out);
 }
 
 bool DD_CALL SvcCombatBuffDefGet(const char* id, DDBuffDef* out)
 {
     auto& c = C();
-    return c.combat && id && c.combat->BuffDefGet(ReadPluginString(id), out);
+    return c.combat && id && !Gated(Dep::CombatBuffRead) && c.combat->BuffDefGet(ReadPluginString(id), out);
 }
 
 uint32_t DD_CALL SvcCombatBuffAdd(DDPluginHandle plugin, const DDActorRef* actor, const char* id, const DDBuffAddOptions* options,
@@ -1167,6 +1189,9 @@ uint32_t DD_CALL SvcCombatBuffAdd(DDPluginHandle plugin, const DDActorRef* actor
     auto& c = C();
     if (!record || !c.combat) {
         return CombatReject(out, DD_COMBAT_OP_BUFF_ADD, !record ? DD_COMBAT_E_INVALID : DD_COMBAT_E_UNAVAILABLE);
+    }
+    if (const char* why = CombatWriteGated(Dep::CombatBuffAdd)) {
+        return CombatReject(out, DD_COMBAT_OP_BUFF_ADD, DD_COMBAT_E_UNAVAILABLE, why);
     }
     combat::AddRequest request;
     if (!CopyActorRef(actor, &request.actor) || !id || (options && !CopySized(options, &request.options))) {
@@ -1186,6 +1211,9 @@ uint32_t DD_CALL SvcCombatBuffRemove(DDPluginHandle plugin, const DDActorRef* ac
     if (!record || !c.combat) {
         return CombatReject(out, DD_COMBAT_OP_BUFF_REMOVE, !record ? DD_COMBAT_E_INVALID : DD_COMBAT_E_UNAVAILABLE);
     }
+    if (const char* why = CombatWriteGated(Dep::CombatBuffRemove)) {
+        return CombatReject(out, DD_COMBAT_OP_BUFF_REMOVE, DD_COMBAT_E_UNAVAILABLE, why);
+    }
     combat::RemoveRequest request;
     if (!CopyActorRef(actor, &request.actor) || !CopySized(spec, &request.spec)) {
         return CombatReject(out, DD_COMBAT_OP_BUFF_REMOVE, DD_COMBAT_E_INVALID);
@@ -1202,6 +1230,9 @@ uint32_t DD_CALL SvcCombatBuffDefine(DDPluginHandle plugin, const DDBuffDef* def
     if (!record || !c.combat) {
         return CombatReject(out, DD_COMBAT_OP_BUFF_DEFINE, !record ? DD_COMBAT_E_INVALID : DD_COMBAT_E_UNAVAILABLE);
     }
+    if (const char* why = CombatWriteGated(Dep::CombatBuffDefine)) {
+        return CombatReject(out, DD_COMBAT_OP_BUFF_DEFINE, DD_COMBAT_E_UNAVAILABLE, why);
+    }
     DDBuffDef copy{};
     if (!CopyIn(def, &copy, sizeof(copy)) || copy.size < sizeof(DDBuffDef)) {
         return CombatReject(out, DD_COMBAT_OP_BUFF_DEFINE, DD_COMBAT_E_INVALID);
@@ -1212,7 +1243,7 @@ uint32_t DD_CALL SvcCombatBuffDefine(DDPluginHandle plugin, const DDBuffDef* def
 bool DD_CALL SvcCombatEffectGet(const char* name, DDEffectInfo* out)
 {
     auto& c = C();
-    return c.combat && name && c.combat->EffectGet(ReadPluginString(name), out);
+    return c.combat && name && !Gated(Dep::CombatEffectGet) && c.combat->EffectGet(ReadPluginString(name), out);
 }
 
 uint32_t DD_CALL SvcCombatEffectApply(DDPluginHandle plugin, const char* name, const DDActorRef* performer, const DDActorRef* target,
@@ -1222,6 +1253,9 @@ uint32_t DD_CALL SvcCombatEffectApply(DDPluginHandle plugin, const char* name, c
     auto& c = C();
     if (!record || !c.combat) {
         return CombatReject(out, DD_COMBAT_OP_EFFECT_APPLY, !record ? DD_COMBAT_E_INVALID : DD_COMBAT_E_UNAVAILABLE);
+    }
+    if (const char* why = CombatWriteGated(Dep::CombatEffectApply)) {
+        return CombatReject(out, DD_COMBAT_OP_EFFECT_APPLY, DD_COMBAT_E_UNAVAILABLE, why);
     }
     combat::EffectRequest request;
     if (!name || !CopyActorRef(performer, &request.performer) || (target && !CopyActorRef(target, &request.target))) {
@@ -1239,6 +1273,9 @@ uint32_t DD_CALL SvcCombatEffectDefine(DDPluginHandle plugin, const char* text, 
     if (!record || !c.combat) {
         return CombatReject(out, DD_COMBAT_OP_EFFECT_DEFINE, !record ? DD_COMBAT_E_INVALID : DD_COMBAT_E_UNAVAILABLE);
     }
+    if (const char* why = CombatWriteGated(Dep::CombatEffectDefine)) {
+        return CombatReject(out, DD_COMBAT_OP_EFFECT_DEFINE, DD_COMBAT_E_UNAVAILABLE, why);
+    }
     if (!text) {
         return CombatReject(out, DD_COMBAT_OP_EFFECT_DEFINE, DD_COMBAT_E_INVALID);
     }
@@ -1249,6 +1286,10 @@ DDRuleId DD_CALL SvcCombatRuleRegister(DDPluginHandle plugin, const char* name, 
 {
     auto* record = FromHandle(plugin);
     auto& c = C();
+    if (record && CombatWriteGated(Dep::CombatRule)) {
+        LogWarn("插件 %s 注册规则被拒绝：%s", record->name.c_str(), CombatWriteGated(Dep::CombatRule));
+        return 0;
+    }
     return record && c.combat && name && fn ? c.combat->RuleRegister(record->owner, ReadPluginString(name), fn, user) : 0;
 }
 
@@ -1268,15 +1309,15 @@ bool DD_CALL SvcCombatRuleStats(DDRuleStats* out)
 bool DD_CALL SvcCombatSkillFromPointer(const void* performer, const void* skill, DDSkillRef* out)
 {
     auto& c = C();
-    return c.combat && c.combat->SkillFromPointer(performer, skill, out);
+    return c.combat && !Gated(Dep::CombatSkill) && c.combat->SkillFromPointer(performer, skill, out);
 }
 
 bool DD_CALL SvcCombatSkillInfo(const DDSkillRef* ref, DDSkillInfo* out)
 {
     auto& c = C();
     DDSkillRef copy{};
-    return c.combat && CopyIn(ref, &copy, sizeof(copy)) && copy.size >= sizeof(DDSkillRef) && copy.actor.size >= sizeof(DDActorRef) &&
-        c.combat->SkillInfo(copy, out);
+    return c.combat && !Gated(Dep::CombatSkill) && CopyIn(ref, &copy, sizeof(copy)) && copy.size >= sizeof(DDSkillRef) &&
+        copy.actor.size >= sizeof(DDActorRef) && c.combat->SkillInfo(copy, out);
 }
 
 const DDCombatService kCombatService = { { sizeof(DDCombatService), DD_SERVICE_COMBAT_VERSION }, &SvcCombatResultText,
@@ -1488,6 +1529,10 @@ bool InvokePersistVerify(DDPersistVerifyFn fn, const DDPersistVerify* verify, vo
 void CreatePersist()
 {
     auto& c = C();
+    if (Gated(Dep::Persist)) {
+        LogWarn("persist 服务被布局核对停用（%s），persist 服务和 campaign.save 主题不可用", c.addr.gate.Reason(Dep::Persist).c_str());
+        return;
+    }
     persist::PersistDeps deps;
     deps.addr = &c.addr;
     deps.events = c.events.get();
@@ -1541,6 +1586,10 @@ void ReadEnabledModList()
     c.enabledMods.clear();
     if (!c.addr.userServices || !c.addr.appliedUgcVector) {
         LogWarn("启用 Mod 列表不可用：特征码 UserServices / AppliedUgcVector 缺失");
+        return;
+    }
+    if (Gated(Dep::GameMods)) {
+        LogWarn("启用 Mod 列表不可用：布局核对停用了 game.mods（%s）", c.addr.gate.Reason(Dep::GameMods).c_str());
         return;
     }
     auto result = game::ReadEnabledMods(c.addr.userServices, c.addr.appliedUgcVector, c.utf8GameRoot);
@@ -1747,6 +1796,11 @@ void OnFrameBody()
         c.lifecycle->Fire(DD_PHASE_TICK, c.frame, serial);
     }
 }
+
+// 每帧 hook 的原型和 layout.inc 的 ProtoUpdateStateInternal 绑定（U1 修复 FA）
+void __fastcall UpdateStateDetour(void* app);
+static_assert(game::layout::kArgs<decltype(&UpdateStateDetour)> == game::layout::kProtoUpdateStateInternal,
+    "每帧 hook 的原型和 layout.inc 的 ProtoUpdateStateInternal 不一致");
 
 void __fastcall UpdateStateDetour(void* app)
 {
@@ -2000,6 +2054,97 @@ void LoadPlugins(const std::vector<PluginCandidate>& candidates)
     }
 }
 
+// 布局清单的运行时核对（U1b，ADR 0036）：Resolve 已经求值了 layout.inc 的全部运行时依据，这里按版本是否已知生成停用开关、
+// 写日志。返回 false 表示必需项不成立（依赖表里有 core），DDCore 整体停用（ADR 0006）
+bool ApplyLayoutCheck(const game::ResolveReport& report, bool knownBuild)
+{
+    namespace check = game::check;
+    auto& c = C();
+    std::vector<check::PolicyLine> lines;
+    c.addr.gate = check::BuildGate(report.check, report.sigs, knownBuild, &lines);
+
+    const auto& evidence = check::Evidence();
+    std::size_t evOk = 0, evFail = 0, evBlocked = 0;
+    for (const auto& r : report.check.evidence) {
+        (r.status == check::EvStatus::Ok ? evOk : (r.status == check::EvStatus::Fail ? evFail : evBlocked)) += 1;
+    }
+    std::size_t counts[5] = {};
+    for (const auto state : report.check.items) {
+        counts[static_cast<std::size_t>(state)] += 1;
+    }
+    // 函数表在解析特征码之前建（HOOK 的入口检查要用），耗时算在扫描里
+    LogInfo("布局核对：特征码 %zu 条扫描 %.1f ms（含函数表 %.1f ms）；运行时依据 %zu 条（成立 %zu、不成立 %zu、没法求值 %zu），求值 %.1f ms；"
+            "清单项 %zu 个（运行时核对通过 %zu、不成立 %zu、没法求值 %zu、只能离线核对 %zu、没有静态依据 %zu），%s",
+        report.sigs.size(), report.resolveMicros / 1000.0, report.check.tableMicros / 1000.0, evidence.size(), evOk, evFail, evBlocked,
+        report.check.micros / 1000.0, report.check.items.size(), counts[static_cast<std::size_t>(check::ItemState::Ok)],
+        counts[static_cast<std::size_t>(check::ItemState::Fail)], counts[static_cast<std::size_t>(check::ItemState::Blocked)],
+        counts[static_cast<std::size_t>(check::ItemState::Offline)], counts[static_cast<std::size_t>(check::ItemState::Unverified)],
+        knownBuild ? "已知版本" : "未知版本");
+    for (std::size_t i = 0; i < evidence.size(); ++i) {
+        const auto& r = report.check.evidence[i];
+        if (r.status == check::EvStatus::Ok) {
+            continue;
+        }
+        (r.status == check::EvStatus::Fail ? LogError : LogWarn)("布局核对：%s 的依据 %u（%s）%s：%s", evidence[i].item,
+            evidence[i].index, check::Describe(evidence[i]).c_str(), r.status == check::EvStatus::Fail ? "不成立" : "没法求值",
+            r.detail.c_str());
+    }
+    for (const auto& line : lines) {
+        (line.level >= 2 ? LogError : (line.level == 1 ? LogWarn : LogInfo))("布局核对：%s", line.text.c_str());
+    }
+    if (!c.addr.gate.Any()) {
+        LogInfo("布局核对：全部通过，没有停用任何能力");
+        return true;
+    }
+    std::string words;
+    for (std::size_t i = 0; i < static_cast<std::size_t>(check::Dep::Count); ++i) {
+        if (c.addr.gate.Off(static_cast<check::Dep>(i))) {
+            words += std::string(words.empty() ? "" : " ") + check::InfoOf(static_cast<check::Dep>(i)).word;
+        }
+    }
+    // 主题规则：依据不成立的整条停用（全部列出），不能核对的只停「写」的主题（可写、可取消、背后装 hook 或改虚表槽；
+    // 只记条数，实际停用的主题由 ApplyTopicGate 逐个记）
+    std::string topics;
+    std::size_t writeOnly = 0;
+    for (const auto& rule : c.addr.gate.TopicRules()) {
+        if (rule.writeOnly) {
+            ++writeOnly;
+        } else {
+            topics += std::string(topics.empty() ? "" : " ") + rule.pattern;
+        }
+    }
+    LogWarn("布局核对：停用的能力 [%s]；整条停用的主题 [%s]；只停写主题的规则 %zu 条", words.c_str(), topics.c_str(), writeOnly);
+    if (c.addr.gate.Off(check::Dep::Core)) {
+        LogError("布局核对：必需项不成立（%s）", c.addr.gate.Reason(check::Dep::Core).c_str());
+        return false;
+    }
+    return true;
+}
+
+// 布局核对按主题停用（topic:<主题>）：事件系统、combat、persist 的主题都注册完之后调用一次。插件自定义的主题不受影响
+void ApplyTopicGate()
+{
+    auto& c = C();
+    if (!c.events || c.addr.gate.TopicRules().empty()) {
+        return;
+    }
+    auto& hub = c.events->hub();
+    std::size_t gated = 0;
+    for (auto* topic : hub.Topics()) {
+        if (topic->kind == events::TopicKind::Custom) {
+            continue;
+        }
+        std::string reason;
+        // 「写」的主题：可写、可取消，或者背后装内联 hook、改虚表槽（ADR 0036，U1 修复 FA）
+        if (c.addr.gate.TopicOff(topic->name, topic->writable || topic->cancellable || topic->hooked, &reason)) {
+            hub.Gate(topic, reason);
+            ++gated;
+            LogWarn("布局核对：主题 %s 停用（%s）", topic->name.c_str(), reason.c_str());
+        }
+    }
+    LogInfo("布局核对：按主题停用 %zu 个", gated);
+}
+
 bool InstallFrameHook()
 {
     auto& c = C();
@@ -2110,13 +2255,31 @@ int CoreBoot(const dd::common::CoreBootInfo* info)
         LogWarn("%s", note.c_str());
     }
 
-    if (const char* label = game::BuildLabel(c.exeSha1)) {
+    const char* label = game::BuildLabel(c.exeSha1);
+    if (label) {
         c.buildLabel = label;
     } else {
         c.buildLabel = "unknown";
-        LogWarn("未知的 Darkest.exe 版本（SHA1 %s），但特征码全部命中，继续运行", c.exeSha1.c_str());
+        LogWarn("未知的 Darkest.exe 版本（SHA1 %s），特征码全部命中；按 ADR 0036 停用依赖不能运行时核对的布局项的写能力", c.exeSha1.c_str());
     }
     LogInfo("Darkest.exe %s，SHA1 %s，svn_revision=%s", c.buildLabel.c_str(), c.exeSha1.c_str(), c.svnRevision.c_str());
+
+    // 测试用：环境变量 DD_LAYOUT_ASSUME_UNKNOWN=1 时布局核对按未知版本处理（只会更严，用来在已知版本上验证未知版本的停用路径）
+    bool knownForLayout = label != nullptr;
+    {
+        wchar_t flag[8] = {};
+        if (knownForLayout && GetEnvironmentVariableW(L"DD_LAYOUT_ASSUME_UNKNOWN", flag, 8) == 1 && flag[0] == L'1') {
+            knownForLayout = false;
+            LogWarn("环境变量 DD_LAYOUT_ASSUME_UNKNOWN=1：布局核对按未知版本处理（只用于测试）");
+        }
+    }
+    if (!ApplyLayoutCheck(report, knownForLayout)) {
+        LogError("DDCore 已整体停用（exe SHA1 %s），下列新协议插件不会加载：", c.exeSha1.c_str());
+        for (const auto& candidate : found.candidates) {
+            LogError("  %s", ToUtf8(candidate.path).c_str());
+        }
+        return dd::common::kCoreBootDisabled;
+    }
 
     c.tracker = std::make_unique<PhaseTracker>(c.addr.states);
     c.lifecycle = std::make_unique<Lifecycle>(&InvokeLifecycleCallback);
@@ -2153,6 +2316,8 @@ int CoreBoot(const dd::common::CoreBootInfo* info)
     }
     // persist 不依赖事件系统（没有时 campaign.save 主题不可用、标签不保存），要在插件 Load（declare）之前创建
     CreatePersist();
+    // 全部主题注册完之后按布局核对停用（插件 Load 里订阅之前）
+    ApplyTopicGate();
 
     if (!InstallFrameHook()) {
         LogError("每帧 hook 不可用，DDCore 已整体停用");

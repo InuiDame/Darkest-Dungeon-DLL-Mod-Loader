@@ -1,5 +1,7 @@
 #include "mods.h"
 
+#include "layout.h"
+
 #include <windows.h>
 
 #include <cstring>
@@ -8,13 +10,8 @@ namespace ddc::game {
 
 namespace {
 
-// 布局（Steam 版和离线版的 UGC 查找函数 38F0B0 / 383F90 一致，见知识库）
-constexpr std::size_t kUgcIdSize = 0xC0;       // UGCId：name char[0x80] + source char[0x40]
-constexpr std::size_t kUgcIdSource = 0x80;
-constexpr std::size_t kListKeyOffset = 0x200;  // UGCIdList 的键名（+0x08）在 vector（+0x208）之前 0x200 字节
-constexpr std::size_t kInstalledVector = 0x20; // UserServicesInterface+0x20：vector<UserGeneratedContent*>
-constexpr std::size_t kUgcPath = 0x20;         // UGC 对象的目录 char[0x200]
-constexpr std::size_t kUgcId = 0x620;          // UGC 对象的 UGCId
+// 布局在 layout.inc（UgcIdSize、UgcObjectId 等），这里只有读表时的合理性上限
+using namespace layout;
 constexpr std::size_t kMaxEntries = 8192;
 
 struct Vec {
@@ -55,7 +52,8 @@ bool ReadVec(std::uintptr_t address, std::size_t elementSize, Vec& out, std::siz
 // 定长 char 数组，要求在容量内以 NUL 结尾
 bool ReadFixedString(std::uintptr_t address, std::size_t capacity, std::string& out)
 {
-    char buffer[0x200];
+    char buffer[0x200];  // 不小于下面用到的最大容量
+    static_assert(sizeof(buffer) >= kUgcListKeyCap && sizeof(buffer) >= kUgcPathCap && sizeof(buffer) >= kUgcIdNameCap);
     if (capacity > sizeof(buffer) || !ReadBytes(address, buffer, capacity)) {
         return false;
     }
@@ -148,7 +146,7 @@ EnabledModsResult ReadEnabledMods(void* const* userServices, const void* applied
 
     // 键名校验：UGCIdList 构造时写入 "applied_ugcs_1_0"（38EA40），复制（415EA0）时一并复制
     std::string key;
-    if (!ReadFixedString(applied - kListKeyOffset, 0x200, key) || key != "applied_ugcs_1_0") {
+    if (!ReadFixedString(applied - kUgcListKeyOffset, kUgcListKeyCap, key) || key != "applied_ugcs_1_0") {
         result.error = "启用列表的键名不是 applied_ugcs_1_0（读到 '" + key + "'），结构可能已变化";
         return result;
     }
@@ -167,7 +165,7 @@ EnabledModsResult ReadEnabledMods(void* const* userServices, const void* applied
     }
     Vec installedVec{};
     std::size_t installedCount = 0;
-    if (!ReadVec(services + kInstalledVector, sizeof(void*), installedVec, installedCount)) {
+    if (!ReadVec(services + kUserServicesInstalled, sizeof(void*), installedVec, installedCount)) {
         result.error = "已安装 Mod 的 vector 不合法";
         return result;
     }
@@ -177,11 +175,11 @@ EnabledModsResult ReadEnabledMods(void* const* userServices, const void* applied
         std::uintptr_t ugc = 0;
         Installed item;
         if (!ReadBytes(installedVec.first + i * sizeof(void*), &ugc, sizeof(ugc)) || ugc == 0 ||
-            !ReadFixedString(ugc + kUgcId, 0x80, item.name) || !ReadFixedString(ugc + kUgcId + kUgcIdSource, 0x40, item.source)) {
+            !ReadFixedString(ugc + kUgcObjectId, kUgcIdNameCap, item.name) || !ReadFixedString(ugc + kUgcObjectId + kUgcIdSource, kUgcIdSourceCap, item.source)) {
             result.error = "已安装 Mod 第 " + std::to_string(i) + " 项读取失败";
             return result;
         }
-        ReadFixedString(ugc + kUgcPath, 0x200, item.path);  // 目录读不出来时按没找到处理
+        ReadFixedString(ugc + kUgcPath, kUgcPathCap, item.path);  // 目录读不出来时按没找到处理
         installed.push_back(std::move(item));
     }
     result.installedCount = installed.size();
@@ -189,7 +187,7 @@ EnabledModsResult ReadEnabledMods(void* const* userServices, const void* applied
     for (std::size_t i = 0; i < appliedCount; ++i) {
         EnabledMod mod;
         const std::uintptr_t entry = appliedVec.first + i * kUgcIdSize;
-        if (!ReadFixedString(entry, 0x80, mod.name) || !ReadFixedString(entry + kUgcIdSource, 0x40, mod.source)) {
+        if (!ReadFixedString(entry, kUgcIdNameCap, mod.name) || !ReadFixedString(entry + kUgcIdSource, kUgcIdSourceCap, mod.source)) {
             result.error = "启用列表第 " + std::to_string(i) + " 项读取失败";
             return result;
         }

@@ -11,6 +11,7 @@
 #include "../../core/src/events/churn_log.h"
 #include "../../core/src/events/hub.h"
 #include "../../core/src/game/actors.h"
+#include "../../core/src/game/layout_check.h"
 #include "../../core/src/game/phase_tracker.h"
 #include "../../core/src/hook/engine.h"
 #include "../../core/src/hook/prologue.h"
@@ -2834,6 +2835,374 @@ void Run()
 
 }  // namespace persisttest
 
+// ---------------------------------------------------------------- 布局清单的运行时核对（U1b，ADR 0036）
+// 真实 exe 上和 Python 的逐项对照在 tests/layout_compare（cpp_compare.py）；这里覆盖不依赖游戏的部分：最小 PE 上的函数表
+// （间接表项、UNW_FLAG_CHAININFO）、扫描（可重叠、完整落在范围里）、一条 VSLOT + FUNC 依据，以及按依赖表停用的策略
+namespace layoutchecktest {
+
+namespace check = ddc::game::check;
+
+constexpr std::uint64_t kBase = 0x140000000ull;
+
+// 最小的 PE64：.text 在 0x1000（0x1000 字节），.rdata 在 0x3000（异常目录、unwind 信息、虚表）
+std::vector<std::uint8_t> MakePe(std::uint32_t exceptionSize)
+{
+    std::vector<std::uint8_t> mem(0x4000, 0);
+    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(mem.data());
+    dos->e_magic = IMAGE_DOS_SIGNATURE;
+    dos->e_lfanew = 0x40;
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(mem.data() + 0x40);
+    nt->Signature = IMAGE_NT_SIGNATURE;
+    nt->FileHeader.Machine = IMAGE_FILE_MACHINE_AMD64;
+    nt->FileHeader.NumberOfSections = 2;
+    nt->FileHeader.SizeOfOptionalHeader = sizeof(IMAGE_OPTIONAL_HEADER64);
+    nt->OptionalHeader.Magic = IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+    nt->OptionalHeader.ImageBase = kBase;
+    nt->OptionalHeader.SizeOfImage = 0x4000;
+    nt->OptionalHeader.SizeOfHeaders = 0x400;
+    nt->OptionalHeader.NumberOfRvaAndSizes = IMAGE_NUMBEROF_DIRECTORY_ENTRIES;
+    nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION].VirtualAddress = 0x3000;
+    nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION].Size = exceptionSize;
+    auto* sections = IMAGE_FIRST_SECTION(nt);
+    std::memcpy(sections[0].Name, ".text", 5);
+    sections[0].VirtualAddress = 0x1000;
+    sections[0].Misc.VirtualSize = 0x1000;
+    std::memcpy(sections[1].Name, ".rdata", 6);
+    sections[1].VirtualAddress = 0x3000;
+    sections[1].Misc.VirtualSize = 0x1000;
+    return mem;
+}
+
+void Put32(std::vector<std::uint8_t>& mem, std::uint32_t rva, std::uint32_t value)
+{
+    std::memcpy(mem.data() + rva, &value, 4);
+}
+
+void PutEntry(std::vector<std::uint8_t>& mem, std::uint32_t rva, std::uint32_t begin, std::uint32_t end, std::uint32_t unwind)
+{
+    Put32(mem, rva, begin);
+    Put32(mem, rva + 4, end);
+    Put32(mem, rva + 8, unwind);
+}
+
+void PutBytes(std::vector<std::uint8_t>& mem, std::uint32_t rva, std::initializer_list<int> bytes)
+{
+    for (const int b : bytes) {
+        mem[rva++] = static_cast<std::uint8_t>(b);
+    }
+}
+
+void TestImageAndScan()
+{
+    // 异常目录（故意不按地址排序）：B、BeginAddress 为 0 的项、A 的链式分块、A、A 的间接表项
+    auto mem = MakePe(5 * 12);
+    PutEntry(mem, 0x3000, 0x1300, 0x1340, 0x3140);
+    PutEntry(mem, 0x300C, 0, 0, 0);
+    PutEntry(mem, 0x3018, 0x1100, 0x1120, 0x3110);
+    PutEntry(mem, 0x3024, 0x1000, 0x1040, 0x3100);
+    PutEntry(mem, 0x3030, 0x1200, 0x1210, 0x3024 | 1);  // 间接：指向 A 的表项
+    mem[0x3100] = 0x01;                                 // 版本 1，没有标志
+    mem[0x3110] = 0x01 | (4 << 3);                      // UNW_FLAG_CHAININFO
+    mem[0x3112] = 1;                                    // CountOfCodes = 1：链到 0x3110 + 4 + 2 * 2
+    PutEntry(mem, 0x3118, 0x1000, 0x1040, 0x3100);
+    mem[0x3140] = 0x01;
+
+    check::ImageView view;
+    std::string error;
+    CHECK(check::DescribeImage(mem.data(), kBase, &view, &error));
+    CHECK(view.textBegin == 0x1000 && view.textEnd == 0x2000 && view.exceptionRva == 0x3000);
+    CHECK(std::string(view.SectionOf(0x3010) ? view.SectionOf(0x3010) : "") == ".rdata" && view.SectionOf(0x2500) == nullptr);
+
+    check::FunctionTable table(view);
+    CHECK(table.EntryCount() == 4);
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> ranges;
+    CHECK(table.Ranges(0x1105, &ranges));
+    CHECK(ranges.size() == 3 && ranges[0].first == 0x1000 && ranges[1].first == 0x1100 && ranges[2].first == 0x1200 &&
+        ranges[2].second == 0x1210);
+    CHECK(table.Ranges(0x1000, &ranges) && ranges.size() == 3);
+    CHECK(table.Ranges(0x133F, &ranges) && ranges.size() == 1 && ranges[0].first == 0x1300);
+    CHECK(!table.Ranges(0x1040, &ranges));  // 区间是 [begin, end)
+    CHECK(!table.Ranges(0x0FFF, &ranges));
+    CHECK(!table.Ranges(-5, &ranges));
+
+    // 函数入口（image.py 的 is_function_start）和 HOOK 的入口检查（sigs.py 的 check_hook 同一条，U1 修复 FA）
+    std::uint32_t primary = 0;
+    CHECK(table.Enclosing(0x1105, &primary) && primary == 0x1000);
+    CHECK(table.Enclosing(0x1305, &primary) && primary == 0x1300);
+    CHECK(!table.Enclosing(0x1040, &primary) && !table.Enclosing(0x1500, &primary));
+    CHECK(table.IsFunctionStart(0x1000) && table.IsFunctionStart(0x1300));
+    CHECK(!table.IsFunctionStart(0x1100) && !table.IsFunctionStart(0x1200) && !table.IsFunctionStart(0x1105));  // 链式、间接表项、函数中间
+    CHECK(check::CheckHookEntry(table, 0x1000).empty() && check::CheckHookEntry(table, 0x1300).empty());
+    CHECK(check::CheckHookEntry(table, 0x1500).empty());  // 不在任何函数里：不拦
+    const std::string midChunk = check::CheckHookEntry(table, 0x1100);
+    CHECK(midChunk.find("不是函数入口") != std::string::npos && midChunk.find("1000") != std::string::npos);
+    CHECK(check::CheckHookEntry(table, 0x1305).find("+0x5") != std::string::npos);
+
+    // 扫描：可重叠，必须完整落在范围里
+    PutBytes(mem, 0x1500, { 0xAA, 0xAA, 0xAA, 0x5C });
+    const check::Scanner scanner(view);
+    check::Pattern pattern;
+    CHECK(scanner.Compile("AA AA", &pattern));
+    std::vector<std::uint32_t> hits;
+    scanner.Scan(pattern, 0x1000, 0x2000, &hits);
+    CHECK(hits.size() == 2 && hits[0] == 0x1500 && hits[1] == 0x1501);
+    hits.clear();
+    scanner.Scan(pattern, 0x1500, 0x1502, &hits);
+    CHECK(hits.size() == 1 && hits[0] == 0x1500);
+    hits.clear();
+    scanner.Scan(pattern, 0x1501, 0x1502, &hits);
+    CHECK(hits.empty());
+    CHECK(scanner.Compile("?? AA 5C", &pattern));
+    hits.clear();
+    scanner.Scan(pattern, 0x1000, 0x2000, &hits);
+    CHECK(hits.size() == 1 && hits[0] == 0x1501);
+    CHECK(!scanner.Compile("AA A", &pattern) && !scanner.Compile("", &pattern));
+
+    // 一条 VSLOT + FUNC 依据：HeroVtable 的解析结果当虚表（0x3200），槽 37 指向函数 B（0x1300），
+    // B 里唯一的 "F3 0F 10 8B ?? ?? ?? ?? F3 0F 5C C8" 读出 0x12FC（ActorStress 的依据 0）
+    const int actorStress = [] {
+        for (std::size_t i = 0; i < check::Evidence().size(); ++i) {
+            if (std::string_view(check::Evidence()[i].item) == "ActorStress") {
+                return static_cast<int>(i);
+            }
+        }
+        return -1;
+    }();
+    CHECK(actorStress >= 0);
+    const std::uint64_t slot = kBase + 0x1300;
+    std::memcpy(mem.data() + 0x3200 + 37 * 8, &slot, 8);
+    PutBytes(mem, 0x1310, { 0xF3, 0x0F, 0x10, 0x8B, 0xFC, 0x12, 0x00, 0x00, 0xF3, 0x0F, 0x5C, 0xC8 });
+    std::vector<check::SigResult> sigs(check::Signatures().size());
+    const int hero = check::FindSig("HeroVtable");
+    CHECK(hero >= 0);
+    sigs[static_cast<std::size_t>(hero)].ok = true;
+    sigs[static_cast<std::size_t>(hero)].hasResolved = true;
+    sigs[static_cast<std::size_t>(hero)].resolved = 0x3200;
+    {
+        check::Evaluator evaluator(view, scanner, sigs);
+        const auto r = evaluator.Evaluate(check::Evidence()[static_cast<std::size_t>(actorStress)]);
+        CHECK(r.status == check::EvStatus::Ok && r.hasOrigin && r.origin == 0x1300 && r.hit == 0x1310 && r.captured == 0x12FC &&
+            r.expected == 0x12FC);
+        // 指针按没有重定位的基址算：换一个 pointerBase，起点就不在 .text
+        check::ImageView moved = view;
+        moved.pointerBase = kBase + 0x10000;
+        check::Evaluator other(moved, scanner, sigs);
+        CHECK(other.Evaluate(check::Evidence()[static_cast<std::size_t>(actorStress)]).status == check::EvStatus::Fail);
+        // 值变了：不成立，并反推新值
+        mem[0x1314] = 0x00;
+        mem[0x1315] = 0x13;
+        const auto changed = evaluator.Evaluate(check::Evidence()[static_cast<std::size_t>(actorStress)]);
+        CHECK(changed.status == check::EvStatus::Fail && changed.captured == 0x1300 && changed.hasImplied && changed.implied == 0x1300);
+        // 起点的特征码失效：没法求值
+        sigs[static_cast<std::size_t>(hero)].ok = false;
+        CHECK(evaluator.Evaluate(check::Evidence()[static_cast<std::size_t>(actorStress)]).status == check::EvStatus::Blocked);
+    }
+}
+
+check::CheckReport PassingReport()
+{
+    check::CheckReport report;
+    report.evidence.resize(check::Evidence().size());
+    for (auto& r : report.evidence) {
+        r.status = check::EvStatus::Ok;
+    }
+    for (const auto& item : check::Items()) {
+        report.items.push_back(item.check == check::ItemCheck::Runtime ? check::ItemState::Ok
+                                                                      : (item.check == check::ItemCheck::Offline ? check::ItemState::Offline
+                                                                                                                  : check::ItemState::Unverified));
+    }
+    return report;
+}
+
+void SetItem(check::CheckReport& report, const char* id, check::ItemState state)
+{
+    const int index = check::FindItem(id);
+    CHECK(index >= 0);
+    if (index >= 0) {
+        report.items[static_cast<std::size_t>(index)] = state;
+    }
+}
+
+void TestManifestTables()
+{
+    CHECK(check::Signatures().size() >= 61 && check::Items().size() >= 227 && check::Evidence().size() >= 114);
+    const int anchor = check::FindSig("ListenerEntryVtable");
+    CHECK(anchor >= 0 && check::Signatures()[static_cast<std::size_t>(anchor)].need == check::SigNeed::Anchor);
+    const int select = check::FindSig("QueryClassNames");
+    CHECK(select >= 0 && check::Signatures()[static_cast<std::size_t>(select)].runtimeSelect);
+    // 同一项的依据按出现顺序编号（和 verify 的 JSON 一致）
+    std::vector<std::uint32_t> priority;
+    for (const auto& ev : check::Evidence()) {
+        if (std::string_view(ev.item) == "ListenerPriority") {
+            priority.push_back(ev.index);
+        }
+    }
+    CHECK(priority.size() == 2 && priority[0] == 0 && priority[1] == 1);
+    // U1 修复 FA：VtSlotStress 有了运行时依据（锚点 ActorStressInternal），原型项都没有静态依据
+    const int stressAnchor = check::FindSig("ActorStressInternal");
+    CHECK(stressAnchor >= 0 && check::Signatures()[static_cast<std::size_t>(stressAnchor)].need == check::SigNeed::Anchor);
+    const int vtStress = check::FindItem("VtSlotStress");
+    CHECK(vtStress >= 0 && check::Items()[static_cast<std::size_t>(vtStress)].check == check::ItemCheck::Runtime);
+    std::size_t protos = 0;
+    for (const auto& item : check::Items()) {
+        if (std::string_view(item.id).substr(0, 5) == "Proto") {
+            ++protos;
+            CHECK(item.check == check::ItemCheck::None && std::string_view(item.type) == "COUNT");
+        }
+    }
+    CHECK(protos >= 30);
+    // 依赖表里的每个词都认识（topic: 除外），每条特征码都有依赖表
+    std::size_t unknown = 0;
+    const auto words = [&](std::string_view text) {
+        std::size_t i = 0;
+        while (i < text.size()) {
+            const std::size_t space = text.find(' ', i);
+            const std::string_view word = text.substr(i, space == std::string_view::npos ? std::string_view::npos : space - i);
+            check::Dep dep{};
+            if (!word.empty() && word.substr(0, 6) != "topic:" && !check::ParseDep(word, &dep)) {
+                ++unknown;
+            }
+            if (space == std::string_view::npos) {
+                break;
+            }
+            i = space + 1;
+        }
+    };
+    for (const auto& item : check::Items()) {
+        words(item.deps);
+    }
+    for (const auto& sig : check::Signatures()) {
+        CHECK(sig.deps && sig.deps[0]);
+        words(sig.deps);
+    }
+    CHECK(unknown == 0);
+    // 依据的对象、rel 都在清单里
+    for (const auto& ev : check::Evidence()) {
+        CHECK(check::FindItem(ev.item) >= 0 || check::FindSig(ev.item) >= 0);
+        CHECK(std::string_view(ev.rel) == "NONE" || check::FindItem(ev.rel) >= 0 || check::FindSig(ev.rel) >= 0);
+        CHECK(ev.origin == check::Origin::NoSig || check::FindSig(ev.sig) >= 0);
+    }
+}
+
+void TestPolicy()
+{
+    using check::Dep;
+    std::vector<check::SigResult> sigs(check::Signatures().size());
+    // 全部依据成立的已知版本：什么都不停
+    {
+        const auto gate = check::BuildGate(PassingReport(), sigs, true, nullptr);
+        CHECK(!gate.Any());
+    }
+    // 同样的结果、未知版本：依赖不能运行时核对的项的写能力停用，只读的照常（ADR 0036）。U1 修复 FA 之后装 hook、改虚表槽、
+    // 调用游戏函数都算写：原型项（Proto*）没有静态依据，hook 主题、persist、actor_info、事件桥都停；DDCore 本身不停（例外）
+    {
+        std::vector<check::PolicyLine> log;
+        const auto gate = check::BuildGate(PassingReport(), sigs, false, &log);
+        for (const Dep dep : { Dep::CombatBuffAdd, Dep::CombatBuffRemove, Dep::CombatBuffDefine, Dep::CombatEffectApply,
+                 Dep::CombatEffectDefine, Dep::CombatRule, Dep::GameActorInfo, Dep::Persist, Dep::EventsNative, Dep::EventsQuery }) {
+            CHECK(gate.Off(dep));
+        }
+        for (const Dep dep : { Dep::Core, Dep::Loader, Dep::Pvp, Dep::GameActor, Dep::GameActorList, Dep::GameBattle, Dep::GameMods,
+                 Dep::CombatBuffRead, Dep::CombatEffectGet, Dep::CombatSkill, Dep::CombatEnum }) {
+            CHECK(!gate.Off(dep));
+        }
+        CHECK(gate.Reason(Dep::GameActorInfo).find("ProtoActorMaxStat") != std::string::npos);
+        CHECK(gate.Reason(Dep::Persist).find("ProtoStorageQueueWrite") != std::string::npos);
+        CHECK(gate.Reason(Dep::EventsNative).find("ProtoListenerAdd") != std::string::npos);
+        // 主题：第二个参数是「写」（可写、可取消、背后装 hook 或改虚表槽）。审核 A 的 S2：只读的 stress.post 背后改虚表槽 36，
+        // 它的原型没有静态依据，也停
+        CHECK(gate.TopicOff("query.IsDisabledQuery", true, nullptr));   // Query 负载没有静态依据，回调能写回
+        CHECK(gate.TopicOff("stress.pre", true, nullptr) && gate.TopicOff("stress.post", true, nullptr));
+        CHECK(gate.TopicOff("hit.post", true, nullptr) && gate.TopicOff("damage.pre", true, nullptr) && gate.TopicOff("damage.final", true, nullptr));
+        CHECK(gate.TopicOff("buff.tick", true, nullptr) && gate.TopicOff("battle.round.start", true, nullptr));
+        CHECK(!gate.TopicOff("native.HeroDeathEvent", false, nullptr)); // 只读、不装 hook 的主题照常（注册归 events.native 管）
+        CHECK(!gate.TopicOff("actor.death", false, nullptr));
+        CHECK(!gate.TopicOff("app.tick", true, nullptr));               // 没有依赖表写到它
+        // DDCore 自己的每帧 hook 原型不能核对：只警告（停用就等于方案 C）；加载器的项 DDCore 不管
+        const auto logged = [&](const char* needle) {
+            return std::any_of(log.begin(), log.end(), [&](const check::PolicyLine& l) { return l.text.find(needle) != std::string::npos; });
+        };
+        CHECK(logged("ProtoUpdateStateInternal") && logged("ProtoCreateAppSystems"));
+    }
+    // 运行时依据不成立：依赖它的读写能力和主题全部停用，别的不受影响
+    {
+        auto report = PassingReport();
+        SetItem(report, "HeroId", check::ItemState::Fail);
+        const auto gate = check::BuildGate(report, sigs, true, nullptr);
+        CHECK(gate.Off(Dep::GameActor) && !gate.Off(Dep::Core) && !gate.Off(Dep::CombatBuffAdd));
+        CHECK(gate.TopicOff("buff.tick", false, nullptr) && !gate.TopicOff("damage.pre", true, nullptr));
+        CHECK(!gate.Reason(Dep::GameActor).empty());
+    }
+    // 必需项不成立或没法求值：DDCore 整体停用（ADR 0006）
+    {
+        auto report = PassingReport();
+        SetItem(report, "ListenerPriority", check::ItemState::Fail);
+        CHECK(check::BuildGate(report, sigs, true, nullptr).Off(Dep::Core));
+        report = PassingReport();
+        SetItem(report, "ListenerFunction", check::ItemState::Blocked);
+        const auto gate = check::BuildGate(report, sigs, true, nullptr);
+        CHECK(gate.Off(Dep::Core) && gate.Off(Dep::EventsNative));
+    }
+    // 只读能力的项没法求值：警告、不停用；写能力的停用
+    {
+        auto report = PassingReport();
+        SetItem(report, "RaidHeroes", check::ItemState::Blocked);  // game.actor_list（只读）
+        CHECK(!check::BuildGate(report, sigs, true, nullptr).Off(Dep::GameActorList));
+        report = PassingReport();
+        SetItem(report, "ActorStress", check::ItemState::Blocked);  // game.actor_info（调用 ActorMaxStat，写）、topic:stress.*、topic:effect.*
+        const auto gate = check::BuildGate(report, sigs, true, nullptr);
+        CHECK(gate.Off(Dep::GameActorInfo) && gate.TopicOff("stress.pre", true, nullptr) && gate.TopicOff("stress.post", true, nullptr));
+        CHECK(!gate.TopicOff("stress.post", false, nullptr));  // 规则只停「写」的主题：不装 hook 的只读主题不受影响
+    }
+    // 槽位 36 的依据（U1 修复 FA，审核 A 的 S2）不成立：stress.* 整条停用，读写都停
+    {
+        auto report = PassingReport();
+        SetItem(report, "VtSlotStress", check::ItemState::Fail);
+        const auto gate = check::BuildGate(report, sigs, true, nullptr);
+        CHECK(gate.TopicOff("stress.post", false, nullptr) && gate.TopicOff("stress.pre", true, nullptr) && !gate.TopicOff("heal.post", true, nullptr));
+    }
+    // 特征码的同一性依据不成立：按它的依赖表停用
+    {
+        auto report = PassingReport();
+        report.misbound.push_back("HeroVtable");
+        const auto gate = check::BuildGate(report, sigs, true, nullptr);
+        CHECK(gate.Off(Dep::GameActor) && gate.Off(Dep::CombatSkill) && gate.TopicOff("damage.post", false, nullptr));
+    }
+    // 主题规则：* 结尾是前缀
+    {
+        check::Gate gate;
+        gate.DisableTopic("battle.round.*", false, "测试");
+        CHECK(gate.TopicOff("battle.round.start", false, nullptr) && !gate.TopicOff("battle.turn.start", false, nullptr));
+        gate.DisableTopic("damage.final", true, "测试");
+        CHECK(gate.TopicOff("damage.final", true, nullptr) && !gate.TopicOff("damage.final", false, nullptr) &&
+            !gate.TopicOff("damage.finals", true, nullptr));
+    }
+}
+
+void DD_CALL NoopCb(DDEvent*, void*) {}
+
+void TestHubGate()
+{
+    ddc::events::Hub hub([](DDEventFn, DDEvent*, void*, std::uint32_t) { return true; }, nullptr);
+    auto* topic = hub.AddTopic("query.Test", ddc::events::TopicKind::Query, {}, true, false);
+    hub.Gate(topic, "测试");
+    CHECK(!topic->available && topic->gated);
+    hub.SetAvailability(topic, true, "");  // 停用之后不能再置为可用
+    CHECK(!topic->available && topic->unavailableReason.find("测试") != std::string::npos);
+    std::string reason;
+    CHECK(hub.Subscribe(1, "query.Test", &NoopCb, nullptr, 0, DD_EVENT_SCOPE_PLUGIN, &reason) == 0);
+}
+
+void Run()
+{
+    TestImageAndScan();
+    TestManifestTables();
+    TestPolicy();
+    TestHubGate();
+}
+
+}  // namespace layoutchecktest
+
 int main(int argc, char** argv)
 {
     SetConsoleOutputCP(CP_UTF8);
@@ -2865,6 +3234,8 @@ int main(int argc, char** argv)
     combattest::Run();
     std::printf("== persist 旁路\n");
     persisttest::Run();
+    std::printf("== 布局核对\n");
+    layoutchecktest::Run();
 
     std::printf("\n%d 项检查，失败 %d\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

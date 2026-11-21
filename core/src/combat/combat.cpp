@@ -1,5 +1,7 @@
 #include "combat.h"
 
+#include "../game/layout.h"
+
 #include <intrin.h>
 
 #include <algorithm>
@@ -11,85 +13,16 @@ namespace ddc::combat {
 
 namespace {
 
-// ---- 结构偏移（Steam 版和离线版相同，tools/check_actor_layout.py 核对），依据 knowledge/dd1/combat.md ----
-namespace layout {
-constexpr std::uintptr_t kActorBuffGroup = 0x460;  // Buff::Group：vector<GroupEntry> 的 first/last/end
-constexpr std::uintptr_t kActorNextGuid = 0x478;   // Group+0x18：下一个组 guid
-constexpr std::size_t kEntrySize = 0x418;          // GroupEntry：+0 组 guid，+8 Instance
-constexpr std::size_t kEntryInstance = 0x08;
-constexpr std::size_t kInstanceSize = 0x410;
+// ---- 结构偏移的唯一来源是 game/layout.inc（tools/dd_update.py verify 核对，依据 knowledge/dd1/combat.md），
+// 这里只有读表时的合理性上限和由布局推出的长度 ----
+using namespace game::layout;
 constexpr std::size_t kMaxEntries = 4096;    // 读表时的合理性上限（防读到垃圾）；超过时这个 actor 的读写都失败
 constexpr std::size_t kAddMaxEntries = 1024;  // 插件添加的上限：表里已经有这么多条时 buff_add 拒绝（C-N6），留出读的余量
-// Buff::Instance
-constexpr std::size_t kInstStat = 0x00;
-constexpr std::size_t kInstSubType = 0x04;
-constexpr std::size_t kInstSubHash = 0x44;
-constexpr std::size_t kInstAmount = 0x48;
-constexpr std::size_t kInstDuration = 0x4C;
-constexpr std::size_t kInstDurationType = 0x50;
-constexpr std::size_t kInstSource = 0x54;
-constexpr std::size_t kInstSourceData = 0x58;
-constexpr std::size_t kInstRule = 0x5C;
-constexpr std::size_t kInstFalseRule = 0x60;
-constexpr std::size_t kInstId = 0x61;
-constexpr std::size_t kInstIdHash = 0xA4;
-constexpr std::size_t kInstTarget = 0xA8;
-constexpr std::size_t kInstRemoveInactive = 0xAC;
-constexpr std::size_t kInstRemoveBattle = 0xAD;
-constexpr std::size_t kInstRuleFloat = 0xB0;
-constexpr std::size_t kInstRuleString = 0xB4;
-constexpr std::size_t kInstRuleHash = 0xF4;
-constexpr std::size_t kInstAdditional = 0x158;     // 25 个 vector<char[64]>，每个 0x18
-constexpr std::size_t kInstClearOnRule = 0x3B0;    // vector<char[64]>
-constexpr std::size_t kInstReadSize = 0xF8;        // 读快照用到的前缀（到 rule_data 的哈希为止）
-// Buff::Library
-constexpr std::uintptr_t kLibraryAltMap = 0x10;
-// MSVC std::map 的节点
-constexpr std::uintptr_t kNodeLeft = 0x00;
-constexpr std::uintptr_t kNodeRight = 0x10;
-constexpr std::uintptr_t kNodeIsNil = 0x19;
-constexpr std::uintptr_t kNodeKey = 0x20;
-constexpr std::uintptr_t kNodeValue = 0x28;
-// Effect（4F02D0 的字段，类型按写入函数：36E940 float，36ED50 int）
-constexpr std::size_t kEffectTarget = 0x44;
-constexpr std::size_t kEffectChance = 0x48;
-constexpr std::size_t kEffectStress = 0x4C;
-constexpr std::size_t kEffectStun = 0x50;
-constexpr std::size_t kEffectHeal = 0xC8;
-constexpr std::size_t kEffectHealPercent = 0xCC;
-constexpr std::size_t kEffectCombatStatBuff = 0xEC;
-constexpr std::size_t kEffectDotPoison = 0x134;
-constexpr std::size_t kEffectDotBleed = 0x138;
-constexpr std::size_t kEffectDotBurn = 0x13C;
-constexpr std::size_t kEffectDotStress = 0x1B8;
-constexpr std::size_t kEffectDuration = 0x1CC;
-constexpr std::size_t kEffectOnHit = 0x345;
-constexpr std::size_t kEffectOnMiss = 0x346;
-constexpr std::size_t kEffectApplyOnce = 0x347;
-constexpr std::size_t kEffectQueue = 0x348;
-constexpr std::size_t kEffectBuffAmount = 0x3B8;
-constexpr std::size_t kEffectBuffIds = 0x3C8;      // vector<uint32>
-constexpr std::size_t kEffectSwap = 0x3E0;
-constexpr std::size_t kEffectBuffDurationType = 0x430;
-constexpr std::size_t kEffectReadSize = 0x438;
-// 技能
-constexpr std::uintptr_t kHeroClassSkills = 0xBD0;      // vector<vector<HeroCombatSkill>>，外层每项 0x18
-constexpr std::uintptr_t kHeroClassMoveSkills = 0xBE8;  // vector<HeroCombatSkill>
-constexpr std::size_t kHeroSkillSize = 0x510;
-constexpr std::uintptr_t kMonsterClassSkills = 0xBA8;   // vector<MonsterSkill>
-constexpr std::size_t kMonsterSkillSize = 0x500;
-constexpr std::size_t kSkillId = 0x08;
-constexpr std::size_t kSkillLevel = 0x48;
-constexpr std::size_t kSkillType = 0x50;
-constexpr std::size_t kSkillFriendly = 0x90;
-constexpr std::size_t kSkillEffects = 0x3C8;            // vector<Effect*>
-// 其他
-constexpr std::uintptr_t kRaidPvpName = 0x52C0;  // Raid::Current+0x52C0：模式名，PvP 是 arena_mp（ADR 0011）
-constexpr std::size_t kSlotAddBuff = 13;
-constexpr std::size_t kSlotRemoveBuffs = 14;
-}  // namespace layout
-
-using namespace layout;
+constexpr std::size_t kInstReadSize = kInstRuleHash + 4;  // 读快照用到的 Instance 前缀（到 rule_data 的哈希为止）
+// 规则类型（Buff::Rule::Types）的数值按名字从枚举表取：13 actorStatus（看 target），42 is_actor_status（看自己）
+constexpr std::int32_t kRuleActorStatus = IndexOf(kEnumRuleNames, "actorStatus");
+constexpr std::int32_t kRuleIsActorStatus = IndexOf(kEnumRuleNames, "is_actor_status");
+static_assert(DD_COMBAT_TEXT == kGameTextCap, "游戏里 char[64] 的字段和 SDK 的 DD_COMBAT_TEXT 必须一致");
 
 constexpr std::size_t kQueueLimit = 256;
 constexpr std::size_t kEffectTextMax = 64 * 1024;
@@ -159,26 +92,26 @@ std::uintptr_t MapFind(std::uintptr_t map, std::uint32_t key)
     if (!head) {
         return 0;
     }
-    std::uintptr_t node = Rd<std::uintptr_t>(head + 8);  // 根
+    std::uintptr_t node = Rd<std::uintptr_t>(head + kMapNodeParent);  // 头节点的父指针是根
     std::uintptr_t result = head;
-    for (int guard = 0; guard < 64 && node && !Rd<std::uint8_t>(node + kNodeIsNil, 1); ++guard) {
-        if (Rd<std::uint32_t>(node + kNodeKey) < key) {
-            node = Rd<std::uintptr_t>(node + kNodeRight);
+    for (int guard = 0; guard < 64 && node && !Rd<std::uint8_t>(node + kMapNodeIsNil, 1); ++guard) {
+        if (Rd<std::uint32_t>(node + kMapNodeKey) < key) {
+            node = Rd<std::uintptr_t>(node + kMapNodeRight);
         } else {
             result = node;
-            node = Rd<std::uintptr_t>(node + kNodeLeft);
+            node = Rd<std::uintptr_t>(node + kMapNodeLeft);
         }
     }
-    if (result == head || Rd<std::uint32_t>(result + kNodeKey) != key) {
+    if (result == head || Rd<std::uint32_t>(result + kMapNodeKey) != key) {
         return 0;
     }
-    return result + kNodeValue;
+    return result + kMapNodeValue;
 }
 
 // ---- 调用游戏函数（SEH，只用 POD） ----
 
 struct alignas(16) InstBuf {
-    std::uint8_t b[kInstanceSize];
+    std::uint8_t b[kBuffInstanceSize];
 };
 
 using CopyFn = void* (*)(void*, const void*);
@@ -191,6 +124,17 @@ using ApplyEffectFn = void* (*)(void*, void*, void*, void*, const void*, float, 
 using PrngFloatFn = float (*)(void*);
 using FreeVecFn = void (*)(void*);
 using ParseEffectsFn = void (*)(const char*, bool);
+
+// 原型和 layout.inc 的 Proto* 项绑定（参数个数，U1 修复 FA）：游戏更新改了原型要同时改这里和清单
+static_assert(kArgs<CopyFn> == kProtoBuffInstanceCopy && kArgs<VecDtorFn> == kProtoVectorDtor64 && kArgs<EhVecDtorFn> == kProtoEhVectorDtor);
+static_assert(kArgs<AddBuffFn> == kProtoAddBuff && kArgs<RemoveBuffsFn> == kProtoRemoveBuffs && kArgs<LibraryIndexFn> == kProtoBuffLibraryIndex);
+static_assert(kArgs<ApplyEffectFn> == kProtoApplyEffect && kArgs<PrngFloatFn> == kProtoPrngFloat && kArgs<FreeVecFn> == kProtoFreeU32Vector);
+static_assert(kArgs<ParseEffectsFn> == kProtoParseEffectFile);
+// 按固定宽度读写的字段（layout.inc 的宽度项）：G_FillDefinition、ReadEntry、谓词按 4 字节读写标量和 guid、按 1 字节读写 bool，
+// EffectGet 同样；vector 按 first/last 两个指针读（ReadVector）
+static_assert(kInstScalarSize == sizeof(std::int32_t) && kInstScalarSize == sizeof(float) && kInstFlagSize == 1);
+static_assert(kBuffGuidSize == sizeof(std::uint32_t) && kEffectScalarSize == sizeof(std::int32_t) && kEffectFlagSize == 1);
+static_assert(kSkillScalarSize == sizeof(std::int32_t) && kStdVectorFirst == 0 && kStdVectorLast == sizeof(void*));
 
 bool G_InstCopy(void* fn, InstBuf* buf, std::uintptr_t def)
 {
@@ -206,7 +150,7 @@ bool G_InstDestroy(void* vecDtor, void* ehVecDtor, void* elemDtor, InstBuf* buf)
 {
     __try {
         reinterpret_cast<VecDtorFn>(vecDtor)(buf->b + kInstClearOnRule);
-        reinterpret_cast<EhVecDtorFn>(ehVecDtor)(buf->b + kInstAdditional, 0x18, 0x19, elemDtor);
+        reinterpret_cast<EhVecDtorFn>(ehVecDtor)(buf->b + kInstAdditional, kStdVectorSize, kInstAdditionalCount, elemDtor);
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
@@ -258,15 +202,15 @@ struct ApplyArgs {
 
 bool G_ApplyEffect(ApplyArgs* a)
 {
-    alignas(16) std::uint8_t res[0x20] = {};
+    alignas(16) std::uint8_t res[kEffectApplyResultSize] = {};
     __try {
         const float roll = reinterpret_cast<PrngFloatFn>(a->prngFloatFn)(a->prng);
         reinterpret_cast<ApplyEffectFn>(a->applyFn)(res, a->prng, reinterpret_cast<void*>(a->performer),
             reinterpret_cast<void*>(a->target), reinterpret_cast<const void*>(a->effect), roll, false, 1.0f, 0, 0, false, false);
         std::uintptr_t vec[2] = {};
-        std::memcpy(vec, res + 8, sizeof(vec));
+        std::memcpy(vec, res + kEffectApplyResultGuids, sizeof(vec));
         a->guids = (vec[0] && vec[1] >= vec[0]) ? static_cast<std::uint32_t>((vec[1] - vec[0]) / 4) : 0;
-        reinterpret_cast<FreeVecFn>(a->freeFn)(res + 8);
+        reinterpret_cast<FreeVecFn>(a->freeFn)(res + kEffectApplyResultGuids);
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
@@ -321,7 +265,7 @@ bool G_FillDefinition(std::uintptr_t inst, const DDBuffDef* def)
 
 // ---- std::function<bool(GroupEntry const&)> 兼容的谓词（槽位 14） ----
 // 同 DDCore 事件桥和 probe_p4 的做法：实现对象由调用方持有，复制、移动返回自己，析构什么都不做；
-// 函数对象 0x40 字节，+0x38 指向实现。5CE600 只按引用捕获它，最后经实现的 _Delete_this（+0x20）析构
+// 函数对象 0x40 字节，+0x38 指向实现（StdFunctionSize、StdFunctionImpl）。5CE600 只按引用捕获它，最后经实现的 _Delete_this（+0x20）析构
 // combat.buff_remove 正在删除：谓词命中的组 guid（buff.remove 的 reason = plugin）。只有这些条目算 plugin，槽位 14 删完后
 // UpdateBuffsInternal 按规则顺带删掉的别的条目按调用栈判断（A-N2）
 thread_local std::vector<std::uint32_t>* t_pluginHits = nullptr;
@@ -350,19 +294,19 @@ bool __fastcall PredDoCall(RemovePredicate* self, const std::uint8_t* entry)
     case DD_BUFF_BY_GUID:
     case DD_BUFF_BY_TAG: {
         std::uint32_t guid = 0;
-        std::memcpy(&guid, entry, 4);
+        std::memcpy(&guid, entry + kBuffEntryGuid, 4);
         hit = std::binary_search(self->guids, self->guids + self->guidCount, guid);
         break;
     }
     case DD_BUFF_BY_ID: {
         std::uint32_t hash = 0;
-        std::memcpy(&hash, entry + kEntryInstance + kInstIdHash, 4);
+        std::memcpy(&hash, entry + kBuffEntryInstance + kInstIdHash, 4);
         hit = hash == self->idHash;
         break;
     }
     case DD_BUFF_BY_SOURCE: {
         std::int32_t source = 0;
-        std::memcpy(&source, entry + kEntryInstance + kInstSource, 4);
+        std::memcpy(&source, entry + kBuffEntryInstance + kInstSource, 4);
         hit = source == self->source;
         break;
     }
@@ -372,7 +316,7 @@ bool __fastcall PredDoCall(RemovePredicate* self, const std::uint8_t* entry)
     self->hits += hit ? 1 : 0;
     if (hit && t_pluginHits) {
         std::uint32_t guid = 0;
-        std::memcpy(&guid, entry, 4);
+        std::memcpy(&guid, entry + kBuffEntryGuid, 4);
         t_pluginHits->push_back(guid);
     }
     return hit;
@@ -395,6 +339,8 @@ void* const kPredVtable[] = {
     reinterpret_cast<void*>(&PredDelete),
     reinterpret_cast<void*>(&PredGet),
 };
+static_assert(std::size(kPredVtable) == kStdFuncImplVtableSlots, "std::function 实现的虚表槽数和 layout.inc 不一致");
+static_assert(kArgs<decltype(&PredDoCall)> == kProtoStdFuncDoCall, "_Do_call 的参数个数和 layout.inc 的 ProtoStdFuncDoCall 不一致");
 
 // ---- 线程状态 ----
 thread_local int t_gameCallDepth = 0;  // DDCore 自己调用游戏函数的层数
@@ -437,6 +383,8 @@ using GroupAddFn = void* (__fastcall*)(void*, std::uint32_t, const void*);
 using GroupEraseFn = void* (__fastcall*)(void*, void*, void*);
 using UpkeepFn = std::uint64_t (__fastcall*)(void*, void*, int);
 using RuleFn = bool (__fastcall*)(void*, const void*, const void*, void*, const void*);
+static_assert(kArgs<GroupAddFn> == kProtoBuffGroupAdd && kArgs<GroupEraseFn> == kProtoBuffGroupErase && kArgs<UpkeepFn> == kProtoBuffDurationUpkeep &&
+    kArgs<RuleFn> == kProtoBuffRuleActive, "combat 的 hook 原型和 layout.inc 的 Proto* 项不一致");
 
 Combat::Impl* g_impl = nullptr;
 
@@ -494,12 +442,12 @@ struct EntrySnap {
 
 bool ReadEntry(std::uintptr_t entry, EntrySnap* out)
 {
-    std::uint8_t raw[kEntryInstance + kInstReadSize] = {};
+    std::uint8_t raw[kBuffEntryInstance + kInstReadSize] = {};
     if (!ReadBytes(entry, raw, sizeof(raw))) {
         return false;
     }
-    const std::uint8_t* inst = raw + kEntryInstance;
-    std::memcpy(&out->guid, raw, 4);
+    const std::uint8_t* inst = raw + kBuffEntryInstance;
+    std::memcpy(&out->guid, raw + kBuffEntryGuid, 4);
     std::memcpy(&out->stat, inst + kInstStat, 4);
     std::memcpy(&out->amount, inst + kInstAmount, 4);
     std::memcpy(&out->duration, inst + kInstDuration, 4);
@@ -635,10 +583,10 @@ struct Combat::Impl {
         if (!ReadVector(actor + kActorBuffGroup, first, &last)) {
             return false;
         }
-        if ((last - *first) % kEntrySize != 0 || (last - *first) / kEntrySize > kMaxEntries) {
+        if ((last - *first) % kBuffEntrySize != 0 || (last - *first) / kBuffEntrySize > kMaxEntries) {
             return false;
         }
-        *count = (last - *first) / kEntrySize;
+        *count = (last - *first) / kBuffEntrySize;
         return true;
     }
 
@@ -653,7 +601,7 @@ struct Combat::Impl {
         }
         out->reserve(count);
         for (std::size_t i = 0; i < count; ++i) {
-            out->push_back(Rd<std::uint32_t>(first + i * kEntrySize));
+            out->push_back(Rd<std::uint32_t>(first + i * kBuffEntrySize + kBuffEntryGuid));
         }
         return true;
     }
@@ -666,8 +614,8 @@ struct Combat::Impl {
             return 0;
         }
         for (std::size_t i = count; i-- > 0;) {
-            if (Rd<std::uint32_t>(first + i * kEntrySize) == guid) {
-                return first + i * kEntrySize;
+            if (Rd<std::uint32_t>(first + i * kBuffEntrySize + kBuffEntryGuid) == guid) {
+                return first + i * kBuffEntrySize;
             }
         }
         return 0;
@@ -852,9 +800,9 @@ struct Combat::Impl {
         std::sort(guids.begin(), guids.end());
         pred.guids = guids.data();
         pred.guidCount = guids.size();
-        alignas(16) std::uint8_t function[0x40] = {};
+        alignas(16) std::uint8_t function[kStdFunctionSize] = {};
         void* impl = &pred;
-        std::memcpy(function + 0x38, &impl, sizeof(impl));
+        std::memcpy(function + kStdFunctionImpl, &impl, sizeof(impl));
         bool removed = false;
         bool ok = false;
         {
@@ -1304,7 +1252,7 @@ struct Combat::Impl {
         const bool main = IsMain();
         for (std::size_t i = 0; i < count; ++i) {
             Fill f;
-            if (!ReadEntry(first + i * kEntrySize, &f.snap)) {
+            if (!ReadEntry(first + i * kBuffEntrySize, &f.snap)) {
                 continue;
             }
             const auto it = std::find_if(before.begin(), before.end(), [&](const TickBefore& b) { return b.guid == f.snap.guid; });
@@ -1333,7 +1281,7 @@ struct Combat::Impl {
             ++ruleStats.skipped;
             return false;
         }
-        void* subject = ruleType == 42 ? self : target;
+        void* subject = ruleType == kRuleIsActorStatus ? self : target;
         if (!subject) {
             ++ruleStats.skipped;
             return false;  // actorStatus 没有 target：游戏的前置检查直接返回假
@@ -1411,6 +1359,10 @@ struct Combat::Impl {
         buffAdd = hub.AddTopic("buff.add", events::TopicKind::Semantic, BuffFields(0), false, false);
         buffRemove = hub.AddTopic("buff.remove", events::TopicKind::Semantic, BuffFields(1), false, false);
         buffTick = hub.AddTopic("buff.tick", events::TopicKind::Semantic, BuffFields(2), false, false);
+        // 背后是 5C4F50、5C4FF0、47AAD0 上的内联 hook，按 ADR 0036 算「写」
+        for (events::Topic* t : { buffAdd, buffRemove, buffTick }) {
+            t->hooked = true;
+        }
         const auto* a = deps.addr;
         const bool vtables = a->heroVtable && a->monsterVtable;
         const auto require = [&](events::Topic* topic, const void* target, const char* sig) {
@@ -1522,7 +1474,7 @@ std::uint64_t __fastcall UpkeepDetour(void* actor, void* filter, int type)
     if (impl->Table(a, &first, &count)) {
         before.reserve(count);
         for (std::size_t i = 0; i < count; ++i) {
-            before.push_back({ Rd<std::uint32_t>(first + i * kEntrySize), Rd<std::int32_t>(first + i * kEntrySize + kEntryInstance + kInstDuration) });
+            before.push_back({ Rd<std::uint32_t>(first + i * kBuffEntrySize + kBuffEntryGuid), Rd<std::int32_t>(first + i * kBuffEntrySize + kBuffEntryInstance + kInstDuration) });
         }
     }
     UpkeepContext context{ a, &before };
@@ -1542,7 +1494,7 @@ bool __fastcall RuleDetour(void* self, const void* inst, const void* p3, void* t
     if (p) {
         std::int32_t ruleType = 0;
         std::memcpy(&ruleType, p + kInstRule, 4);
-        if (ruleType == 13 || ruleType == 42) {
+        if (ruleType == kRuleActorStatus || ruleType == kRuleIsActorStatus) {
             const RuleSnapshot* snapshot = impl->rules.Snapshot();
             if (snapshot && !snapshot->entries.empty()) {
                 std::uint32_t hash = 0;
@@ -1632,11 +1584,11 @@ bool Combat::BuffGet(const DDActorRef& ref, std::uint32_t guid, DDBuffInfo* out)
         return false;
     }
     const std::uintptr_t entry = m.FindEntry(actor, guid);
-    std::uint8_t raw[kEntryInstance + kInstReadSize] = {};
+    std::uint8_t raw[kBuffEntryInstance + kInstReadSize] = {};
     if (!entry || !ReadBytes(entry, raw, sizeof(raw))) {
         return false;
     }
-    const std::uint8_t* inst = raw + kEntryInstance;
+    const std::uint8_t* inst = raw + kBuffEntryInstance;
     const std::uint32_t size = out->size;
     std::memset(out, 0, sizeof(DDBuffInfo));
     out->size = size;
@@ -1888,8 +1840,8 @@ bool SkillInClass(std::uintptr_t performer, bool hero, std::uintptr_t skill)
     if (hero) {
         const auto cls = Rd<std::uintptr_t>(performer + game::actor_layout::kHeroClass);
         std::uintptr_t first = 0, last = 0;
-        if (cls && ReadVector(cls + kHeroClassSkills, &first, &last) && (last - first) / 0x18 < 256) {
-            for (std::uintptr_t at = first; at < last; at += 0x18) {
+        if (cls && ReadVector(cls + kHeroClassSkills, &first, &last) && (last - first) / kStdVectorSize < 256) {
+            for (std::uintptr_t at = first; at < last; at += kStdVectorSize) {
                 std::uintptr_t a = 0, b = 0;
                 if (ReadVector(at, &a, &b) && skill >= a && skill < b && (skill - a) % kHeroSkillSize == 0) {
                     return true;
@@ -1917,8 +1869,8 @@ std::uintptr_t FindSkill(std::uintptr_t performer, bool hero, const std::string&
     if (hero) {
         const auto cls = Rd<std::uintptr_t>(performer + game::actor_layout::kHeroClass);
         std::uintptr_t first = 0, last = 0;
-        if (cls && ReadVector(cls + kHeroClassSkills, &first, &last) && (last - first) / 0x18 < 256) {
-            for (std::uintptr_t at = first; at < last; at += 0x18) {
+        if (cls && ReadVector(cls + kHeroClassSkills, &first, &last) && (last - first) / kStdVectorSize < 256) {
+            for (std::uintptr_t at = first; at < last; at += kStdVectorSize) {
                 std::uintptr_t a = 0, b = 0;
                 if (!ReadVector(at, &a, &b) || (b - a) / kHeroSkillSize > 64) {
                     continue;

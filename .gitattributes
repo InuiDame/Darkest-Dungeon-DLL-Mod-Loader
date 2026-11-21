@@ -1,2 +1,4 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+# 基线快照要求同一个 exe 两次生成字节一致（dd_update.py baseline），检出时不转换换行
+tools/baseline/*.json text eol=lf

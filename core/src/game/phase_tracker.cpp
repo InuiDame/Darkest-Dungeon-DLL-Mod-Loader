@@ -1,5 +1,7 @@
 #include "phase_tracker.h"
 
+#include "layout.h"
+
 namespace ddc {
 
 PhaseEvents PhaseTracker::Step(const GameSample& s)
@@ -63,7 +65,7 @@ bool PhaseTracker::ObserveBattle(const BattleSample& s)
     }
     // 有战斗：状态非零，或者怪物表不空（Battle::Create 填好怪物表到 5A4722 置 bs_create 之间状态还是 0；
     // 撤退途中 5A93B3 先置 bs_none，怪物表还在）。两样都没有才是「没有战斗」
-    const bool present = s.state != 0 || s.monsters != 0;
+    const bool present = s.state != game::layout::kBattleStateNone || s.monsters != 0;
     // guid 计数只在 Battle::Create（5A40F7 清零）和战斗读档（5AD160 的 5AD1EA 从存档读入）时变小，同一场战斗里只增加
     // （5AD463 的 inc 是读档时给重复的怪物 guid 重新编号，只会变大，第三轮审核 R3B-备注3）：
     // 变小时不管状态都是新战斗（第二轮审核 R2B-备注1）

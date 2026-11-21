@@ -12,6 +12,10 @@ namespace {
 using namespace actor_layout;
 
 using MaxStatFn = float (*)(const void* stat, std::uint32_t mask, bool clamp);
+// 原型、宽度和 layout.inc 绑定（U1 修复 FA）：ActorMaxStat 的参数个数，生命和压力按 float、hero id 和怪物 guid 按 uint32 读
+static_assert(layout::kArgs<MaxStatFn> == layout::kProtoActorMaxStat, "ActorMaxStat 的原型和 layout.inc 的 ProtoActorMaxStat 不一致");
+static_assert(layout::kActorFloatSize == sizeof(float) && layout::kActorIdSize == sizeof(std::uint32_t) &&
+    layout::kBattleIntSize == sizeof(std::int32_t));
 
 bool ReadBytes(std::uintptr_t src, void* dst, std::size_t size)
 {
