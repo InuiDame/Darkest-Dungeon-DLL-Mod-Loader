@@ -1,0 +1,865 @@
+暗黑地牢 MOD 加载器 预制功能说明（面向 MOD 制作者）
+Darkest Dungeon Mod Loader Built-in Features (for Mod Authors)
+
+最后更新 / Last updated: 2026-11-21
+
+本文介绍随加载器预装、可以直接在 MOD 中使用的功能。这些功能位于 mods\DD Mod Lib，最先加载且始终启用，你的 MOD 不需要携带对应的 DLL。
+This document covers the features that come with the loader and can be used directly in your mod. They live in mods\DD Mod Lib, load first and are always enabled, so your mod does not need to ship their DLLs.
+
+如果 MOD 里带了同名 DLL，加载器只使用这里的版本，MOD 目录里的副本和它旁边的配置文件都不会生效。
+If your mod ships a DLL with the same name, the loader only uses the copy here. The copy in your mod and any config next to it have no effect.
+
+
+============================================================
+buff_icon：自定义 Buff 图标 / Custom Buff Icons
+============================================================
+
+在 buff 的 JSON 里加一个字段，就能让它在角色状态栏显示你自己的图标。
+Add one field to a buff's JSON to give it your own icon on the character status tray.
+
+
+一、快速开始 / Quick Start
+------------------------------------------------------------
+
+1. 准备一张 PNG 图标，放到 <你的 MOD>/overlays/tray_my_icon.png。原版状态栏图标的尺寸是 24×24。
+   Put a PNG icon at <your mod>/overlays/tray_my_icon.png. The original tray icons are 24x24.
+
+2. 在 <你的 MOD>/shared/buffs/*.buffs.json 的 buff 上加入 buff_icon。其余字段按原版写法，下面省略了一部分。
+   Add buff_icon to a buff in <your mod>/shared/buffs/*.buffs.json. Other fields follow the original format, and some are omitted below.
+
+   {
+       "buffs": [
+           {
+               "id": "my_buff",
+               "stat_type": "hp_dot_heal",
+               "amount": 13,
+               "buff_icon": "my_icon"
+           }
+       ]
+   }
+
+3. 重启游戏，进入地牢，让角色获得这个 buff。
+   Restart the game, enter a dungeon and apply the buff to a character.
+
+4. 如果图标没有出现，请看第六节的日志说明。
+   If the icon does not appear, see the log guide in section 6.
+
+
+二、字段规则 / Field Rules
+------------------------------------------------------------
+
+* buff_icon 写在 "buffs" 数组里的 buff 对象上。该 buff 必须有字符串类型的 id，buff_icon 也必须是字符串，空字符串视为未配置。
+  buff_icon goes on a buff object in the "buffs" array. The buff needs a string id, buff_icon must also be a string, and an empty string counts as not set.
+
+* 会读取 shared/buffs 及其子目录中所有以 .buffs.json 结尾的文件。
+  Every file ending in .buffs.json under shared/buffs, including subfolders, is read.
+
+* 只读取 mods 文件夹中的 MOD、创意工坊 MOD 和游戏本体。在配置工具里添加的额外 MOD 目录不会被读取。
+  Only mods in the mods folder, Workshop mods and the base game are read. Extra mod folders added in the configuration tool are not.
+
+* 这些文件只在游戏启动时读取一次，修改 JSON 或图标后需要重启游戏。
+  These files are read once when the game starts, so restart the game after changing JSON or icons.
+
+* 同一个 buff id 在多处配置 buff_icon 时，优先级为本地 MOD、创意工坊 MOD、游戏本体。
+  When the same buff id has buff_icon in several places, the priority is local mods, then Workshop mods, then the base game.
+
+* JSON 可以有注释，但不能有尾随逗号，否则这个文件里的 buff_icon 会全部跳过。
+  JSON may contain comments but no trailing commas. Otherwise every buff_icon in that file is skipped.
+
+
+三、图标文件 / Icon Files
+------------------------------------------------------------
+
+* "buff_icon": "my_icon" 会依次查找 overlays/tray_my_icon.png 和 overlays/my_icon.png。名称不区分大小写，末尾的 .png 可写可不写。
+  "buff_icon": "my_icon" looks for overlays/tray_my_icon.png, then overlays/my_icon.png. Names are case-insensitive and the trailing .png is optional.
+
+* 可以使用 overlays 下的子目录，"buff_icon": "sub/my_icon" 对应 overlays/sub/my_icon.png。tray_ 前缀不会加到子目录里的文件名上，请写完整文件名。
+  Subfolders of overlays work: "buff_icon": "sub/my_icon" maps to overlays/sub/my_icon.png. The tray_ prefix is not added to file names inside subfolders, so write the full name.
+
+* 查找顺序：定义该 buff 的 MOD、其他本地 MOD、创意工坊 MOD、游戏本体。
+  Search order: the mod that defines the buff, other local mods, Workshop mods, the base game.
+
+* 多个 buff 指向同一个文件时，合并成一个图标。
+  Buffs that point to the same file share one icon.
+
+
+四、显示规则 / Display Rules
+------------------------------------------------------------
+
+* 配置了 buff_icon 的 buff 从原来的分组中拆出，单独显示一个图标。同一单位上没有配置的同类 buff 仍显示原版图标。
+  A buff with buff_icon is taken out of its original group and shown with its own icon. Similar buffs on the same unit without the field keep the original icon.
+
+* 这个功能只替换图标。悬停时使用该 buff 所属分组的原版提示框，内容只统计使用这个图标的 buff，不能自定义提示文字。
+  Only the icon changes. The tooltip is the original one for the buff's group and counts only buffs that use this icon. Custom tooltip text is not supported.
+
+* buff 本身要能显示在状态栏，图标才会出现。DOT 类 buff 的 amount 大于 0 时才归入 DOT 分组。
+  The buff must be one that would normally appear on the status tray. A DOT buff only counts as a DOT when its amount is above 0.
+
+* 同一个图标同时用于增益和减益时，悬停只显示其中一种。
+  If one icon is used for both buffs and debuffs, the tooltip shows only one of them.
+
+支持的 buff 类别 / Supported buff categories:
+
+* 普通增益、减益
+  Regular buffs and debuffs
+
+* 毒、流血、灼烧、压力、位移、愈合 DOT
+  Poison, bleed, burn, stress, shift and heal DOTs
+
+* 永不再犯、决心经验加成、城镇事件
+  Never-again, resolve XP bonus and town events
+
+* 死门效果、反击、战斗修正
+  Death's door effects, riposte and combat modifiers
+
+
+五、不支持的情况 / Not Supported
+------------------------------------------------------------
+
+* 痴狂、美德、标记、死门、守护、潜行等图标不由 buff 列表决定，不受 buff_icon 影响。
+  Affliction, virtue, mark, death's door, guard, stealth and similar icons do not come from the buff list, so buff_icon does not affect them.
+
+* 技能效果临时生成、没有 JSON id 的 buff 无法配置图标。
+  Buffs generated by skill effects without a JSON id cannot be given an icon.
+
+
+六、排查问题 / Troubleshooting
+------------------------------------------------------------
+
+日志位置 / Log file: <游戏根目录 / game root>\DDModLoader\log\buff_icon.log
+
+[MAP] <id> -> <path>
+  buff 已映射到图标文件。
+  The buff is mapped to an icon file.
+
+Custom icon '...' of buff '...' not found
+  所有位置都找不到图标文件，请检查文件名和 overlays 路径。
+  No icon file was found. Check the file name and the overlays path.
+
+JSON parse failed in ...
+  该文件不是合法 JSON，常见原因是尾随逗号。
+  The file is not valid JSON. A trailing comma is a common cause.
+
+All hooks installed and enabled successfully.
+  功能已生效。
+  The feature is active.
+
+Incompatible game version, hooks are not installed
+  当前游戏版本尚未适配，功能不生效，游戏照常运行并显示原版图标。
+  This game version is not supported yet. The feature is off, and the game runs normally with the original icons.
+
+Added N custom tray icon(s) to overlay
+  进入地牢时已注册 N 个自定义图标。
+  N custom icons were registered when entering a dungeon.
+
+
+七、发布 MOD / Publishing Your Mod
+------------------------------------------------------------
+
+* 不需要在 MOD 里携带 buff_icon.dll。玩家安装加载器时已经有了，MOD 里的同名副本不会被加载。
+  Your mod does not need to ship buff_icon.dll. Players already get it with the loader, and a same-named copy in your mod is not loaded.
+
+* 请在 MOD 说明里告知玩家需要安装 DDModLoader。未安装时游戏会忽略 buff_icon 字段，buff 显示原版图标。
+  Tell players in your mod description that DDModLoader is required. Without it the game ignores the buff_icon field and shows the original icon.
+
+* 当前支持 Steam 版和离线版的 64 位程序。
+  The current 64-bit Steam and offline builds are supported.
+
+
+============================================================
+DeathBlowCapMod：死门抗性上限 / Death Blow Resist Cap
+ProtectionCapMod：保护上限 / Protection Cap
+============================================================
+
+这两个功能用来修改游戏写死的属性上限，用法相同，这里一起说明。
+These two features change attribute caps that are hard-coded in the game. They work the same way and are described together.
+
+
+一、配置方法 / Configuration
+------------------------------------------------------------
+
+配置文件位于 <游戏根目录>\DDModLoader\cfg，修改后需要重启游戏。
+The config files are in <game root>\DDModLoader\cfg. Restart the game after changing them.
+
+DeathBlowCap.cfg
+  死门抗性（death_blow），原版上限 87%，安装后默认 cap = 0.87。
+  Death blow resistance (death_blow). The original cap is 87% and the installed default is cap = 0.87.
+
+ProtectionCap.cfg
+  保护（protection_rating），原版上限 80%，安装后默认 cap = 0.80。
+  Protection (protection_rating). The original cap is 80% and the installed default is cap = 0.80.
+
+示例 / Example:
+   cap = 0.95
+
+* cap 可以写小数或百分比，0.95 和 95% 等价。取值范围 0.0 ~ 10.0，超出时按边界取值。
+  cap accepts a decimal or a percentage, so 0.95 and 95% are the same. The range is 0.0 to 10.0, and values outside it are clamped.
+
+* # 和 // 之后的内容是注释。
+  Text after # or // is a comment.
+
+* cap 等于原版数值时，这个功能完全不修改游戏。
+  While cap equals the original value, the feature does not change the game at all.
+
+* 保护的 cap = 1.00 表示承受 0 伤害。超过 1.0 可能导致负概率或负伤害，请谨慎使用。
+  A protection cap of 1.00 means no damage taken. Values above 1.0 may produce negative chances or negative damage.
+
+* 重新安装加载器时保留已修改的配置，卸载加载器时配置文件会一起删除。
+  Changed values are kept when the loader is reinstalled. The config files are removed when the loader is uninstalled.
+
+* 删除 ProtectionCap.cfg 后，下次启动会重新生成并使用 cap = 0.95，不是原版的 0.80。
+  If ProtectionCap.cfg is deleted, the next start creates a new one and uses cap = 0.95, not the original 0.80.
+
+
+二、注意事项 / Notes
+------------------------------------------------------------
+
+* 上限对整个游戏生效，同一份游戏只有一个数值，不能按 MOD 单独设置。
+  The cap applies to the whole game. There is one value per game install, and it cannot be set per mod.
+
+* 修改的是主程序中所有等于原版上限的常量（0.87/87.0 或 0.8/80.0），同值的其他常量也会一起改变。
+  Every constant in the game executable equal to the original cap (0.87/87.0 or 0.8/80.0) is replaced, so other constants with the same value change too.
+
+* 两个 cap 不要设成对方的原版数值，即 ProtectionCap 不要设为 0.87，DeathBlowCap 不要设为 0.80，否则可能被另一个插件再次改写。
+  Do not set either cap to the other one's original value (ProtectionCap to 0.87 or DeathBlowCap to 0.80), or the other plugin may overwrite it.
+
+* 这两个功能不校验游戏版本，游戏更新后需要重新确认是否仍然有效。
+  These two features do not check the game version, so recheck them after a game patch.
+
+* 没有日志文件，运行信息输出到 Windows 调试通道，可以用 DebugView 查看，前缀是 [DeathBlowCap] 和 [ProtCap]。
+  There is no log file. Messages go to the Windows debug output and can be read with DebugView, under the prefixes [DeathBlowCap] and [ProtCap].
+
+
+三、发布 MOD / Publishing Your Mod
+------------------------------------------------------------
+
+* 不需要在 MOD 里携带这两个 DLL 和配置文件。MOD 里的同名 DLL 不会被加载，旁边的配置文件也不会被读取。
+  Your mod does not need to ship these DLLs or config files. A same-named DLL in your mod is not loaded, and the config next to it is not read.
+
+* MOD 文件不会改动 DDModLoader\cfg 下的配置。如果你的 MOD 需要特定的上限，请在 MOD 说明里告诉玩家要把 cap 改成多少。
+  Your mod files do not change the config in DDModLoader\cfg. If your mod needs a specific cap, tell players in your mod description what to set cap to.
+
+
+============================================================
+custom_type_effects：自定义技能类型触发器 / Custom Skill Type Triggers
+============================================================
+
+原版的攻击附加效果只在技能 .type 为 "melee" 或 "ranged" 时生效。把 .type 改成特殊类型或自定义类型后，buff 和 trinket 上的这些触发器就不再触发。这个功能让它们可以按任意自定义 .type 追加效果。
+Vanilla attack additional effects only fire when a skill's .type is "melee" or "ranged". Setting .type to a special or custom type disables those buff and trinket triggers. This feature lets them attach effects to any custom .type.
+
+
+一、快速开始 / Quick Start
+------------------------------------------------------------
+
+1. 按原版写法在 <你的 MOD>/effects/*.effects.darkest 里定义效果，例如 "My Shadow Step Heal"。
+   Define your effects in <your mod>/effects/*.effects.darkest as usual, for example "My Shadow Step Heal".
+
+2. 给 buff 或 trinket 加上以目标 .type 开头的字段，这里用 shadow_step 举例。其余字段按原版写法，下面省略了一部分。
+   Add a field named after the target .type to a buff or a trinket. This example uses shadow_step. Other fields follow the original format, and some are omitted below.
+
+   {
+       "buffs": [
+           {
+               "id": "my_buff",
+               "stat_type": "combat_stat_add",
+               "stat_sub_type": "speed",
+               "amount": 1,
+               "shadow_step_type_additional_effect_ids": [ "My Shadow Step Heal" ]
+           }
+       ]
+   }
+
+   {
+       "entries": [
+           {
+               "id": "my_trinket",
+               "buffs": [ "my_buff" ],
+               "rarity": "very_rare",
+               "shadow_step_type_additional_effects": [ "My Shadow Step Stress Heal" ]
+           }
+       ]
+   }
+
+3. 在 <你的 MOD>/heroes/<英雄>/*.info.darkest 里把对应技能的 .type 改成同一个值，其余字段保持原样。
+   Set .type on the matching skill in <your mod>/heroes/<hero>/*.info.darkest to the same value and leave the other fields as they were.
+
+   combat_skill: .id "smite" .level 0 .type "shadow_step" .atk 85% .dmg 0% .crit 0% .launch 21 .target 12 .is_crit_valid True .effect "My Skill Effect"
+
+4. 重启游戏，进入战斗使用该技能。
+   Restart the game, enter combat and use that skill.
+
+5. 如果效果没有出现，请看第五节的日志说明。
+   If the effect does not appear, see the log guide in section 5.
+
+
+二、字段规则 / Field Rules
+------------------------------------------------------------
+
+* 两种后缀都可用：<type>_type_additional_effect_ids 和 <type>_type_additional_effects。在 *.buffs.json 和 *.entries.trinkets.json 里都认，不限于某一种文件。
+  Both suffixes work: <type>_type_additional_effect_ids and <type>_type_additional_effects. Either can be used in *.buffs.json and *.entries.trinkets.json.
+
+* <type> 就是技能 .type 的字符串。匹配时不区分大小写、忽略首尾空白，所以 shadow_step_type_... 对应 .type "shadow_step" 或 .type "Shadow_Step"。
+  <type> is the skill's .type string. Matching is case-insensitive and ignores surrounding whitespace, so shadow_step_type_... matches .type "shadow_step" or .type "Shadow_Step".
+
+* 值可以是字符串数组或单个字符串。同一个字段里重复的效果名只触发一次。
+  The value can be an array of strings or a single string. Duplicate effect names in one field fire only once.
+
+* 效果名必须能在某个 *.effects.darkest 里查到，且区分大小写。查不到时只会写日志，不会让游戏报错。
+  Effect names must exist in some *.effects.darkest and are case-sensitive. A missing name only produces a log entry and does not break the game.
+
+* buff 字段写在 "buffs" 数组的对象上，trinket 字段写在 "entries" 数组的对象上；两者都必须有字符串类型的 id。
+  Buff fields go on objects in the "buffs" array, trinket fields on objects in the "entries" array. Both need a string id.
+
+* 字段必须带 _type_ 标记，因此不会和 attack_additional_effect_ids、melee_attack_additional_effect_ids 等原版字段冲突。
+  Fields must contain the _type_ marker, so they cannot clash with vanilla fields such as attack_additional_effect_ids or melee_attack_additional_effect_ids.
+
+* 会读取游戏本体、dlc、本地 MOD 和创意工坊 MOD 下的 *.buffs.json 与 *.entries.trinkets.json。在配置工具里添加的额外 MOD 目录不会被读取。
+  The base game, dlc, local mods and Workshop mods are scanned for *.buffs.json and *.entries.trinkets.json. Extra mod folders added in the configuration tool are not.
+
+* 这些文件只在游戏启动时读取一次，修改 JSON 后需要重启游戏。JSON 可以有注释，但不能有尾随逗号，否则该文件会被跳过。
+  These files are read once when the game starts, so restart after changing JSON. Comments are allowed but trailing commas are not, otherwise that file is skipped.
+
+* 同一个 id 的同一个 type 在多处定义时，优先级为本地 MOD、创意工坊 MOD、游戏本体；不同 type 的规则会累加。
+  When the same id and type are defined in several places, the priority is local mods, then Workshop mods, then the base game. Rules for different types accumulate.
+
+
+三、屏蔽的 type 与配置 / Blocked Types and Configuration
+------------------------------------------------------------
+
+* 默认屏蔽 teleport、melee、ranged、move。teleport 技能使用后会传送出战斗；另外三种已有原版触发器或属于位移技能。
+  teleport, melee, ranged and move are blocked by default. A teleport skill moves the hero out of combat, while the other three are covered by vanilla triggers or are movement skills.
+
+* 为屏蔽的 type 写的字段会被跳过并在日志里给出警告。.type 为 melee / ranged 时只有原版触发器生效，自定义触发器不会重复触发。
+  Fields written for a blocked type are skipped with a log warning. When .type is melee or ranged, only vanilla triggers fire and custom triggers do not double up.
+
+配置文件位于 <游戏根目录>\DDModLoader\cfg\CustomTypeEffects.cfg，和 DeathBlowCap.cfg 等放在同一个目录，修改后需要重启游戏。
+The config file is <game root>\DDModLoader\cfg\CustomTypeEffects.cfg, alongside DeathBlowCap.cfg and the others. Restart the game after changing it.
+
+示例 / Example:
+   blocked_types = teleport, melee, ranged, move
+
+* # 和 // 之后的内容是注释，配置按 key = value 逐行读取。
+  Text after # or // is a comment; the config is read line by line as key = value.
+
+* 多个 type 用逗号或空白分隔；重复写 blocked_types 行会合并。出现这个键即覆盖内置默认值，写成空值表示不屏蔽任何 type。
+  Separate types with commas or whitespace, and repeated blocked_types lines are merged. The key overrides the built-in defaults; an empty value means nothing is blocked.
+
+* 第一次启动时若文件不存在会自动生成一份带注释的默认配置。删掉这个键或删掉整个文件，下次启动会重新生成并使用内置默认值。MOD 目录里的同名 cfg 不会被读取。
+  A commented default config is generated on first start if the file is missing. Remove the key or delete the whole file and the next start regenerates it with built-in defaults. A same-named cfg inside a mod folder is not read.
+
+* 重新安装加载器时保留已修改的配置，卸载加载器时配置文件会一起删除。
+  Changed values are kept when the loader is reinstalled. The config file is removed when the loader is uninstalled.
+
+* 配置对整个游戏生效，同一份游戏只有一份，不能按 MOD 单独设置。
+  The config applies to the whole game. There is one per game install, and it cannot be set per mod.
+
+
+四、生效规则 / How It Triggers
+------------------------------------------------------------
+
+* 技能使用时，若当前 .type 命中某条规则，就把对应的效果追加到游戏原本收集的效果列表里，之后走和原版完全相同的流程，包括命中/未命中、暴击和队列判定。
+  When a skill is used and its .type matches a rule, the effects are appended to the list the game already collects. They then go through the exact same vanilla pipeline, including hit/miss, crit and queue handling.
+
+* 攻击技能、友方技能以及其它调用该收集函数的路径都会生效。
+  Attack skills, friendly skills and every other path through that collection function are covered.
+
+* buff 侧沿用游戏自己的 buff 生效判定，只有当前确实生效的 buff 才会追加效果。trinket 侧按角色背包装备的 trinket id 匹配，两个饰品分别计算。
+  Buffs use the game's own active-buff check, so only buffs that are currently active add effects. Trinkets are matched by the ids equipped in the character's inventory, and both slots are counted.
+
+* 只要 .type 匹配就触发，不区分原版内部对攻击技能与友方技能的分类标记。如果只想在攻击技能上触发，请只给攻击技能使用这个自定义 .type。
+  Any matching .type triggers, regardless of the game's internal attack/friendly skill flags. If you only want it on attacks, use that custom .type only on attack skills.
+
+* 功能不改动原版 melee / ranged / attack 触发器的行为，也不会修改任何游戏文件。
+  Vanilla melee / ranged / attack triggers are unchanged, and no game files are modified.
+
+
+五、排查问题 / Troubleshooting
+------------------------------------------------------------
+
+日志位置 / Log file: <游戏根目录 / game root>\DDModLoader\log\custom_type_effects.log
+
+[RULE] ... .type "..." -> N effect(s)
+  启动扫描到的规则，可用来确认你的 MOD 有没有被读到。
+  A rule found during startup; use it to check whether your mod was read.
+
+Loaded custom type triggers: ...
+  扫描结束后的规则总数。
+  Total number of rules after the scan.
+
+No custom type triggers found.
+  DLL 正常，但没有任何 MOD 定义 *_type_additional_effect* 字段。
+  The DLL works, but no mod defines a *_type_additional_effect* field.
+
+Ignoring '...' on '...': .type "..." is blocked
+  该 type 在屏蔽列表里，字段被跳过。
+  The type is blocked, so the field was skipped.
+
+Undefined additional effect "..." referenced by ...
+  *.effects.darkest 里没有这个名字，或大小写不一致。
+  The name is missing from *.effects.darkest or the case does not match.
+
+cfg loaded: ... / Default cfg generated: ...
+  屏蔽列表的来源，日志里还会逐条列出实际生效的 type。
+  Where the blocked-type list came from; the log also lists every active blocked type.
+
+CollectEffects detour installed at +479470
+  功能已生效。
+  The feature is active.
+
+Incompatible game version, hook NOT installed
+  当前游戏版本尚未适配，功能不生效，游戏照常运行。
+  This game version is not supported yet. The feature is off, and the game runs normally.
+
+
+六、发布 MOD / Publishing Your Mod
+------------------------------------------------------------
+
+* 不需要在 MOD 里携带 custom_type_effects.dll。玩家安装加载器时已经有了，MOD 里的同名 DLL 不会被加载。
+  Your mod does not need to ship custom_type_effects.dll. Players already get it with the loader, and a same-named copy in your mod is not loaded.
+
+* 请在 MOD 说明里告知玩家需要安装 DDModLoader。未安装时游戏会忽略这些字段，技能不会附带这些额外效果。
+  Tell players in your mod description that DDModLoader is required. Without it the game ignores these fields and the skill gets no extra effects.
+
+* 不要在 MOD 里改动 DDModLoader\cfg\CustomTypeEffects.cfg。如果你的 MOD 需要特定的屏蔽列表，请在 MOD 说明里告诉玩家怎么改。
+  Do not change DDModLoader\cfg\CustomTypeEffects.cfg from your mod. If your mod needs a specific blocked list, tell players what to set in your mod description.
+
+* 当前支持 Steam 版和离线版的 64 位程序。游戏更新后如果日志出现 Incompatible game version，说明需要重新适配。
+  The current 64-bit Steam and offline builds are supported. After a game patch, an Incompatible game version log entry means the feature needs to be updated.
+
+
+============================================================
+dd_immune：kill / control / capture 免疫 / Kill, Control and Capture Immunity
+============================================================
+
+提供三个互相独立的免疫模块，可单独或组合使用。目标只对指定的效果字段失效，同一个效果里的其它字段（如 stun、伤害 buff）照常执行。已在实机验收通过。
+Three independent immunity modules; use any combination. Only the specified effect fields are suppressed, while other fields in the same effect (such as stun or damage buffs) still apply. Verified in game.
+
+* 免疫.kill：目标不会被效果的 .kill（含 .kill_enemy_types）当场击杀。
+  Kill immunity: the target is not killed on the spot by an effect's .kill (including .kill_enemy_types).
+* 免疫.control：目标不会被效果的 .control 施加"控制"。事前阻断，不等同于事后解控。
+  Control immunity: the target is not put under "control" by an effect's .control. It blocks before the fact and is not the same as removing control afterwards.
+* 免疫.capture：目标不会被效果的 .capture（CaptureBosun / CaptureHag）捕获，同时屏蔽 .capture_remove_from_party。
+  Capture immunity: the target is not captured by an effect's .capture (CaptureBosun / CaptureHag); .capture_remove_from_party is suppressed as well.
+
+最终免疫 = class 级（info 文件）与 buff 级（buff 字段）按位 OR。三个位：kill=1、control=2、capture=4。
+Final immunity is the bitwise OR of the class level (info file) and the buff level (buff fields). Bits: kill=1, control=2, capture=4.
+
+
+一、快速开始 / Quick Start
+------------------------------------------------------------
+
+1. 职业固有免疫：在职业文件顶层直接新增真实块 immune:，与 DDShield 的 shield: 同款，不需要 // 注释。
+   For a class-wide immunity, add a real immune: block at the top level of the class file, like DDShield's shield:. No // comment needed.
+
+   immune: .kill true .control true .capture true
+   resistances: ...
+   combat_skill: ...
+
+   文件写在 <你的 MOD>/heroes/<英雄>/<英雄>.info.darkest 或 <你的 MOD>/monsters/<怪物>/<怪物>.info.darkest。
+   Put the file in <your mod>/heroes/<hero>/<hero>.info.darkest or <your mod>/monsters/<monster>/<monster>.info.darkest.
+
+2. buff 免疫：在自己的 buff JSON 里加布尔字段，值 true / false，缺省 false。
+   For a buff-based immunity, add boolean fields to your buff JSON. Values are true / false and default to false.
+
+   {
+       "buffs": [
+           {
+               "id": "my_immune_buff",
+               "stat_type": "status",
+               "immune_kill": true,
+               "immune_control": true,
+               "immune_capture": true
+           }
+       ]
+   }
+
+3. 重启游戏，让角色带上该 buff 或使用对应职业。修改 info / JSON 后必须重启。
+   Restart the game and give the character that buff or use that class. Restart after changing info or JSON files.
+
+
+二、字段规则 / Field Rules
+------------------------------------------------------------
+
+* info 形式：行首跳过空白后首个 token 为大小写不敏感的 immune: 即识别。冒号后按逗号或空白切 token，支持 .kill true / .control false / .capture 1 / .capture 0（. 前缀加布尔值），以及裸 token kill / control / capture（等价 true）。其它 token 写 WARN 忽略。
+  Info form: after leading whitespace, a case-insensitive immune: token is recognized. Tokens after the colon are split by commas or whitespace. .kill true / .control false / .capture 1 / .capture 0 (dot prefix plus a boolean) and bare kill / control / capture (equivalent to true) are accepted. Other tokens are ignored with a warning.
+
+* 同一个 info 文件里多行按顺序处理，显式 false / 0 清除之前置位，之后的 true 可再置回。为兼容旧写法，仍识别 // DD_IMMUNE: 注释，但不再要求 //。
+  Multiple lines in one info file are processed in order. An explicit false / 0 clears an earlier set bit, and a later true sets it again. The old // DD_IMMUNE: comment form is still recognized for compatibility, but // is no longer required.
+
+* 职业名取最深层目录名（与文件名相同），登记裸名、hero_class_name_ 前缀、str_monstername_ 前缀三种哈希。HeroClass+8 与部分 MonsterClass+0x48 的内嵌职业 id 都会参与查询，命中任一即生效。
+  The class name is the deepest directory name (same as the file name). Three hashes are registered: the bare name, the hero_class_name_ prefix and the str_monstername_ prefix. The embedded class id at HeroClass+8 and, for some monsters, +0x48 are both queried; any match applies.
+
+* buff 形式扫描 shared/buffs、trinkets、dlc、本地 MOD、创意工坊 MOD 下的 *.buffs.json。同 id 多处配置时按本地 MOD、创意工坊 MOD、游戏本体的优先级覆盖，显式 false 可覆盖低优先级的 true。
+  Buff form scans *.buffs.json under shared/buffs, trinkets, dlc, local mods and Workshop mods. For the same id, priority is local mods, then Workshop mods, then the base game; an explicit false can override a lower-priority true.
+
+* 这些文件只在游戏启动时读取一次，修改后需要重启游戏。info 块是格式合法的未知块，游戏会忽略但不会截断后续块。
+  These files are read once at game start, so restart after changing them. The immune: block is a well-formed unknown block that the game ignores without truncating the rest of the file.
+
+* 运行时按 buff 条目是否存在判断 active（默认不调用游戏的规则判定函数 479CD0）。同一个效果里只有对应字段被清零，其它字段照常执行。
+  At runtime a buff counts as active as long as its entry exists (the game's rule check 479CD0 is not called by default). Only the matching fields of an effect are cleared; all other fields still apply.
+
+
+三、三个模块的注意事项 / Notes on Each Module
+------------------------------------------------------------
+
+免疫.kill / Kill immunity
+
+* 只保证目标不被当场击杀，不改变敌人的选目标、伤害或复读逻辑。同一个效果的 stun、伤害等其它字段照常执行。
+  It only prevents the instant kill. It does not change enemy targeting, damage or repeat logic. Other fields of the same effect, such as stun and damage, still apply.
+
+* 最终 BOSS 会检测队伍人数，对秒杀招数进行复读：被点名目标没有按预期死亡时，它会再次施放该秒杀招，形成连续点名。
+  The final boss checks the party size and repeats its instant-kill move: if the targeted character does not die as expected, it casts the move again, resulting in repeated targeting.
+
+* 因此使用免疫.kill 时，应同时给该角色配备反伤或反击（riposte / 反伤类 buff、饰品或技能）。否则角色虽然不死，仍会被反复点名，压力和回合消耗很大，甚至陷入僵持；配上反伤或反击后，每次复读秒杀都会反过来造成伤害，把点名变成输出窗口。
+  For this reason, pair kill immunity with damage reflection or riposte (a riposte / reflect buff, trinket or skill). Without it the character survives but is targeted again and again, costing stress and turns and possibly stalling the fight. With reflection or riposte, every repeated instant-kill deals damage back and turns the targeting into a damage window.
+
+免疫.control / Control immunity
+
+* .control(+0x70) 是施加控制，命中后调用 Battle::UpdateControl(...,1,0)，把目标置为被控制。本功能是事前阻断：在效果生效前把 .control 清零，让施加分支不执行。
+  .control (+0x70) applies control by calling Battle::UpdateControl(...,1,0) to put the target under control. This feature blocks before the fact: it clears .control before the effect applies so the branch never runs.
+
+* 与 .uncontrol(+0x74) 事后解控不同：本功能绝不写 .uncontrol。即使同一效果同时带 .control 和 .uncontrol，解除逻辑仍按原样执行。
+  Unlike .uncontrol (+0x74), which removes control after the fact, this feature never writes .uncontrol. Even if one effect carries both .control and .uncontrol, the removal logic still runs as normal.
+
+* stun/unstun、daze/undaze、immobilize/unimmobilize 是独立字段，不走 Battle::UpdateControl，不受本功能影响，也不会绕过本免疫。
+  stun/unstun, daze/undaze and immobilize/unimmobilize are separate fields that do not go through Battle::UpdateControl. They are unaffected by this feature and cannot bypass it.
+
+免疫.capture / Capture immunity
+
+* 同时清零 .capture(+0x320) 与 .capture_remove_from_party(+0x324)，避免只挡住捕获却把角色移出队伍的半捕获状态。
+  Both .capture (+0x320) and .capture_remove_from_party (+0x324) are cleared, avoiding a half-captured state where capture is blocked but the character is still removed from the party.
+
+
+四、排查问题 / Troubleshooting
+------------------------------------------------------------
+
+日志位置 / Log file: <游戏根目录 / game root>\DDModLoader\log\dd_immune.log
+
+[INFO-RULE] class 'crusader' -> mask 0x7
+  启动扫描读到某职业的 info 规则，可确认你的职业文件被扫到。
+  An info rule found at startup; use it to confirm your class file was read.
+[BUFF-RULE] ... -> mask 0x...
+  启动扫描读到的 buff 规则。
+  A buff rule found at startup.
+[DIAG] class id ok: +8='crusader' +0x48='...' -> mask=0x7
+  运行时成功认出职业并命中规则（前 8 次）。看到 mask 非 0 表示 class 级免疫生效。
+  The class was recognized at runtime and matched a rule (first 8 times). A non-zero mask means class-level immunity is active.
+[DIAG] class id read failed
+  没能把 actor 解析成职业。若持续出现，说明目标不是标准 Actor 或版本不匹配。
+  The actor could not be resolved to a class. If it persists, the target is not a standard actor or the game version does not match.
+[DIAG] immune detour hit: mask=0x... swap=...
+  免疫已作用于某个目标的 effect（前 16 次）。
+  Immunity was applied to an effect on a target (first 16 times).
+[FAIL] V1 ... / [FAIL] V2 ... / [FAIL] V6 ... / [FAIL] V8 ...
+  游戏版本或布局与基准不符，本功能已安全禁用，游戏照常运行。请确认使用支持的游戏版本。
+  The game version or layout does not match the baseline and the feature is safely disabled. The game still runs. Check that you are using a supported version.
+no rules found, hook NOT installed
+  DLL 正常，但没有扫到任何免疫规则。检查字段拼写和文件位置。
+  The DLL is fine but no immunity rule was found. Check field names and file locations.
+
+
+五、发布 MOD / Publishing Your Mod
+------------------------------------------------------------
+
+* 不需要在 MOD 里携带 dd_immune.dll。玩家安装加载器时已经有了，MOD 里的同名 DLL 不会被加载。
+  Your mod does not need to ship dd_immune.dll. Players already get it with the loader, and a same-named copy in your mod is not loaded.
+
+* 请在 MOD 说明里告知玩家需要安装 DDModLoader。未安装时游戏会忽略 immune 字段和 immune: 块，不产生任何免疫效果。
+  Tell players in your mod description that DDModLoader is required. Without it the game ignores the immune fields and the immune: block, and no immunity applies.
+
+* 使用免疫.kill 时，请在 MOD 说明里提醒玩家给该角色配备反伤或反击，理由见第三节。
+  If you use kill immunity, tell players in your mod description to pair the character with damage reflection or riposte; see section 3 for the reason.
+
+* 当前支持 Steam 版和离线版的 64 位程序，且只适配内置基准版本。游戏更新后若日志出现 [FAIL] 校验信息，说明需要重新适配。
+  The current 64-bit Steam and offline builds are supported, and only the built-in baseline version is covered. After a game patch, a [FAIL] entry in the log means the feature needs to be updated.
+
+
+============================================================
+SpineFix：spine 2.1 切片时间线与混合模式 / Spine 2.1 Timeline and Blend Mode Fixes
+============================================================
+
+SpineFix 补上游戏自带 spine 2.1 运行时里几项「数据在 .skel 里，但游戏不画或画错」的功能。它随加载器预装，位于 mods\DD Mod Lib，不需要在 MOD 里携带。
+SpineFix restores several features that exist in a .skel but are not rendered, or are rendered incorrectly, by the game's bundled spine 2.1 runtime. It ships with the loader in mods\DD Mod Lib and does not need to be included in your mod.
+
+支持的功能 / Supported Features
+
+* 切片显示/隐藏关键帧（slot attachment timeline）：动画里的 attachment 关键帧现在会真正切换切片。
+  Slot attachment timelines: attachment keyframes in an animation now actually show or hide the slot.
+
+* 层级调整关键帧（drawOrder timeline）：动画里的 drawOrder 关键帧现在会影响绘制顺序。
+  DrawOrder timelines: drawOrder keyframes in an animation now affect render order.
+
+* 切片混合模式：读取 .skel 里每个 slot 的 additive 字节，支持加法、正片叠底和滤色。
+  Slot blend modes: reads the additive byte of each slot in the .skel and supports additive, multiply and screen.
+
+* 帧动画循环：用大量 attachment 关键帧逐帧切换切片的角色，循环播放现在会正常回到第一帧，不会播一遍就停在末帧。
+  Frame-animation looping: characters that switch attachments frame by frame now loop back to the first frame instead of stopping on the last frame after one pass.
+
+
+一、快速开始 / Quick Start
+------------------------------------------------------------
+
+1. 安装 DDModLoader。SpineFix 已经在 mods\DD Mod Lib 里，MOD 不需要再带一份 DLL。
+   Install DDModLoader. SpineFix is already in mods\DD Mod Lib, so your mod does not need to ship another copy.
+
+2. 切片显示/隐藏和层级调整不需要额外配置：在 Spine 2.1 工程里正常做 attachment / drawOrder 关键帧，导出 .skel 即可。
+   Attachment visibility and drawOrder need no extra configuration: author attachment / drawOrder keyframes in Spine 2.1 and export the .skel as usual.
+
+3. 混合模式需要给对应 slot 写入 additive 字节，取值见第二节。原版只认 0 和 1，2/3 是本插件扩展的约定。
+   Blend modes require the additive byte on the slot; see section 2. The original runtime only understands 0 and 1, while 2 and 3 are conventions added by this plugin.
+
+4. 改完 .skel 或配置后重启游戏。
+   Restart the game after changing a .skel or the configuration.
+
+
+二、混合模式约定 / Blend Mode Convention
+------------------------------------------------------------
+
+混合模式就是 .skel 里 slot 记录最后那个 additive 字节：
+The blend mode is the final additive byte of a slot record in the .skel:
+
+    0 = 正常 / Normal
+    1 = 加法 / Additive
+    2 = 正片叠底 / Multiply
+    3 = 滤色 / Screen
+
+原版 2.1 只把 0 当正常、1 当加法，并且渲染时一个 sprite 只用一个混合状态；SpineFix 会按这些值把绘制顺序切成连续段，每段切换一次混合状态。
+The original 2.1 runtime only treats 0 as normal and 1 as additive, and renders a whole sprite with a single blend state. SpineFix splits the draw order into consecutive runs by these values and changes the blend state once per run.
+
+* 0 正常：沿用调用方的混合状态（通常是 ONE / ONE_MINUS_SRC_ALPHA）。
+  Normal: keeps the caller's blend state (usually ONE / ONE_MINUS_SRC_ALPHA).
+* 1 加法：ONE / ONE。
+  Additive: ONE / ONE.
+* 2 正片叠底：DST_COLOR / ONE_MINUS_SRC_ALPHA。
+  Multiply: DST_COLOR / ONE_MINUS_SRC_ALPHA.
+* 3 滤色：ONE / ONE_MINUS_SRC_COLOR。
+  Screen: ONE / ONE_MINUS_SRC_COLOR.
+
+这些公式假设贴图是预乘 alpha 的，和游戏原版的假设一致。非预乘贴图的半透明边缘可能偏色，见第五节的限制。
+These formulas assume premultiplied-alpha textures, matching the game's own assumption. Non-premultiplied textures may show color fringing on semi-transparent edges; see the limitations in section 5.
+
+修改 additive 字节 / Changing the additive byte
+
+如果你有插件源码，可以用 tools/set_blend.py 只改这一个字节，文件长度不变，并在同目录留一份 .blendbak：
+If you have the plugin source, tools/set_blend.py changes only this byte without changing the file length and leaves a .blendbak next to the file:
+
+    python tools/set_blend.py --list hero.sprite.combat.skel
+    python tools/set_blend.py --set Body_Skirt1_Shadow=2 hero.sprite.combat.skel --write
+    python tools/set_blend.py --all 2 hero.sprite.combat.skel --write
+
+脚本会先解析 slots 段并核对名字和骨骼下标，解析对不上就跳过，不会写坏文件。
+The script parses the slots section and validates names and bone indices first; if parsing does not line up it skips the file instead of corrupting it.
+
+
+三、配置 / Configuration
+------------------------------------------------------------
+
+配置文件在 <游戏根目录>\DDModLoader\cfg\SpineFix.cfg，第一次运行自动生成。改完需要重启游戏。
+The configuration file is <game root>\DDModLoader\cfg\SpineFix.cfg and is generated on first run. Restart the game after changing it.
+
+* repair_timelines：0 = 不动，1 = 修补（默认），2 = 只记录差异不修改。设为 2 可以观察原版到底有没有应用时间线。
+  repair_timelines: 0 = off, 1 = repair (default), 2 = log differences without changing anything. Use 2 to see whether the original runtime applied the timeline.
+
+* blend_modes：是否启用混合模式，默认 1。
+  blend_modes: enables blend modes, default 1.
+
+* additive：additive 字节为 1 时是否按加法画，默认 1。原版有些特效切片带 1，觉得画面过亮可以设为 0，只保留 2/3。
+  additive: whether byte 1 is rendered as additive, default 1. Some original effect slots use 1; set it to 0 if they look too bright and keep only 2/3.
+
+* max_passes：一个 sprite 最多拆成几段绘制，默认 8，范围 1-32。超出的段会并进最后一段。
+  max_passes: maximum draw runs per sprite, default 8, range 1-32. Extra runs are merged into the last one.
+
+* verbose：每次修补都写日志；默认只在预算内记每个动画的第一次。
+  verbose: log every repair; by default only the first repair of each animation is logged within a budget.
+
+* probe：每种骨骼资源第一次绘制时打一份自检，包含槽位数、混合字节分布、当前动画和整份骨骼所有动画的时间线统计。
+  probe: prints a self-check for the first draw of each skeleton, including slot count, blend byte distribution, the current animation and timeline counts across all animations in the skeleton.
+
+* debug_split_passes：自检用，把每个 sprite 强行拆成两段正常混合来画；平时保持 0。
+  debug_split_passes: diagnostic only; forces every sprite into two normal-blend runs. Keep it at 0 normally.
+
+
+四、排查问题 / Troubleshooting
+------------------------------------------------------------
+
+日志位置 / Log file: <游戏根目录 / game root>\DDModLoader\log\SpineFix.log
+
+Located Render +2585E0, GetAttachment +853330, SetAttachment +8559A0
+SpineSprite::Render hook installed
+  版本校验通过，hook 已安装。若出现 Incompatible game version，说明当前程序不在支持范围内，插件不会安装。
+  Version checks passed and the hook is installed. If Incompatible game version appears, the current executable is not supported and the hook was not installed.
+
+probe: slots=... animation="..." ... | all: anims=N attachment=A drawOrder=D names=...
+  自检行。竖线前是当前动画，竖线后是整份骨骼所有动画的汇总；有 drawOrder 时间线的动画会列出名字和条数，不需要正好播到那一段。
+  Self-check line. Before the bar is the current animation; after it is a summary of every animation in the skeleton. Animations with drawOrder timelines are listed by name and count, even if they are not currently playing.
+
+repaired "walk": 1 attachment, 0 drawOrder (total ...)
+  绘制前补了一次时间线。数字是本次改动的时间线条数，括号里是累计值。
+  A timeline was repaired before drawing. The numbers are timelines changed this time and the running total in parentheses.
+
+drawOrder timeline active: "..." (N)
+  当前正在渲染的动画里确实有 drawOrder 时间线，每个动画最多一行。它和 repaired 行配合，可以区分「资源里有但没播到」和「播到了但修补没有差异」。
+  The animation currently being rendered does contain drawOrder timelines, at most one line per animation. Together with repaired lines it distinguishes "the timeline exists but never played" from "it played and the repair found no difference".
+
+multi-pass draw: N pass(es)
+  这个 sprite 因为混合模式被拆成了 N 段绘制。段数越多 draw call 越多。
+  The sprite was split into N draw runs because of blend modes. More runs mean more draw calls.
+
+cfg: repaired-timelines=... blend-modes=... additive=... max-passes=... verbose=...
+  启动时读到的配置。确认自己的修改确实生效。
+  Configuration read at startup. Use it to confirm your changes took effect.
+
+
+五、限制 / Limitations
+------------------------------------------------------------
+
+* 只处理当前条目，也就是 Sprite 当前指向的那份 .skel，和原版 Update / Render 的行为一致。
+  Only the current entry is handled, i.e. the .skel the Sprite currently points to, matching the original Update / Render behavior.
+
+* 只修时间线和混合模式，不补原版其它绘制限制：多页图集只用第一页、非预乘贴图的边缘、附件自身颜色不参与。
+  Only timelines and blend modes are fixed. Other original rendering limits remain: multi-page atlases use only the first page, non-premultiplied texture edges are not corrected, and per-attachment colors are not applied.
+
+* 和 SpineCompat 抢同一个 hook 目标（SpineSprite::Render，2585E0），两者不要同时安装。
+  SpineFix and SpineCompat hook the same target (SpineSprite::Render, 2585E0); do not install both.
+
+* 只适配安装器内置的基准版本。游戏更新后若日志出现版本不匹配，需要重新适配。
+  Only the baseline version bundled with the installer is supported. If the log reports a version mismatch after a game update, the plugin needs to be updated.
+
+* 层级顺序关键帧（drawOrder）已经能进入绘制，但在部分资源上画面仍未完全达到 Spine 编辑器的效果；如果遇到，请带上 probe=1、verbose=1 的日志反馈。
+  DrawOrder keyframes now reach rendering, but on some assets the result still does not fully match the Spine editor. If you hit this, report it with probe=1 and verbose=1 logs.
+
+
+六、发布 MOD / Publishing Your Mod
+------------------------------------------------------------
+
+* 不需要在 MOD 里携带 SpineFix.dll。玩家安装加载器时已经有了，MOD 里的同名 DLL 不会被加载。
+  Your mod does not need to ship SpineFix.dll. Players already get it with the loader, and a same-named copy in your mod is not loaded.
+
+* 请在 MOD 说明里告知玩家需要安装 DDModLoader。未安装时游戏会忽略 attachment / drawOrder 时间线的修补和 2/3 混合约定，画面按原版显示。
+  Tell players in your mod description that DDModLoader is required. Without it the game ignores the attachment / drawOrder repairs and the 2/3 blend convention, and renders as the original game does.
+
+* 如果 MOD 依赖帧动画循环或特殊混合，请在说明里写清楚需要加载器；只靠 .skel 文件本身，原版不会呈现这些效果。
+  If your mod relies on frame-animation looping or special blend modes, state that the loader is required; the .skel file alone will not produce these effects in the original game.
+
+
+============================================================
+hero_level_cap：英雄等级上限 / Per-class Hero Level Cap
+============================================================
+
+在原版 6 级上限之外，允许按职业把最高等级提到更高（1~20）。等级、经验、技能解锁和 UI 都按新上限走。
+Raises the per-class resolve level cap above the vanilla 6 (1~20). Level, XP, skill unlocks and the UI all follow the new cap.
+
+
+一、用法 / Usage
+------------------------------------------------------------
+
+1. 在英雄 info 文件顶层加一行 level_cap:，与 DDShield 的 shield:、dd_immune 的 immune: 同款真实块，不需要 // 注释。
+   Add one level_cap: line at the top level of a hero's info file, like DDShield's shield: and dd_immune's immune:. No // comment needed.
+
+   level_cap: .max 7
+   resistances: ...
+   combat_skill: ...
+
+   文件写在 <你的 MOD>/heroes/<英雄>/<英雄>.info.darkest。
+   Put the file at <your mod>/heroes/<hero>/<hero>.info.darkest.
+
+   也接受 level_cap: 7 和 level_cap: .cap 7 两种写法。
+   level_cap: 7 and level_cap: .cap 7 are also accepted.
+
+2. 不写这一行就是原版 6 级上限。取值 1~20，超出会被夹到边界。同一职业多处配置时按本地 MOD、创意工坊 MOD、游戏本体的优先级覆盖。
+   Without the line the cap stays at the vanilla 6. Values are clamped to 1~20. For the same class, local mods override Workshop mods, which override the base game.
+
+3. 改完 info 必须重启游戏。这个块只在启动时读取一次。
+   Restart the game after editing the info file; the block is read once at startup.
+
+
+二、经验上限与梯度 / XP Cap and Gradient
+------------------------------------------------------------
+
+* 阈值表来自 campaign/roster/roster.variables.json 的 resolve_level_thresholds。原版是 7 项 [0,2,8,14,24,36,48]，最后一项 48 就对应 6 级。
+  The threshold table comes from resolve_level_thresholds in campaign/roster/roster.variables.json. Vanilla has 7 entries [0,2,8,14,24,36,48], and the last entry 48 corresponds to level 6.
+
+* 安装器把这张表补成 8 项（末尾加 60），所以 7 级需要 60 XP；插件按最后一段步长（12）继续外推，8 级起每级再加 12。
+  The installer extends the table to 8 entries (appending 60), so level 7 needs 60 XP. The plugin extrapolates with the last step (12), so every level past 7 costs another 12.
+
+* 满级后经验不再增长，与原版满级行为一致：插件把超额 XP 收回该职业上限对应的阈值（6 级职业仍是 48，7 级职业是 60）。
+  At max level XP stops growing, the same as vanilla: excess XP is pulled back to the threshold of that class's cap (48 for a level-6 class, 60 for level 7).
+
+* 想支持更高的全局上限（例如 10 级），需要把 roster.variables.json 继续补项（每级 +12）后重新安装或手工修改。表长决定 UI 能算到的最大等级。
+  For a higher global ceiling (for example level 10), extend roster.variables.json by another entry per level (+12), then reinstall or edit it by hand. The table length decides the highest level the UI can compute.
+
+
+三、等级图标（已带 7~10 级）/ Level Icons (7~10 bundled)
+------------------------------------------------------------
+
+* 徽章底色：shared/resolve_level_bar/resolve_level_bar_number_background_lvl<N>.png 与同目录的 _glow_lvl<N>.png，原版 64×64，只有 lvl0~lvl6。第 N 级要这两张 lvl<N>。
+  Badge background: shared/resolve_level_bar/resolve_level_bar_number_background_lvl<N>.png and _glow_lvl<N>.png in the same folder. The originals are 64x64 and only cover lvl0~lvl6. Level N needs both lvl<N> files.
+
+* 安装器已预装 7~10 级徽章，沿原版顺序继续换色（7 紫、8 青、9 品红、10 冷白），金色外框沿用原版 6 级样式。11 级起需要自备，或改 tools/gen_level_icons.py 里的 RAMP 重新生成。
+  The installer ships badges for levels 7~10, continuing the original color order (7 purple, 8 cyan, 9 magenta, 10 cold white) on the vanilla level-6 gold frame. Levels 11 and up need your own art, or extend RAMP in tools/gen_level_icons.py and regenerate.
+
+* 名册卡片底图：campaign/town/roster/rosterelement_res<N>.png，原版只有 res1~res6。安装器会用 res6 复制生成 res7~res20 避免缺图，玩家可以自行替换成更好看的版本。
+  Roster card frame: campaign/town/roster/rosterelement_res<N>.png. The originals only cover res1~res6. The installer copies res6 to res7~res20 so nothing is missing, and players may replace them with their own art.
+
+* 缺图不会导致崩溃，但会显示占位图或沿用上一级外观。等级本身仍然生效。
+  Missing art does not crash the game; it shows a placeholder or the previous tier's look. The level itself still works.
+
+
+四、称号本地化 / Level Titles
+------------------------------------------------------------
+
+* 英雄详情页的称号来自 str_resolve_<等级>，原版只有 str_resolve_0~6。没补本地化时，7 级会显示 [<str_resolve_7>] 这样的未解析占位符，这是正常的，不影响等级、经验和技能。
+  The hero panel title comes from str_resolve_<level>, and the originals only cover str_resolve_0~6. Without localization, level 7 shows an unresolved placeholder such as [<str_resolve_7>]. This is expected and does not affect level, XP or skills.
+
+* 安装器会把 localization\hero_level_cap.string_table.xml 放进游戏 localization 目录，里面是 7~10 级的中英称号（神话/不朽/超凡/圣临）。文件名与本体表格不重名，不会覆盖 miscellaneous / heroes 等原版文件。
+  The installer puts localization\hero_level_cap.string_table.xml into the game's localization folder with English and Chinese titles for levels 7~10. The name does not collide with the vanilla tables, so miscellaneous / heroes and the rest stay untouched.
+
+* 部分语言（schinese 等）实际从 .loc2 二进制读取，所以这份 XML 是模板。要显示文字，把它转成同名 .loc2（hero_level_cap.loc2）放进同一目录；转好的文件也可以放回安装器的 hero_level_cap\localization，之后安装会一起带上。
+  Some languages (schinese and others) are loaded from .loc2 binaries, so the XML is a template. Compile it into a same-named .loc2 (hero_level_cap.loc2) and drop it in the same folder; you may also put the result back into the installer's hero_level_cap\localization so later installs ship it.
+
+* 要支持更高等级，在同一个 XML 里按格式继续追加 str_resolve_11 及之后的键。
+  For higher levels, append str_resolve_11 and later keys to the same XML in the same format.
+
+
+五、排错 / Troubleshooting
+------------------------------------------------------------
+
+日志位置 / Log file: <游戏根目录 / game root>\DDModLoader\log\hero_level_cap.log
+
+* level cap from info: class=xxx cap=7 表示 info 行被读到；没有这行说明路径或职业名不对。
+  level cap from info: class=xxx cap=7 means the info line was read; if it is missing, the path or class name is wrong.
+
+* installed: ...（四处补丁都必须 writeback=true）。出现 Incompatible game version 说明游戏更新了，需要重新适配。
+  installed: ... (all four patches must report writeback=true). Incompatible game version means the game was updated and the plugin needs to be re-adapted.
+
+* live thresholds loaded: 8 entries, last=60 表示阈值表已是 8 项；如果仍是 7 entries, last=48，说明 roster.variables.json 没被替换。
+  live thresholds loaded: 8 entries, last=60 means the table has 8 entries; 7 entries, last=48 means roster.variables.json was not replaced.
+
+* xp capped at class limit: class=xxx 748 -> 60 表示满级后经验已经收回上限。
+  xp capped at class limit: class=xxx 748 -> 60 means excess XP was pulled back at max level.
+
+* 面板显示 6 但日志里 level=7：先看阈值表项数（第三条），再确认名册底图 res<N> 是否存在。
+  Panel shows 6 while the log says level=7: check the table length first (third item), then whether the roster frame res<N> exists.
+
+* 启动后约 1 秒闪退、app.log 停在 `Post-crash check saved timestamp`：
+  `shared\resource_manager.setup` 的 `max_resource_entries`（默认 2097152）为了装更多 MOD 被调大，
+  且装了很多 MOD 时曾与本插件在 DllMain 里扫描 MOD 目录的操作冲突。本版本已把扫描与补丁移到工作线程，
+  **不再依赖该值的大小**，可按需调大以装更多 MOD。若调大后仍闪退，请查 Windows 事件查看器的异常模块。
+  Crash about one second after launch with app.log stopping at `Post-crash check saved timestamp`: raising
+  `max_resource_entries` in `shared\resource_manager.setup` (default 2097152) to load more mods used to
+  conflict with this plugin's MOD-directory scan inside DllMain. This build moves that work to a worker
+  thread and **no longer depends on that value** — raise it as needed. If it still crashes, check the
+  faulting module in Windows Event Viewer.
+
+
+六、已知限制 / Known Limits
+------------------------------------------------------------
+
+* 阈值表是全局一张，插件按职业过滤（XP 收回 + GetResolveLevel 截断）。工具提示里的经验上限显示的是表的最后一项，所以 6 级职业满级会显示 48/60 而不是 48/48。
+  The threshold table is global and the plugin filters per class (XP pullback plus a GetResolveLevel clamp). The tooltip's XP ceiling shows the table's last entry, so a maxed level-6 class reads 48/60 instead of 48/48.
+
+* 只适配安装器内置的基准版本。游戏更新后若日志出现版本不匹配或补丁未装上，需要重新适配。
+  Only the baseline build bundled with the installer is supported. If the log reports a version mismatch or a patch was not applied after a game update, the plugin needs to be re-adapted.
+
+* 满级后经验不再增长的实现依赖对象类型校验，只对真实角色对象生效；非角色对象上不会写入任何字节。
+  The XP pullback validates the object type and only writes on real actor objects; nothing is written on any other object.
